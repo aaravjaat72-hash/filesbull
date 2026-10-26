@@ -402,6 +402,11 @@ def handle_private_message(message: Dict[str, Any]) -> None:
         source = forwarded_source(message)
         try:
             register_channel(source)
+            if text == "/requirechannel" or text.startswith("/requirechannel"):
+                invite = f"https://t.me/{source['username']}" if source.get("username") else None
+                supabase("required_channels", "POST", {"chat_id": source["id"], "title": source.get("title", "Required channel"), "username": source.get("username"), "invite_link": invite, "active": True}, "?on_conflict=chat_id")
+                send_text(chat_id, f"Required join channel add ho gaya: {source.get('title', 'channel')}")
+                return
             if info:
                 record = build_metadata(message, source)
                 # A forwarded message has a new message_id in the bot chat. Delivery
@@ -485,6 +490,9 @@ def handle_admin_command(message: Dict[str, Any]) -> None:
         return
     if text.startswith("/requirechannel"):
         target = text[len("/requirechannel"):].strip()
+        if not target:
+            send_text(chat_id, "Required channel add karne ke liye:\n1. /requirechannel @channelusername bhejein, ya\n2. Us channel ki koi post is bot ko forward karein.")
+            return
         try:
             channel = telegram("getChat", {"chat_id": target}).get("result", {})
             link = f"https://t.me/{channel['username']}" if channel.get("username") else None
