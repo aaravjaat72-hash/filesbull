@@ -48,6 +48,8 @@ def supabase(path: str, method: str = "GET", payload: Any = None,
         "Authorization": f"Bearer {SUPABASE_KEY}",
         "Prefer": "return=representation",
     }
+    if method == "POST" and "on_conflict=" in query:
+        headers["Prefer"] = "return=representation,resolution=merge-duplicates"
     return http_json(url, method, payload, headers)
 
 
