@@ -1,4 +1,5 @@
 import json
+import io
 import os
 import re
 import urllib.parse
@@ -6,6 +7,7 @@ import urllib.request
 from typing import Any, Dict, List, Optional
 
 from flask import Flask, jsonify, request
+from pypdf import PdfReader
 
 app = Flask(__name__)
 
@@ -93,12 +95,36 @@ def file_info(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return None
 
 
+def extract_pdf_text(file_id: Optional[str], file_name: str = "") -> str:
+    """Best-effort extraction for normal text PDFs; scanned PDFs need OCR."""
+    if not file_id or not file_name.lower().endswith(".pdf") or not BOT_TOKEN:
+        return ""
+    try:
+        file_result = telegram("getFile", {"file_id": file_id}).get("result", {})
+        file_path = file_result.get("file_path")
+        if not file_path:
+            return ""
+        url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+        with urllib.request.urlopen(url, timeout=15) as response:
+            data = response.read(8 * 1024 * 1024)
+        reader = PdfReader(io.BytesIO(data))
+        chunks = []
+        for page in reader.pages[:25]:
+            chunks.append(page.extract_text() or "")
+            if sum(len(x) for x in chunks) >= 120000:
+                break
+        return clean_text(" ".join(chunks))[:120000]
+    except Exception:
+        return ""
+
+
 def build_metadata(message: Dict[str, Any], channel: Dict[str, Any]) -> Dict[str, Any]:
     info = file_info(message) or {}
     caption = message.get("caption", "") or ""
     raw_name = info.get("file_name", "")
     title = clean_text(caption) or clean_text(os.path.splitext(raw_name)[0])
-    searchable = " ".join([title, caption, raw_name, channel.get("title", "")])
+    content_text = extract_pdf_text(info.get("file_id"), raw_name)
+    searchable = " ".join([title, caption, raw_name, channel.get("title", ""), content_text])
     # Captions can contain explicit tags such as #ssc #english; retain them for search.
     keywords = clean_text(searchable)
     return {
@@ -115,6 +141,7 @@ def build_metadata(message: Dict[str, Any], channel: Dict[str, Any]) -> Dict[str
         "title": title[:500],
         "caption": caption[:4000],
         "keywords": keywords[:4000],
+        "content_text": content_text,
         "language": detect_language(searchable),
         "status": "indexed",
     }
@@ -139,11 +166,22 @@ def upsert_item(record: Dict[str, Any]) -> None:
 
 def search_books(query: str) -> List[Dict[str, Any]]:
     rows = supabase("books", "GET", query="?select=*&status=eq.indexed&limit=500")
-    terms = [normalize(x) for x in re.findall(r"[\w\u0900-\u097F]+", query) if len(x) > 1]
+    raw_terms = [normalize(x) for x in re.findall(r"[\w\u0900-\u097F]+", query) if len(x) > 1]
+    aliases = {
+        "eco": {"eco", "economy", "economic", "economics"},
+        "economy": {"eco", "economy", "economic", "economics"},
+        "economic": {"eco", "economy", "economic", "economics"},
+        "economics": {"eco", "economy", "economic", "economics"},
+    }
+    terms = set(raw_terms)
+    for term in raw_terms:
+        terms.update(aliases.get(term, set()))
     scored = []
     for row in rows:
-        haystack = normalize(" ".join(str(row.get(k, "")) for k in ("title", "caption", "keywords", "source_chat_title")))
+        haystack = normalize(" ".join(str(row.get(k, "")) for k in ("title", "caption", "keywords", "content_text", "source_chat_title")))
         score = sum(1 for term in terms if term in haystack)
+        if row.get("content_text") and any(term in normalize(row["content_text"]) for term in raw_terms):
+            score += 3
         if score:
             scored.append((score, row))
     scored.sort(key=lambda x: (-x[0], x[1].get("title", "")))

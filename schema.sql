@@ -22,6 +22,7 @@ create table if not exists public.books (
   title text not null,
   caption text,
   keywords text,
+  content_text text,
   language text,
   status text not null default 'indexed',
   created_at timestamptz not null default now(),
@@ -31,6 +32,8 @@ create table if not exists public.books (
 create index if not exists books_title_idx on public.books(title);
 create index if not exists books_keywords_idx on public.books(keywords);
 create index if not exists books_source_chat_idx on public.books(source_chat_id);
+
+alter table public.books add column if not exists content_text text;
 
 alter table public.channels enable row level security;
 alter table public.books enable row level security;
