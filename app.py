@@ -793,7 +793,7 @@ ADMIN_HELP = (
     "📋 Source Channels — list, ❌ se hatao\n"
     "💾 Backup Channel — har nayi file ki copy yahan, source fail ho to yahan se bhejega\n"
     "💾 Backup: purani files bhi — pehle ki files bhi backup (20-20 karke)\n"
-    "📝 Log Chat — naya user, kisne kaunsi file li, nayi file (user track)\n"
+    "📝 Log Chat — naya user, kisne kaunsi file li, nayi file (user track); 📜 Purani updates Log me bhejo = ab tak ki saari files ki details\n"
     "👥 Users — kitne users, aaj active, top 10; /user ID se details\n"
     "👮 Admins — sub-admin jodo/hatao (sirf owner)\n"
     "✏️ File Rename — file ka search naam badlo\n"
@@ -910,7 +910,8 @@ def handle_admin_input(message: Dict[str, Any], action: str, extra: Any) -> None
                 raise InputError("Bot is chat me message nahi bhej pa raha. Bot ko wahan add/admin karo.\n" + friendly_tg_error(exc)) from None
             set_setting("log_chat_id", str(chat["id"]))
             clear_pending(user_id)
-            send_text(chat_id, f"✅ Log chat set: {chat.get('title')}", {"inline_keyboard": [BACK_ROW]})
+            send_text(chat_id, f"✅ Log chat set: {chat.get('title')}\n\nAb tak ki saari files ki details bhi wahan bhejni hain? Niche dabao 👇",
+                      {"inline_keyboard": [[{"text": "📜 Purani updates Log me bhejo", "callback_data": "ad:logfill"}], BACK_ROW]})
         elif action == "addadmin":
             if not is_owner(user_id):
                 raise InputError("Admin sirf owner jod sakta hai.")
@@ -1010,9 +1011,7 @@ def handle_admin_callback(query: Dict[str, Any], data: str, chat_id: int, user_i
     elif cmd == "users":
         show(chat_id, users_view(), {"inline_keyboard": [[{"text": "🔄 Refresh", "callback_data": "ad:users"}], BACK_ROW]}, query)
     elif cmd == "log":
-        show(chat_id, *setting_view("log_chat_id", "📝 Log Chat (User Track)", "ad:setlog", "ad:logoff",
-                                    "Yahan aayega: 🆕 nayi file (kab, kahan se, purana naam → naya naam, category), ✏️ naam badla (kisne), "
-                                    "📥 kis user ne kaunsi file li, 🗂️ nayi category bani. Set na ho to /logs se last 50 dekho."), query=query)
+        show(chat_id, *log_setting_view(), query=query)
     elif cmd in {"setbackup", "setlog"}:
         ask_input(chat_id, user_id, cmd)
     elif cmd in {"backupoff", "logoff"}:
@@ -1909,7 +1908,8 @@ def ask_question(chat_id: int, user_id: Optional[int], ctx: Dict[str, Any], kind
     send_text(chat_id, msg, {"inline_keyboard": kb}, "HTML")
 
 
-def smart_reply(chat_id: int, user: Dict[str, Any], text: str) -> None:
+def smart_reply(chat_id: int, user: Dict[str, Any], text: str, searched: bool = False) -> None:
+    """searched=True: an admin already tapped 🔍 Search — just search, never ask again."""
     user_id = user.get("id")
     u = understand(text)
     intent = u["intent"]
@@ -1920,7 +1920,7 @@ def smart_reply(chat_id: int, user: Dict[str, Any], text: str) -> None:
         send_text(chat_id, THANKS_MSG)
         return
     if intent in {"off_topic", "empty"}:
-        send_text(chat_id, OFFTOPIC_MSG, None, "HTML")
+        offtopic_reply(chat_id, user, text, searched)
         return
     ctx = load_ctx(user_id)
     if intent == "more":
@@ -1962,7 +1962,7 @@ def smart_reply(chat_id: int, user: Dict[str, Any], text: str) -> None:
         save_ctx(user_id, ctx)
         if ans:
             if ans["intent"] in {"off_topic", "greeting"}:
-                send_text(chat_id, OFFTOPIC_MSG, None, "HTML")
+                offtopic_reply(chat_id, user, text, searched)
                 return
             if ans["intent"] == "more" and ctx.get("q"):
                 show_more(chat_id, user_id, ctx)
@@ -1993,7 +1993,7 @@ def handle_guided_callback(query: Dict[str, Any], data: str, chat_id: int) -> No
         return
     if val == "all" or not val:
         if not pending or not send_results(chat_id, user_id, ctx, pending, lang, None, " ".join(pending)):
-            send_text(chat_id, OFFTOPIC_MSG, None, "HTML")
+            offtopic_reply(chat_id, user, "", True)
         return
     label = dict((v, l) for l, v in EXAM_BUTTONS).get(val, val)
     if has_full_match(pending + [val], lang) and send_results(chat_id, user_id, ctx, pending + [val], lang, None, " ".join(pending + [val])):
@@ -2922,7 +2922,7 @@ def handle_admin_command(message: Dict[str, Any]) -> None:
             handle_admin_input(dict(message, text=arg), "setbackup", None)
     elif command == "/setlogchat":
         if not arg:
-            send_text(chat_id, *setting_view("log_chat_id", "📝 Log Chat", "ad:setlog", "ad:logoff", "Nayi file, naam badla, kisne file li — sab yahan. (/logs = last 50)"))
+            send_text(chat_id, *log_setting_view())
         else:
             handle_admin_input(dict(message, text=arg), "setlog", None)
     elif command in {"/report", "/stats"}:
@@ -3074,14 +3074,18 @@ _REQ_T0 = [time.monotonic()]
 
 ADMIN_ACTIONS = {"search", "rename", "bulk_rename", "delete_file", "backup_old", "list_files", "users", "report",
                  "status", "restart", "add_channel", "remove_channel", "list_channels", "add_admin", "ai_keys",
-                 "ai_naming", "fix_names", "panel", "help", "unknown"}
+                 "ai_naming", "fix_names", "panel", "help", "log_backfill", "unknown"}
 OWNER_ONLY_ACTIONS = {"add_admin", "ai_keys"}
 SEARCH_PREFIXES = ("?", "？", "🔍", "search ", "dhoondo ", "dhundo ", "khojo ", "find ")
 CMD_VERBS = {"kr", "kro", "krdo", "krde", "krna", "krne", "krke", "karo", "kardo", "karde", "kar", "karna", "karne",
              "karke", "kijiye", "kijie", "badlo", "badal", "badl", "badalna", "change", "rename", "hatao", "hata",
              "hatado", "hatana", "mitao", "mita", "delete", "remove", "set", "jodo", "jod", "add", "upload", "backup",
              "restart", "chalu", "band", "on", "off", "naam", "name", "rakho", "rakh", "theek", "thik", "sahi",
-             "bana", "banao", "bnao", "bnado", "banado"}
+             "bana", "banao", "bnao", "bnado", "banado",
+             # Aarav 6:14 PM Oct 26: "Abhi tkk ki sari updates log chat me dal do" was missed — these words mean "a job"
+             "dal", "daal", "dalo", "daalo", "daldo", "daaldo", "dalna", "bhej", "bhejo", "bhejdo", "bhejna", "send",
+             "dikhao", "dikha", "dikhado", "hatao", "jodo", "lagao", "log", "logs", "update", "updates", "record",
+             "backup", "users", "report", "status", "restart", "rename", "naam", "settings", "setting"}
 NAME_WORDS = r"(?:name|naam|nam|title|named)"
 DO_TAIL = r"(?:kr|kar|rakh|krdo|kardo|karo|kro|krde|karde|krna|karna|likh|bana)\s*(?:do|de|dena|dijiye|dijie|o)?"
 
@@ -3192,6 +3196,9 @@ def local_admin_intent(text: str) -> Optional[Dict[str, Any]]:
     if words & {"naam", "name", "names", "naamo", "nam"} and words & {"theek", "thik", "sahi", "fix", "clean", "saaf"} and \
             words & {"purane", "purani", "old", "sab", "sabhi", "sare", "saare", "sari", "saari", "all", "ai"}:
         return {"action": "fix_names"}
+    # 📜 old updates → Log Chat ("Abhi tkk ki sari updates log chat me dal do", "purani updates bhejo")
+    if is_log_backfill(low, words):
+        return {"action": "log_backfill"}
     # backup of old files ("Sari ek baar me upload kro", "sab files backup kro")
     if words & {"backup", "bkp", "upload", "uplod", "uplode"}:
         if words & {"channel", "chat"} and words & {"set", "badlo", "change", "lagao", "jodo"}:
@@ -3254,6 +3261,7 @@ ADMIN_AI_SYSTEM = (
     "delete_file (find), backup_old (copy/upload all old files to the backup channel), list_files, users, report, "
     "status, restart, add_channel (kind join|source, target @name/link or null), remove_channel (kind), "
     "list_channels (kind), add_admin, ai_keys, ai_naming (on true/false), fix_names (let AI clean old file names), "
+    "log_backfill (send details of ALL files added so far — old updates / records — to the log chat / log channel), "
     "panel, help, unknown. Message may be Hindi/Hinglish. If unclear, action unknown and ask = ONE short Hinglish question. "
     "Never invent file names; copy find/to from the message.")
 
@@ -3317,9 +3325,10 @@ def admin_text(chat_id: int, user: Dict[str, Any], text: str) -> Optional[str]:
         if not looks_like_command(raw):
             return raw                       # plain words ("lucent", "ssc gd gk hindi") → search, no AI
         intent = ai_admin_intent(user_id, raw)
-        if intent is None:
-            # AI down / limit / unsure → never a dead end: treat it as a normal search (local rules first).
-            return raw
+        if intent is None or intent.get("action") == "unknown":
+            # Sounds like a job but neither the rules nor the AI could tell → ask once (never the user off-topic reply).
+            ask_cmd_or_search(chat_id, user_id, raw, (intent or {}).get("ask"))
+            return None
     if intent["action"] == "search":
         return intent.get("query") or raw
     run_admin_action(chat_id, user, intent, raw)
@@ -3406,11 +3415,10 @@ def run_admin_action(chat_id: int, user: Dict[str, Any], intent: Dict[str, Any],
         send_text(chat_id, ADMIN_PANEL_TEXT, admin_menu(user_id), "HTML")
     elif a == "help":
         send_text(chat_id, ADMIN_HELP, {"inline_keyboard": [BACK_ROW]})
+    elif a == "log_backfill":
+        logfill_preview(chat_id, user_id, query)
     else:   # unknown
-        token = set_op(user_id, {"kind": "search", "q": raw[:300]})
-        ask = intent.get("ask") or "Samajh nahi aaya — kya karna hai?"
-        send_text(chat_id, "🤔 " + ask, {"inline_keyboard": [[{"text": "🔍 Search karo", "callback_data": f"ad:op:s:{token}"}],
-                                                             [{"text": "⚙️ Admin Panel", "callback_data": "ad:panel"}]]})
+        ask_cmd_or_search(chat_id, user_id, raw, intent.get("ask"))
 
 
 # ---- rename / bulk rename / delete flows
@@ -3596,6 +3604,13 @@ def run_op(query: Dict[str, Any], chat_id: int, user_id: int, op: Dict[str, Any]
         set_setting("ai_naming", "on" if op.get("on") else "off")
         text, kb = ainame_view()
         show(chat_id, ("✅ AI Naming chalu ho gaya\n\n" if op.get("on") else "✅ AI Naming band ho gaya\n\n") + text, kb, query)
+    elif kind == "logfill":
+        clear_op(user_id)
+        if not get_setting("log_chat_id"):
+            show(chat_id, setlog_steps_text(), {"inline_keyboard": [[{"text": "📝 Log Chat set karo", "callback_data": "ad:setlog"}], BACK_ROW]}, query)
+            return
+        logfill_start(user_id, chat_id, int(op.get("n") or 0))
+        logfill_run_from_button(query, chat_id)
     elif kind == "addch":
         clear_op(user_id)
         if op.get("ch") == "join":
@@ -3853,6 +3868,24 @@ def handle_admin_callback_v6(query: Dict[str, Any], cmd: str, chat_id: int, user
         text, kb = files_view(1)
         show(chat_id, f"✅ File hata di: {(rows[0].get('title') if rows else bid)}\n\n" + text, kb, query)
         return True
+    if cmd == "logfill":
+        logfill_preview(chat_id, user_id, query)
+        return True
+    if cmd == "logfill:go":
+        st = logfill_state()
+        if not logfill_active(st) and st.get("stopped") == "errors":
+            st.pop("stopped", None)
+            st["errors"] = 0
+            logfill_save(st)
+        if not logfill_active():
+            show(chat_id, logfill_status_text(st) if st else "📜 Koi adhoora kaam nahi hai.", {"inline_keyboard": [BACK_ROW]}, query)
+            return True
+        logfill_run_from_button(query, chat_id)
+        return True
+    if cmd.startswith("cmdq:"):
+        clear_op(user_id)
+        show(chat_id, *cmd_choice_view(user_id), query=query)
+        return True
     if cmd == "smode":
         on = get_setting(f"admsearch:{user_id}") == "1"
         set_setting(f"admsearch:{user_id}", "0" if on else "1")
@@ -3895,7 +3928,7 @@ def handle_admin_callback_v6(query: Dict[str, Any], cmd: str, chat_id: int, user
             run_op(query, chat_id, user_id, op)
         elif verb == "s" and op.get("kind") == "search":
             clear_op(user_id)
-            smart_reply(chat_id, query.get("from") or {"id": user_id}, str(op.get("q") or ""))
+            smart_reply(chat_id, query.get("from") or {"id": user_id}, str(op.get("q") or ""), searched=True)
         elif verb == "p" and op.get("kind") == "rename_pick" and len(parts) > 3 and parts[3].isdigit():
             rows = supabase("books", "GET", query=f"?id=eq.{int(parts[3])}&select=id,title&limit=1")
             if rows:
@@ -4013,6 +4046,16 @@ def health() -> Any:
         flush_logs()        # ✏️ renames done by the retry go to the log too
     except Exception:
         log_error("flush_logs")
+    try:
+        # 📜 a log backfill that stopped half way (function time over / lost kick) continues on the keepalive
+        lf = logfill_state()
+        if logfill_active(lf) and time.time() - float(lf.get("last_ts") or 0) > 60:
+            lf = logfill_step(budget=max(2.5, 8.0 - req_elapsed()))
+            logfill_notify_done(lf)
+            if logfill_active(lf) and not lf.get("_busy"):
+                logfill_kick()
+    except Exception:
+        log_error("logfill keepalive")
     _REQ.clear()
     status = setup_status()
     status["webhook_registered"] = registered
@@ -4070,6 +4113,12 @@ def diagnostics() -> Dict[str, Any]:
     except Exception:
         pass
     d["log_chat_set"] = bool(get_setting("log_chat_id"))
+    try:
+        _lf = logfill_state()
+        d["log_backfill"] = ({"active": logfill_active(_lf), "sent": _lf.get("sent_files", 0), "total": _lf.get("total", 0),
+                              "done": bool(_lf.get("done"))} if _lf else "never")
+    except Exception:
+        pass
     try:
         d["named_by"] = named_by_counts()          # clean / local_text = 0 tokens; ai = one small call; fallback
         d["categories_auto"] = sorted(cat_registry())
@@ -5317,6 +5366,408 @@ def build_header(response: Any) -> Any:
     # Which commit is serving (lets a deploy be verified without opening the home page).
     response.headers["X-Filesbull-Build"] = os.environ.get("VERCEL_GIT_COMMIT_SHA", "")[:7] or "local"
     return response
+
+
+# ================================================================ v9: admin text never gets the user off-topic reply + 📜 log backfill
+# Aarav 6:14 PM Oct 26: as owner he typed "Abhi tkk ki sari updates log chat me dal do" and got
+# "🙏 Main sirf books / PDF dhoondhne me madad karta hu…". For admins that reply never fires now:
+# rules → AI → "🤔 Ye command hai ya search?" [⚙️ Command] [🔍 Search].
+
+_BF_LOG = {"log", "logs", "लॉग"}
+_BF_REC = {"update", "updates", "updets", "updatess", "record", "records", "details", "detail", "history", "entries",
+           "entry", "data", "jankari", "info"}
+_BF_ALL = {"sari", "saari", "sare", "saare", "sab", "sabhi", "all", "purani", "purane", "purana", "old", "pichli",
+           "pichle", "puri", "poori", "pura", "poora", "tak", "tk", "tkk", "takk"}
+_BF_SEND = {"dal", "daal", "dalo", "daalo", "daldo", "daaldo", "dalna", "daalna", "dalde", "bhej", "bhejo", "bhejdo",
+            "bhejde", "bhejna", "send", "post", "forward", "chadhao", "kr", "kro", "karo", "kar", "do", "de"}
+
+
+def is_log_backfill(low: str, words: set) -> bool:
+    """'sari updates log chat me dal do', 'purani updates bhejo', 'abhi tak ka record log me'."""
+    if words & {"set", "lagao", "badlo", "hatao", "band", "off"} and not words & _BF_REC:
+        return False                      # "log chat set kro" / "log band kro" are other jobs
+    marker = bool(words & _BF_ALL) or bool(re.search(r"\b(?:abhi|ab|aaj)\s*(?:tak|tk|tkk|takk)\b|till\s+now|so\s+far", low))
+    if not marker:
+        return False
+    has_log = bool(words & _BF_LOG)
+    has_rec = bool(words & _BF_REC)
+    has_send = bool(words & _BF_SEND)
+    has_place = bool(words & {"chat", "channel", "chanel", "group", "me", "mein", "mai"})
+    # "log" alone can mean people ("sab log kitne hai") — needs a record word, a send verb or "log chat/channel/me"
+    if has_log and (has_rec or has_send or has_place):
+        return True
+    return has_rec and has_send and bool(words & {"purani", "purane", "old", "pichli", "pichle", "tak", "tk", "tkk", "takk",
+                                                  "sari", "saari", "sab", "sabhi", "all"})
+
+
+def ask_cmd_or_search(chat_id: int, user_id: int, raw: str, hint: Optional[str] = None,
+                      query: Optional[Dict[str, Any]] = None) -> None:
+    token = set_op(user_id, {"kind": "search", "q": (raw or "")[:300]})
+    text = "🤔 Ye command hai ya search?"
+    if raw:
+        text += f"\n\n\"{raw[:120]}\""
+    if hint and hint.strip() and "command" not in hint.lower():
+        text += f"\n\n{hint.strip()[:200]}"
+    show(chat_id, text, {"inline_keyboard": [[{"text": "⚙️ Command", "callback_data": f"ad:cmdq:{token}"},
+                                              {"text": "🔍 Search", "callback_data": f"ad:op:s:{token}"}]]}, query)
+
+
+def offtopic_reply(chat_id: int, user: Dict[str, Any], text: str, searched: bool = False) -> None:
+    """Non-admins: the fixed off-topic reply. Admins: never — ask command/search, or after 🔍 Search say nothing found."""
+    uid = user.get("id")
+    if uid and is_subadmin(uid):
+        if searched or not (text or "").strip():
+            send_text(chat_id, f"😕 \"{(text or '')[:60]}\" ke liye koi file nahi mili.\n"
+                               "Book ka naam / subject likho, ya 📂 All Files dekho.",
+                      {"inline_keyboard": [[{"text": "📂 All Files", "callback_data": "ad:files:1"}],
+                                           [{"text": "⚙️ Admin Panel", "callback_data": "ad:panel"}]]})
+        else:
+            ask_cmd_or_search(chat_id, int(uid), text)
+        return
+    send_text(chat_id, OFFTOPIC_MSG, None, "HTML")
+
+
+CMD_EXAMPLES = ("⚙️ Bolke kaam — aise likho:\n"
+                "▸ \"polity ka naam politics kr do\"\n"
+                "▸ \"abhi tak ki sari updates log chat me dal do\"\n"
+                "▸ \"sari ek baar me upload kro\" (backup)\n"
+                "▸ \"lucent wali file hatao\"\n"
+                "▸ \"users dikhao\" / \"status\" / \"bot restart kro\"\n\n"
+                "Ya niche se button chuno 👇")
+
+
+def cmd_choice_view(user_id: int) -> Any:
+    kb = [[{"text": "📜 Purani updates Log me bhejo", "callback_data": "ad:logfill"}]] + admin_menu(user_id)["inline_keyboard"]
+    return CMD_EXAMPLES, {"inline_keyboard": kb}
+
+
+# ---- 📜 log backfill: every file added so far → 📝 Log Chat (summary + ~20 files per message, ≥1.1 s apart, resumable)
+LOGFILL_PER_MSG = 20
+LOGFILL_GAP = 1.1          # seconds between two messages to the log chat (Telegram: ~20 msgs/min per chat)
+LOGFILL_BUDGET = 7.0       # seconds per function run; the rest continues by itself / ▶️ Aage bhejo / keepalive
+LOGFILL_SLEEP = [time.sleep]
+LOGFILL_KEY = "logfill_state"
+
+
+def logfill_cols() -> str:
+    return "id,title,file_name,caption,keywords,source_chat_id,source_chat_title,created_at" + \
+        (",category" if has_category_col() else "")
+
+
+def logfill_state() -> Dict[str, Any]:
+    try:
+        d = json.loads(get_setting(LOGFILL_KEY) or "{}")
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def logfill_save(st: Dict[str, Any]) -> None:
+    set_setting(LOGFILL_KEY, json.dumps(st, ensure_ascii=False, separators=(",", ":")))
+
+
+def logfill_active(st: Optional[Dict[str, Any]] = None) -> bool:
+    st = logfill_state() if st is None else st
+    return bool(st) and not st.get("done") and not st.get("stopped")
+
+
+def setlog_steps_text() -> str:
+    return ("📝 Log Chat abhi set nahi hai, isliye purani updates kahin nahi bhej sakta.\n\n"
+            "Set karne ke steps:\n"
+            "1️⃣ Telegram me naya private channel banao (jaise \"Files Bull Logs\")\n"
+            "2️⃣ Channel → Administrators → Add Admin → " + bot_mention() + " → \"Post Messages\" on → Save\n"
+            "3️⃣ /admin → 📝 Log Chat → ✏️ Set / Badlo → us channel ki koi bhi post yahan FORWARD karo\n\n"
+            "Phir dobara bolo: \"sari updates log chat me dal do\"")
+
+
+def logfill_preview(chat_id: int, user_id: int, query: Optional[Dict[str, Any]] = None) -> None:
+    if not get_setting("log_chat_id"):
+        show(chat_id, setlog_steps_text(), {"inline_keyboard": [[{"text": "📝 Log Chat set karo", "callback_data": "ad:setlog"}], BACK_ROW]}, query)
+        return
+    n = count_rows("books", "&status=eq.indexed")
+    if not n:
+        show(chat_id, "📜 Abhi koi file save hi nahi hai — bhejne ko kuch nahi.", {"inline_keyboard": [BACK_ROW]}, query)
+        return
+    msgs = 1 + (n + LOGFILL_PER_MSG - 1) // LOGFILL_PER_MSG
+    st = logfill_state()
+    note = ""
+    if logfill_active(st):
+        note = (f"\n\nℹ️ Pichli baar {st.get('sent_files', 0)}/{st.get('total', 0)} bheji thi — "
+                "Accept karne pe shuru se dobara jayegi (adhoori wali ke liye ▶️ Aage bhejo).")
+    text = f"📜 Log Chat me ab tak ki {n} files ki details jayengi (~{msgs} messages). Bhejun?" + note
+    kb_extra = [[{"text": f"▶️ Aage bhejo ({st.get('sent_files', 0)}/{st.get('total', 0)})", "callback_data": "ad:logfill:go"}]] \
+        if logfill_active(st) else []
+    kb = accept_kb(set_op(user_id, {"kind": "logfill", "n": n}))
+    kb["inline_keyboard"] = kb["inline_keyboard"] + kb_extra
+    show(chat_id, text, kb, query)
+
+
+def _orig_name(row: Dict[str, Any]) -> str:
+    fn = str(row.get("file_name") or "").strip()
+    if fn:
+        return fn
+    cap = str(row.get("caption") or "").strip().split("\n")[0]
+    return cap[:80]
+
+
+def _norm_nm(s: str) -> str:
+    return re.sub(r"[^a-z0-9\u0900-\u097F]+", "", os.path.splitext(str(s or ""))[0].lower())
+
+
+def _was_renamed(row: Dict[str, Any]) -> bool:
+    o = _orig_name(row)
+    return bool(o) and _norm_nm(o) != _norm_nm(row.get("title") or "")
+
+
+def _src_label(row: Dict[str, Any]) -> str:
+    title = str(row.get("source_chat_title") or "").strip()
+    try:
+        sid = int(row.get("source_chat_id") or 0)
+    except Exception:
+        sid = 0
+    if sid > 0 or title.lower() == "admin uploads":
+        return "👤 Admin upload"
+    return f"📢 {title[:40]}" if title else "📢 Channel"
+
+
+def logfill_all_rows() -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    after = 0
+    for _ in range(50):
+        rows = supabase("books", "GET", query=f"?select={logfill_cols()}&status=eq.indexed&id=gt.{after}&order=id.asc&limit=1000")
+        out.extend(rows)
+        if len(rows) < 1000:
+            break
+        after = int(rows[-1]["id"])
+    return out
+
+
+def logfill_total_users() -> int:
+    try:
+        if users_table_ok():
+            return count_rows("bot_users", col="user_id")
+        return len(all_user_recs())
+    except Exception:
+        return 0
+
+
+def logfill_summary(rows: List[Dict[str, Any]]) -> str:
+    cmap = {} if has_category_col() else catmap()
+    counts: Dict[str, int] = {}
+    for r in rows:
+        slug = book_category(r, cmap)
+        counts[slug] = counts.get(slug, 0) + 1
+    renamed = sum(1 for r in rows if _was_renamed(r))
+    srcs: Dict[str, int] = {}
+    for r in rows:
+        k = _src_label(r)
+        srcs[k] = srcs.get(k, 0) + 1
+    order = sorted(counts.items(), key=lambda kv: (kv[0] == "other", -kv[1], cat_label(kv[0])))
+    lines = ["📜 Ab tak ka record (" + ist_now() + " IST)", "",
+             f"📚 Kul files: {len(rows)}",
+             f"👥 Kul users: {logfill_total_users()}",
+             f"✏️ Naam badle ab tak: {renamed} (asli file naam se alag)", "",
+             "🗂️ Category wise:"]
+    for slug, c in order[:40]:
+        lines.append(f"{cat_emoji(slug)} {cat_label(slug)}: {c}")
+    lines.append("")
+    lines.append("📍 Kahan se aayi:")
+    for k, c in sorted(srcs.items(), key=lambda kv: -kv[1])[:12]:
+        lines.append(f"{k}: {c}")
+    lines.append("")
+    lines.append(f"Niche har file ki line ({LOGFILL_PER_MSG}-{LOGFILL_PER_MSG} karke): tareekh · kahan se · asli naam → abhi ka naam · category")
+    return "\n".join(lines)[:4000]
+
+
+def logfill_line(n: int, row: Dict[str, Any], cmap: Dict[str, str]) -> str:
+    orig = _orig_name(row)
+    cur = str(row.get("title") or "Untitled")
+    slug = book_category(row, cmap)
+    name = f"{orig[:60]} → {cur[:70]}" if orig and _was_renamed(row) else cur[:90]
+    when = ist_time(row.get("created_at")) if row.get("created_at") else ""
+    return f"{n}. " + (f"{when} · " if when else "") + f"{_src_label(row)}\n   📄 {name} · {cat_emoji(slug)} {cat_label(slug)}"
+
+
+def _tg_wait(exc: Exception) -> int:
+    m = re.search(r"retry after (\d+)", str(exc), re.I)
+    return int(m.group(1)) if m else 0
+
+
+def logfill_send(target: str, text: str, st: Dict[str, Any]) -> None:
+    gap = LOGFILL_GAP - (time.time() - float(st.get("last_ts") or 0))
+    if gap > 0:
+        LOGFILL_SLEEP[0](gap)
+    telegram("sendMessage", {"chat_id": int(target), "text": text[:4000], "disable_web_page_preview": True,
+                             "disable_notification": True})
+    st["last_ts"] = time.time()
+    st["msgs"] = int(st.get("msgs") or 0) + 1
+
+
+def logfill_start(user_id: int, chat_id: int, n: int) -> Dict[str, Any]:
+    st = {"after": 0, "sent_files": 0, "total": int(n), "msgs": 0, "summary": False, "by": int(user_id),
+          "chat": int(chat_id), "t": int(time.time()), "done": False, "last_ts": 0, "lock": 0, "num": 0}
+    logfill_save(st)
+    return st
+
+
+def logfill_step(budget: float = LOGFILL_BUDGET) -> Dict[str, Any]:
+    """Send as much as fits in the time budget; the cursor is saved after every message (resumable)."""
+    st = logfill_state()
+    if not logfill_active(st):
+        return st
+    now = time.time()
+    if float(st.get("lock") or 0) > now:
+        st["_busy"] = True
+        return st                          # another run is sending right now
+    if float(st.get("wait_until") or 0) > now:
+        st["_wait"] = int(float(st["wait_until"]) - now)
+        return st
+    target = get_setting("log_chat_id")
+    if not target:
+        st["stopped"] = "no_log_chat"
+        logfill_save(st)
+        return st
+    started = time.monotonic()
+    st["lock"] = now + budget + 5
+    logfill_save(st)
+    cmap = {} if has_category_col() else catmap()
+    try:
+        if not st.get("summary"):
+            rows = logfill_all_rows()
+            st["total"] = len(rows)
+            logfill_send(target, logfill_summary(rows), st)
+            st["summary"] = True
+            logfill_save(st)
+        while time.monotonic() - started + LOGFILL_GAP + 1.0 < budget:
+            rows = supabase("books", "GET", query=f"?select={logfill_cols()}&status=eq.indexed&id=gt.{int(st['after'])}"
+                                                  f"&order=id.asc&limit={LOGFILL_PER_MSG}")
+            if not rows:
+                st["done"] = True
+                break
+            num = int(st.get("num") or 0)
+            first = num + 1
+            lines = [logfill_line(num + i + 1, r, cmap) for i, r in enumerate(rows)]
+            head = f"📜 Files {first}–{num + len(rows)} / {max(int(st.get('total') or 0), num + len(rows))}"
+            body = head + "\n\n" + "\n".join(lines)
+            if len(body) > 4000:
+                body = body[:3990] + "…"
+            logfill_send(target, body, st)
+            st["num"] = num + len(rows)
+            st["sent_files"] = st["num"]
+            st["after"] = int(rows[-1]["id"])
+            logfill_save(st)
+            if len(rows) < LOGFILL_PER_MSG:
+                st["done"] = True
+                break
+    except Exception as exc:
+        wait = _tg_wait(exc)
+        if wait:
+            st["wait_until"] = time.time() + wait + 1
+        else:
+            st["errors"] = int(st.get("errors") or 0) + 1
+            st["last_error"] = type(exc).__name__ + ": " + str(exc)[:120].replace(BOT_TOKEN or "\0", "***")
+            if st["errors"] >= 5:
+                st["stopped"] = "errors"
+        log_error("logfill")
+    st["lock"] = 0
+    if st.get("done"):
+        st["finished"] = int(time.time())
+    logfill_save(st)
+    return st
+
+
+def logfill_status_text(st: Dict[str, Any]) -> str:
+    total = int(st.get("total") or 0)
+    sent = int(st.get("sent_files") or 0)
+    if st.get("done"):
+        return f"✅ Log Chat me ab tak ki {sent} files ki details bhej di ({int(st.get('msgs') or 0)} messages: summary + list)."
+    if st.get("stopped") == "no_log_chat":
+        return "❌ Log Chat hata diya gaya, isliye ruk gaya. Log Chat set karke dobara bolo."
+    if st.get("stopped"):
+        return f"❌ {sent}/{total} bhejne ke baad ruk gaya (Telegram error). ▶️ Aage bhejo dabao."
+    extra = ""
+    if st.get("_wait"):
+        extra = f"\nTelegram ne {st['_wait']} sec rukne ko kaha — uske baad apne-aap aage."
+    elif st.get("_busy"):
+        extra = "\nAbhi bhej raha hai…"
+    return f"⏳ {sent}/{total} files bhej di. Baaki apne-aap jaa rahi hain (atke to ▶️ Aage bhejo).{extra}"
+
+
+def logfill_markup(st: Dict[str, Any]) -> Dict[str, Any]:
+    kb: List[Any] = []
+    if logfill_active(st) or st.get("stopped") == "errors":
+        kb.append([{"text": "▶️ Aage bhejo", "callback_data": "ad:logfill:go"}])
+    kb.append(BACK_ROW)
+    return {"inline_keyboard": kb}
+
+
+def logfill_kick_key() -> str:
+    return hmac.new((WEBHOOK_SECRET or "x").encode(), b"logfill", hashlib.sha256).hexdigest()[:24]
+
+
+def logfill_kick() -> None:
+    """Start the next run in a fresh function call (the cursor is saved, so a lost kick only waits for keepalive)."""
+    try:
+        urllib.request.urlopen(urllib.request.Request(PUBLIC_HOME + "api/logfill?k=" + logfill_kick_key(),
+                                                      headers={"User-Agent": "filesbull-bot/1.0"}), timeout=1.5).read()
+    except Exception:
+        pass
+
+
+def logfill_notify_done(st: Dict[str, Any]) -> None:
+    if st.get("done") and not st.get("notified") and st.get("chat"):
+        st["notified"] = True
+        logfill_save(st)
+        try:
+            send_text(int(st["chat"]), logfill_status_text(st), {"inline_keyboard": [BACK_ROW]})
+        except Exception:
+            log_error("logfill notify")
+
+
+@app.get("/api/logfill")
+def logfill_endpoint() -> Any:
+    tok = request.args.get("k", "")
+    diag = request.args.get("t", "")
+    ok = bool(tok) and hmac.compare_digest(tok, logfill_kick_key())
+    if not ok and diag:
+        ok = hmac.compare_digest(hashlib.sha256(diag.encode()).hexdigest(), DIAG_TOKEN_SHA256)
+    if not ok:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    _REQ_T0[0] = time.monotonic()
+    st = logfill_state()
+    if not logfill_active(st):            # only continues a run an admin already accepted
+        return jsonify({"ok": True, "active": False, "done": bool(st.get("done")), "sent": st.get("sent_files", 0)})
+    st = logfill_step()
+    logfill_notify_done(st)
+    if logfill_active(st) and not st.get("_busy"):
+        if st.get("_wait"):
+            LOGFILL_SLEEP[0](min(int(st["_wait"]), 6))
+        logfill_kick()
+    return jsonify({"ok": True, "active": logfill_active(st), "sent": st.get("sent_files", 0), "total": st.get("total", 0)})
+
+
+def logfill_run_from_button(query: Optional[Dict[str, Any]], chat_id: int) -> None:
+    try:
+        telegram("answerCallbackQuery", {"callback_query_id": (query or {}).get("id"), "text": "📜 Log Chat me bhej raha hu..."})
+    except Exception:
+        pass
+    st = logfill_step(max(2.5, LOGFILL_BUDGET - req_elapsed()))
+    show(chat_id, logfill_status_text(st), logfill_markup(st), query)
+    if st.get("done"):
+        st["notified"] = True
+        logfill_save(st)
+    elif logfill_active(st) and not st.get("_busy"):
+        logfill_kick()
+
+
+def log_setting_view() -> Any:
+    text, kb = setting_view("log_chat_id", "📝 Log Chat (User Track)", "ad:setlog", "ad:logoff",
+                            "Yahan aayega: 🆕 nayi file (kab, kahan se, purana naam → naya naam, category), ✏️ naam badla (kisne), "
+                            "📥 kis user ne kaunsi file li, 🗂️ nayi category bani. Set na ho to /logs se last 50 dekho.")
+    rows = kb["inline_keyboard"]
+    rows.insert(len(rows) - 1, [{"text": "📜 Purani updates Log me bhejo", "callback_data": "ad:logfill"}])
+    return text, kb
+
 
 
 _SEEN_UPDATES: List[Any] = []
