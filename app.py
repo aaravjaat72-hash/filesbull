@@ -9759,10 +9759,10 @@ def ub_login_step(st: Dict[str, Any], step: str, value: str) -> Dict[str, Any]:
 
 def ub_finish_login(st: Dict[str, Any], r: Dict[str, Any]) -> Dict[str, Any]:
     me = r.get("me") or {}
-    if int(me.get("id") or 0) != int(st.get("u") or 0) or not is_owner(int(me.get("id") or 0)):
-        # The link is owner-only AND it must authorize that same owner's Telegram account, not a different one.
-        # Never persist a session for a stranger (even if a one-time link leaked during its 10-minute lifetime).
-        raise InputError("Ye Telegram account bot ke owner wale account se alag hai. Wahi account se login karo.")
+    # The page itself is owner-only (signed one-time link from the owner's /admin, 10 min). Aarav (Oct 26, 9:24 PM)
+    # wants to log in with a DIFFERENT (second) Telegram account as the userbot, so any account is allowed here.
+    if not int(me.get("id") or 0):
+        raise InputError("Login poora nahi hua, dobara try karo")
     set_setting(UB_SESS_KEY, ub_encrypt(r["s"]))
     ub_del(UB_LOGIN_KEY)
     ust = ub_state()
