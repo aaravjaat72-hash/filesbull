@@ -113,7 +113,7 @@ def ai_rank(query: str, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not OPENAI_API_KEY or len(rows) < 2:
         return rows
     compact = [{"id": r.get("id"), "title": r.get("title"), "keywords": r.get("keywords", "")[:500], "content": r.get("content_text", "")[:700]} for r in rows[:10]]
-    prompt = "Select only the IDs of files that best satisfy the user's request. Return JSON {\\"ids\\":[number]}. Never invent IDs. User: " + query + "\\nFiles: " + json.dumps(compact, ensure_ascii=False)
+    prompt = "Select only the IDs of files that best satisfy the user's request. Return JSON with an ids array of numbers. Never invent IDs. User: " + query + "\nFiles: " + json.dumps(compact, ensure_ascii=False)
     try:
         result = http_json("https://api.openai.com/v1/chat/completions", "POST", {
             "model": OPENAI_MODEL,
