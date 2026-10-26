@@ -61,7 +61,9 @@ def log_error(where: str) -> None:
 def http_json(url: str, method: str = "GET", payload: Optional[Dict[str, Any]] = None,
               headers: Optional[Dict[str, str]] = None, timeout: float = 20) -> Dict[str, Any]:
     body = None
-    final_headers = {"Content-Type": "application/json"}
+    # A browser-like/app User-Agent: Cloudflare-fronted APIs (Groq) answer 403 "error code 1010"
+    # to Python's default "Python-urllib" agent.
+    final_headers = {"Content-Type": "application/json", "User-Agent": "filesbull-bot/1.0 (+https://filesbull.vercel.app)"}
     if headers:
         final_headers.update(headers)
     if payload is not None:
