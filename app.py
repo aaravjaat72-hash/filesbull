@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import hmac
 import html
@@ -59,7 +60,8 @@ def log_error(where: str) -> None:
     # Printed tracebacks show up in Vercel -> Project -> Logs. Never print the token.
     text = traceback.format_exc()
     for secret in (BOT_TOKEN, OPENAI_API_KEY, SUPABASE_KEY, *GROQ_KEYS, *[x.get("k", "") for x in _DBKEYS["v"]],
-                   *[k for v in globals().get("ENV_AI_KEYS", {}).values() for k in v]):
+                   *[k for v in globals().get("ENV_AI_KEYS", {}).values() for k in v],
+                   *globals().get("_BIG_SECRETS", [])):
         if secret:
             text = text.replace(secret, "***")
     print(f"[filesbull] error in {where}:\n{text}", flush=True)
@@ -3519,20 +3521,38 @@ def can_rename_file(row: Dict[str, Any]) -> bool:
 
 
 def deliver_renamed(chat_id: int, row: Dict[str, Any], caption: str) -> bool:
-    """Send the file with its clean FILE NAME (≤20 MB documents). False → caller sends a copy with the clean caption."""
-    if not row.get("id") or not can_rename_file(row):
+    """Send the file with its clean FILE NAME. A renamed copy's file_id works at any size (>20 MB copies come from the
+    GitHub Action, see BIG-FILE RENAME); new copies are made here only for ≤20 MB documents.
+    False → caller sends a copy with the clean caption."""
+    if not row.get("id"):
         return False
     title = str(row.get("title") or "").strip()
     if not title:
         return False
-    name = safe_filename(title, str(row.get("file_name") or ""))
     cached = renamed_copy(row)
     if cached:
         try:
-            telegram("sendDocument", {"chat_id": chat_id, "document": cached, "caption": caption})
+            res = telegram("sendDocument", {"chat_id": chat_id, "document": cached, "caption": caption})
+            doc = ((res or {}).get("result") or {}).get("document") or {}
+            _REQ["_dl"] = {"how": "renamed_file_id", "file_name": doc.get("file_name"),
+                           "message_id": ((res or {}).get("result") or {}).get("message_id")}
             return True
         except Exception:
             log_error("renamed copy send")
+        try:
+            v = json.loads(get_setting(f"dlf:{row.get('id')}") or "null")
+            if isinstance(v, dict) and v.get("c") and v.get("m"):
+                res = telegram("copyMessage", {"chat_id": chat_id, "from_chat_id": int(v["c"]), "message_id": int(v["m"]),
+                                               "caption": caption})
+                _REQ["_dl"] = {"how": "renamed_post_copy", "message_id": ((res or {}).get("result") or {}).get("message_id")}
+                return True
+        except Exception:
+            log_error("renamed post copy")
+    if not can_rename_file(row):
+        return False
+    name = safe_filename(title, str(row.get("file_name") or ""))
+    if cached:
+        pass
     elif str(row.get("file_name") or "") == name:
         return False                       # the file already carries this name: a copy is enough
     if req_elapsed() > 8.0:
@@ -3800,6 +3820,11 @@ def handle_admin_command(message: Dict[str, Any]) -> None:
             n = int(arg) if arg.strip().isdigit() else 15
             for part in logs_text(n):
                 send_text(chat_id, part)
+    elif command == "/bigfix":
+        if not is_owner(user_id):
+            send_text(chat_id, "Ye sirf owner ke liye hai.")
+        else:
+            bigfix_view(chat_id, user_id)
     elif command == "/aitest":
         send_text(chat_id, ai_test_text(), {"inline_keyboard": [[{"text": "🔁 Dobara test", "callback_data": "ad:aitest"}], BACK_ROW]}, "HTML")
     elif command == "/ainaming":
@@ -4369,6 +4394,9 @@ def validate_admin_ai(content: str, text: str) -> Optional[Dict[str, Any]]:
     return out
 
 
+BIGFIX_RE = re.compile(r"\b(badi|bdi|bari|bado|big|20\s*mb\s*se\s*(?:badi|bdi|jyada|zyada))\b.{0,20}\b(files?|pdfs?)\b.{0,25}\b(naam|nam|name)\b")
+
+
 def admin_text(chat_id: int, user: Dict[str, Any], text: str) -> Optional[str]:
     """Admin free text. Returns None when handled here, else the text to search."""
     user_id = int(user.get("id"))
@@ -4377,6 +4405,9 @@ def admin_text(chat_id: int, user: Dict[str, Any], text: str) -> Optional[str]:
     intent = local_admin_intent(raw)
     if intent and intent.get("action") == "search_mode":      # "search mode on/off" — never itself a search
         run_admin_action(chat_id, user, intent, raw)
+        return None
+    if BIGFIX_RE.search(low) and is_owner(user_id) and get_setting(f"admsearch:{user_id}") != "1":
+        bigfix_view(chat_id, user_id)        # "badi files ka naam theek karo"
         return None
     for p in SEARCH_PREFIXES:
         if low.startswith(p):
@@ -5131,7 +5162,12 @@ def preview_rename(chat_id: int, user_id: int, items: List[Any], query: Optional
                int(r.get("file_size") or 0) > TG_FILE_LIMIT] if ids else []
     except Exception:
         big = []
-    if big:
+    big = [r for r in big if not str(r.get("mime_type") or "").lower().startswith(("video/", "audio/"))] \
+        if bigfile_ready() else big
+    if big and bigfile_ready():
+        lines.append("\n🔁 20 MB se badi file" + (f" ({len(big)})" if len(big) > 1 else "") +
+                     ": Accept ke baad bot use naye naam se dobara upload karega (1–2 min). Tab tak caption me naya naam dikhega.")
+    elif big:
         lines.append("\n⚠️ 20 MB se badi file ka asli naam Telegram badalne nahi deta, caption me naya naam dikhega"
                      + (f" ({len(big)} files)" if len(big) > 1 else ""))
     op = {"kind": "rename", "items": [[i, o[:300], n[:300]] for i, o, n in items]}
@@ -5246,6 +5282,13 @@ def run_op(query: Dict[str, Any], chat_id: int, user_id: int, op: Dict[str, Any]
         lines = [f"✅ {len(done)} file ka naam badal diya" if len(done) != 1 else "✅ Naam badal diya:"]
         for _, old, new in done[:5]:
             lines.append(f"• {str(old)[:50]} → {str(new)[:50]}")
+        try:
+            big_line = bigfile_after_rename(chat_id, [int(x[0]) for x in done], actor_label(user_id))
+        except Exception:
+            log_error("bigfile_after_rename")
+            big_line = ""
+        if big_line:
+            lines.append("\n" + big_line)
         kb: List[Any] = []
         if left:
             token = set_op(user_id, dict(op, items=left))
@@ -5465,6 +5508,7 @@ def ainame_view() -> Any:
     if cursor not in ("", "0"):
         lines.append(f"Purane naam: ID {cursor} tak check ho chuke")
     kb = [[{"text": "🛠️ AI se purane naam theek karo (ek baar)", "callback_data": "ad:fixn"}],
+          [{"text": "🔁 Badi files ka naam theek karo", "callback_data": "ad:bigfix"}],
           [{"text": "🤖 AI test", "callback_data": "ad:aitest"}], BACK_ROW]
     return "\n".join(lines), {"inline_keyboard": kb}
 
@@ -5596,6 +5640,16 @@ def handle_admin_callback_v6(query: Dict[str, Any], cmd: str, chat_id: int, user
         return True
     if cmd in {"ainame:on", "ainame:off"}:
         run_admin_action(chat_id, query.get("from") or {"id": user_id}, {"action": "ai_naming", "on": cmd.endswith(":on")}, "", query)
+        return True
+    if cmd == "bigfix":
+        if not is_owner(user_id):
+            show(chat_id, "Ye sirf owner kar sakta hai.", {"inline_keyboard": [BACK_ROW]}, query)
+            return True
+        try:
+            telegram("answerCallbackQuery", {"callback_query_id": query.get("id"), "text": "🔁 Badi files dekh raha hu..."})
+        except Exception:
+            pass
+        bigfix_view(chat_id, user_id, query)
         return True
     if cmd == "fixn" or cmd.startswith("fixn:"):
         try:
@@ -5852,6 +5906,9 @@ def setup_status() -> Dict[str, Any]:
             "MISTRAL_API_KEY": bool(ENV_AI_KEYS.get("mistral")),
             "OPENROUTER_API_KEY": bool(ENV_AI_KEYS.get("openrouter")),
             "NVIDIA_API_KEY": bool(ENV_AI_KEYS.get("nvidia")),
+            "TG_API_ID": bool(TG_API_ID),
+            "TG_API_HASH": bool(TG_API_HASH),
+            "GH_TOKEN": bool(GH_DISPATCH_TOKEN),
         },
         "ai": ("on (" + ai_provider() + ")") if ai_provider() else "off",
         "ai_keys_in_bot": len(db_ai_keys()),
@@ -5863,6 +5920,13 @@ def setup_status() -> Dict[str, Any]:
     except Exception:
         pass
     status["ai_understand"] = "on (AI first, cache 24 h, local fallback)" if AI_UNDERSTAND else "off (local parser)"
+    try:  # >20 MB file names through the GitHub Action: ready / missing_secrets, trigger, queue counts
+        bq = bigfile_sweep() if bigfile_ready() else None
+        bst = bigfile_status()
+        status["bigfile_rename"] = bst["state"]
+        status["bigfile"] = bst
+    except Exception:
+        log_error("bigfile status")
     try:  # multi-provider router: LIVE + backup order, per provider key count / status / calls today (never keys)
         status["ai_providers"] = ai_providers_summary()
     except Exception:
@@ -7148,6 +7212,22 @@ def aidiag() -> Any:
             res["admin"] = out_a
         except Exception as exc:
             res["admin"] = {"error": _err_class(exc)}
+    if request.args.get("big"):     # >20 MB rename: status, candidates, queue; &bigrun=<book id> queues + triggers (no owner msg)
+        try:
+            rows_b = supabase("books", "GET", query=f"?select=*&status=eq.indexed&file_size=gt.{TG_FILE_LIMIT}&order=id.desc&limit=200")
+            res["bigfile"] = {"status": bigfile_status(),
+                              "files": [{"id": r.get("id"), "title": str(r.get("title"))[:70], "size": human_size(r.get("file_size")),
+                                         "file_name": str(r.get("file_name") or "")[:90], "delivered": delivered_name(r)[:90],
+                                         "needs": big_needs_rename(r), "backup": bool(r.get("backup_message_id"))} for r in rows_b[:40]],
+                              "queue": [{k: j.get(k) for k in ("j", "b", "fn", "st", "tries", "err", "file_name", "run")}
+                                        for j in bigq_load()[-10:]]}
+            if request.args.get("bigrun", "").isdigit():
+                pick = [r for r in rows_b if str(r.get("id")) == request.args.get("bigrun")]
+                res["bigfile"]["run"] = {k: v for k, v in bigfile_start(pick, None, "diag").items() if k != "jobs"}
+                res["bigfile"]["run"]["queued"] = len(bigq_load()) and [j.get("j") for j in bigq_load() if j.get("st") == "pending"]
+            flush_request()
+        except Exception as exc:
+            res["bigfile"] = {"error": _err_class(exc)}
     if request.args.get("dl"):      # live check of delivery under the clean name: send to the Log Chat, read the name, delete it
         try:
             target = get_setting("log_chat_id")
@@ -8147,6 +8227,454 @@ def log_setting_view() -> Any:
     text += "\n\n👥 Group ko Log Chat banana ho: bot ko group me admin banao, phir us group me /setlogchat bhejo."
     return text, kb
 
+
+
+# ---- BIG-FILE RENAME (>20 MB) through MTProto in a GitHub Action (Aarav 7:36 PM Oct 26: "koi hor treeka h kya")
+# The Bot HTTP API cannot download files over 20 MB, so it cannot re-upload them under a new FILE name.
+# MTProto (the full Telegram protocol) lets the same bot download/upload up to 2 GB. That runs in the GitHub Action
+# .github/workflows/bigfile-rename.yml (tools/bigfile_runner.py):
+#   1. The bot queues a job in bot_settings "bigq" and triggers the workflow (GitHub API, token GH_TOKEN in Vercel);
+#      without that token the workflow's own 5-minute schedule picks the queue up.
+#   2. The runner proves who it is with GitHub's OIDC token (signed by GitHub: this repo, main branch, this workflow)
+#      at POST /api/bigfile-job and gets the job + the bot credentials (BOT_TOKEN, TG_API_ID, TG_API_HASH from Vercel;
+#      GitHub Actions secrets with the same names are used instead when they exist). No secret is stored in the repo.
+#   3. It downloads the file from the Backup channel post, uploads it as a document named "<clean name>.<ext>" with
+#      caption "📄 name / 🗂️ subject" to the Backup channel, deletes the temp file and reports to POST /api/bigfile-done
+#      signed with an HMAC key the bot gave for that one job.
+#   4. The bot reads the new post's file_id (forward + delete, file name checked), stores it in "dlf:<id>" and every
+#      later send uses it (the Bot API can send any size by file_id). Failure → one retry, then "❌" + reason to the owner.
+TG_API_ID = os.environ.get("TG_API_ID", "").strip()
+TG_API_HASH = os.environ.get("TG_API_HASH", "").strip()
+GH_REPO = os.environ.get("GH_REPO", "aaravjaat72-hash/filesbull").strip()
+GH_TOKEN_NAMES = ("GH_TOKEN", "GH_DISPATCH_TOKEN", "GITHUB_TOKEN", "GH_PAT", "GITHUB_PAT")
+GH_DISPATCH_TOKEN = next((os.environ.get(n, "").strip() for n in GH_TOKEN_NAMES if os.environ.get(n, "").strip()), "")
+BIG_WORKFLOW = "bigfile-rename.yml"
+BIG_QUEUE_KEY = "bigq"
+BIG_TRIES = 2                       # first try + one retry
+BIG_STALE_SEC = 15 * 60            # a claimed job with no report after this counts as a failed try
+OIDC_ISS = "https://token.actions.githubusercontent.com"
+OIDC_AUD = "filesbull-bigfile"
+BIG_STATUS_TEXT = "⏳ Badi file ka naam badal raha hai (1–2 min)…"
+BIG_STATUS_SLOW = "⏳ Badi file ka naam badal raha hai (5–15 min)…"
+_BIG_SECRETS = [s for s in (TG_API_HASH, GH_DISPATCH_TOKEN) if s]
+
+
+def bigfile_ready() -> bool:
+    return bool(TG_API_ID and TG_API_HASH and BOT_TOKEN)
+
+
+def bigfile_status() -> Dict[str, Any]:
+    st: Dict[str, Any] = {"state": "ready" if bigfile_ready() else "missing_secrets",
+                          "trigger": "instant" if GH_DISPATCH_TOKEN else "schedule_5min (GH_TOKEN missing)"}
+    if not bigfile_ready():
+        st["missing"] = [n for n, v in (("TG_API_ID", TG_API_ID), ("TG_API_HASH", TG_API_HASH), ("BOT_TOKEN", BOT_TOKEN)) if not v]
+    try:
+        q = bigq_load()
+        cnt: Dict[str, int] = {}
+        for j in q:
+            cnt[j.get("st", "?")] = cnt.get(j.get("st", "?"), 0) + 1
+        st["queue"] = cnt
+        last = [j for j in q if j.get("st") in ("done", "failed")]
+        if last:
+            j = last[-1]
+            st["last"] = {"st": j.get("st"), "name": str(j.get("fn") or "")[:80], "err": str(j.get("err") or "")[:120] or None}
+    except Exception:
+        pass
+    return st
+
+
+def _scrub(text: str) -> str:
+    text = str(text or "")
+    for s in (BOT_TOKEN, *_BIG_SECRETS):
+        if s:
+            text = text.replace(s, "***")
+    return re.sub(r"\b\d{6,}:[A-Za-z0-9_-]{20,}\b", "***", text)
+
+
+def bigq_load() -> List[Dict[str, Any]]:
+    try:
+        v = json.loads(get_setting(BIG_QUEUE_KEY) or "[]")
+        return v if isinstance(v, list) else []
+    except Exception:
+        return []
+
+
+def bigq_save(q: List[Dict[str, Any]]) -> None:
+    # keep every open job + the last 40 finished ones
+    open_ = [j for j in q if j.get("st") in ("pending", "running")]
+    done = [j for j in q if j.get("st") not in ("pending", "running")][-40:]
+    keep = sorted(open_ + done, key=lambda j: j.get("t", 0))
+    set_setting(BIG_QUEUE_KEY, json.dumps(keep, ensure_ascii=False, separators=(",", ":")))
+
+
+def is_big_doc(row: Dict[str, Any]) -> bool:
+    mime = str(row.get("mime_type") or "").lower()
+    try:
+        size = int(row.get("file_size") or 0)
+    except (TypeError, ValueError):
+        size = 0
+    return size > TG_FILE_LIMIT and not mime.startswith(("video/", "audio/")) and \
+        bool(row.get("telegram_file_id") or (row.get("backup_chat_id") and row.get("backup_message_id")) or
+             (row.get("source_chat_id") and row.get("source_message_id")))
+
+
+def delivered_name(row: Dict[str, Any]) -> str:
+    """The FILE name a user receives right now."""
+    try:
+        v = json.loads(get_setting(f"dlf:{row.get('id')}") or "null")
+    except Exception:
+        v = None
+    if isinstance(v, dict) and v.get("f") and v.get("n") == str(row.get("title") or "") and v.get("fn"):
+        return str(v["fn"])
+    if renamed_copy(row):
+        return safe_filename(str(row.get("title") or ""), str(row.get("file_name") or ""))
+    return str(row.get("file_name") or "")
+
+
+def big_needs_rename(row: Dict[str, Any]) -> bool:
+    title = str(row.get("title") or "").strip()
+    if not title or not row.get("id") or not is_big_doc(row):
+        return False
+    return delivered_name(row) != safe_filename(title, str(row.get("file_name") or ""))
+
+
+def bigfile_enqueue(rows: List[Dict[str, Any]], chat_id: Optional[int], who: str = "") -> List[Dict[str, Any]]:
+    """Queue >20 MB documents whose delivered name differs from the display name. Returns the jobs added."""
+    q = bigq_load()
+    added: List[Dict[str, Any]] = []
+    for r in rows:
+        if not big_needs_rename(r):
+            continue
+        title = str(r.get("title") or "").strip()
+        fn = safe_filename(title, str(r.get("file_name") or ""))
+        if any(j.get("b") == r["id"] and j.get("fn") == fn and j.get("st") in ("pending", "running") for j in q):
+            continue
+        for j in q:                     # an older open job for the same file (other name) is replaced
+            if j.get("b") == r["id"] and j.get("st") in ("pending", "running"):
+                j["st"], j["err"] = "replaced", "naya naam aa gaya"
+        job = {"j": hashlib.sha1(os.urandom(12)).hexdigest()[:12], "b": int(r["id"]), "n": title[:300], "fn": fn,
+               "sz": int(r.get("file_size") or 0), "st": "pending", "tries": 0, "chat": chat_id, "t": int(time.time()),
+               "who": who[:60]}
+        q.append(job)
+        added.append(job)
+    if added:
+        bigq_save(q)
+    return added
+
+
+def bigfile_dispatch(job_id: str = "") -> str:
+    """Start the workflow now. 'dispatched' | 'no_token' | 'error: …'. Never raises."""
+    if not GH_DISPATCH_TOKEN:
+        return "no_token"
+    url = f"https://api.github.com/repos/{GH_REPO}/actions/workflows/{BIG_WORKFLOW}/dispatches"
+    body = json.dumps({"ref": "main", "inputs": {"job": str(job_id or "queue")}}).encode()
+    req = urllib.request.Request(url, data=body, method="POST", headers={
+        "Authorization": f"Bearer {GH_DISPATCH_TOKEN}", "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "filesbull-bot", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            return "dispatched" if resp.status in (200, 204) else f"error: HTTP {resp.status}"
+    except urllib.error.HTTPError as exc:
+        try:
+            why = json.loads(exc.read().decode("utf-8", "replace")).get("message", "")
+        except Exception:
+            why = ""
+        return _scrub(f"error: HTTP {exc.code} {why}")[:160]
+    except Exception as exc:
+        return _scrub(f"error: {type(exc).__name__}")[:160]
+
+
+def bigfile_start(rows: List[Dict[str, Any]], chat_id: Optional[int], who: str = "") -> Dict[str, Any]:
+    """Queue + trigger. Returns {jobs, dispatch, text} (text = owner status line, '' when nothing queued)."""
+    if not bigfile_ready():
+        return {"jobs": [], "dispatch": "missing_secrets", "text": ""}
+    jobs = bigfile_enqueue(rows, chat_id, who)
+    if not jobs:
+        return {"jobs": [], "dispatch": "", "text": ""}
+    d = bigfile_dispatch(jobs[0]["j"])
+    for j in jobs:
+        audit_log(f"⏳ Badi file rename queue · {ist_now()}\n📄 {j['fn'][:80]} ({human_size(j['sz'])})")
+    text = BIG_STATUS_TEXT if d == "dispatched" else BIG_STATUS_SLOW
+    if len(jobs) > 1:
+        text += f" ({len(jobs)} files)"
+    return {"jobs": jobs, "dispatch": d, "text": text}
+
+
+def bigfile_after_rename(chat_id: int, ids: List[int], who: str = "") -> str:
+    """After a rename was accepted: >20 MB documents get a real new file name. Returns a status line or ''."""
+    if not ids or not bigfile_ready():
+        return ""
+    try:
+        rows = supabase("books", "GET", query=f"?id=in.({','.join(str(int(i)) for i in ids[:50])})&select=*")
+    except Exception:
+        log_error("bigfile rows")
+        return ""
+    res = bigfile_start(rows, chat_id, who)
+    return res["text"]
+
+
+def big_candidates(limit: int = 200) -> List[Dict[str, Any]]:
+    rows = supabase("books", "GET", query=f"?select=*&status=eq.indexed&file_size=gt.{TG_FILE_LIMIT}&order=id.desc&limit={limit}")
+    return [r for r in rows if big_needs_rename(r)]
+
+
+def bigfix_view(chat_id: int, user_id: int, query: Optional[Dict[str, Any]] = None) -> None:
+    """🔁 Badi files ka naam theek karo: queue every >20 MB file whose delivered name ≠ display name."""
+    back = {"inline_keyboard": [BACK_ROW]}
+    if not bigfile_ready():
+        show(chat_id, "❌ Badi file ka naam badalne ke liye Vercel me TG_API_ID aur TG_API_HASH chahiye "
+                      "(Settings → Environment Variables), phir Redeploy.\nTab tak caption me naya naam dikhega.", back, query)
+        return
+    try:
+        rows = big_candidates()
+    except Exception:
+        log_error("big_candidates")
+        show(chat_id, "❌ Files padh nahi paya, thodi der baad dobara try karo.", back, query)
+        return
+    if not rows:
+        open_ = [j for j in bigq_load() if j.get("st") in ("pending", "running")]
+        show(chat_id, (f"⏳ {len(open_)} badi file ka naam abhi badal raha hai…" if open_ else
+                       "✅ Saari 20 MB se badi files pehle se sahi naam se jaati hain."), back, query)
+        return
+    res = bigfile_start(rows, chat_id, actor_label(user_id))
+    lines = [res["text"] or BIG_STATUS_TEXT, ""]
+    for j in res["jobs"][:12]:
+        lines.append(f"• {j['fn'][:70]} ({human_size(j['sz'])})")
+    if len(res["jobs"]) > 12:
+        lines.append(f"…aur {len(res['jobs']) - 12}")
+    if not res["jobs"]:
+        lines = ["⏳ Ye files pehle se queue me hain, thodi der me ho jayengi."]
+    lines.append("\nHar file ke baad yahin \"✅ Ho gaya\" aayega. Tab tak caption me naya naam dikhega.")
+    show(chat_id, "\n".join(lines)[:3900], back, query)
+
+
+# -- runner authentication: GitHub's OIDC token (RS256, verified here with GitHub's published keys)
+_JWKS: Dict[str, Any] = {"t": 0.0, "keys": {}}
+
+
+def _b64u(s: str) -> bytes:
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def oidc_keys(force: bool = False) -> Dict[str, Any]:
+    if force or not _JWKS["keys"] or time.time() - _JWKS["t"] > 3600:
+        with urllib.request.urlopen(OIDC_ISS + "/.well-known/jwks", timeout=6) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        _JWKS["keys"] = {k["kid"]: (int.from_bytes(_b64u(k["n"]), "big"), int.from_bytes(_b64u(k["e"]), "big"))
+                         for k in data.get("keys", []) if k.get("kty") == "RSA" and k.get("kid")}
+        _JWKS["t"] = time.time()
+    return _JWKS["keys"]
+
+
+_SHA256_DI = bytes.fromhex("3031300d060960864801650304020105000420")
+
+
+def rs256_ok(signing_input: bytes, sig: bytes, n: int, e: int) -> bool:
+    k = (n.bit_length() + 7) // 8
+    if len(sig) != k or k < 256:
+        return False
+    s = int.from_bytes(sig, "big")
+    if s >= n:
+        return False
+    m = pow(s, e, n).to_bytes(k, "big")
+    digest = _SHA256_DI + hashlib.sha256(signing_input).digest()
+    expected = b"\x00\x01" + b"\xff" * (k - len(digest) - 3) + b"\x00" + digest
+    return hmac.compare_digest(m, expected)
+
+
+def verify_oidc(token: str) -> Dict[str, Any]:
+    """Claims of a valid GitHub Actions OIDC token from THIS repo's bigfile workflow on main. Raises InputError."""
+    try:
+        h64, p64, s64 = str(token or "").split(".")
+        header = json.loads(_b64u(h64))
+        claims = json.loads(_b64u(p64))
+        sig = _b64u(s64)
+    except Exception:
+        raise InputError("bad token")
+    if header.get("alg") != "RS256":
+        raise InputError("bad alg")
+    keys = oidc_keys()
+    if header.get("kid") not in keys:
+        keys = oidc_keys(force=True)
+    key = keys.get(header.get("kid"))
+    if not key or not rs256_ok(f"{h64}.{p64}".encode(), sig, *key):
+        raise InputError("bad signature")
+    now = time.time()
+    aud = claims.get("aud")
+    if claims.get("iss") != OIDC_ISS or (aud != OIDC_AUD and not (isinstance(aud, list) and OIDC_AUD in aud)):
+        raise InputError("bad issuer/audience")
+    if not (float(claims.get("exp", 0)) > now - 30 and float(claims.get("nbf", claims.get("iat", 0)) or 0) <= now + 60):
+        raise InputError("expired")
+    wf = f"{GH_REPO}/.github/workflows/{BIG_WORKFLOW}@refs/heads/main"
+    if (claims.get("repository") != GH_REPO or claims.get("ref") != "refs/heads/main" or
+            claims.get("workflow_ref") != wf or
+            claims.get("event_name") not in ("workflow_dispatch", "repository_dispatch", "schedule")):
+        raise InputError("wrong repo/workflow")
+    return claims
+
+
+def big_job_key(job_id: str) -> str:
+    master = os.environ.get("BIGFILE_SECRET", "").strip() or hashlib.sha256(f"filesbull-bigfile:{BOT_TOKEN}".encode()).hexdigest()
+    return hmac.new(master.encode(), f"bigjob:{job_id}".encode(), hashlib.sha256).hexdigest()
+
+
+def big_sign(job_id: str, body: bytes) -> str:
+    return hmac.new(big_job_key(job_id).encode(), body, hashlib.sha256).hexdigest()
+
+
+def bigfile_sweep(q: Optional[List[Dict[str, Any]]] = None, save: bool = True) -> List[Dict[str, Any]]:
+    """Claimed jobs that never reported: count as a failed try (retry once, then ❌)."""
+    q = bigq_load() if q is None else q
+    changed = False
+    now = time.time()
+    for j in q:
+        if j.get("st") == "running" and now - float(j.get("ct") or 0) > BIG_STALE_SEC:
+            big_fail(j, "GitHub Action ne time pe jawab nahi diya")
+            changed = True
+    if changed and save:
+        bigq_save(q)
+        if any(j.get("st") == "pending" for j in q):
+            bigfile_dispatch("retry")
+    return q
+
+
+def big_notify(job: Dict[str, Any], text: str) -> None:
+    chat = job.get("chat")
+    if chat:
+        try:
+            send_text(int(chat), text)
+        except Exception:
+            log_error("big notify")
+
+
+def big_fail(job: Dict[str, Any], reason: str) -> None:
+    reason = _scrub(reason)[:200] or "pata nahi"
+    job["err"] = reason
+    if int(job.get("tries") or 0) < BIG_TRIES:
+        job["st"] = "pending"           # one more try
+        audit_log(f"🔁 Badi file rename dobara try · {job.get('fn', '')[:70]}\nWajah: {reason[:120]}")
+        return
+    job["st"] = "failed"
+    big_notify(job, f"❌ Badi file ka naam nahi badla: {job.get('fn', '')[:80]}\nWajah: {reason}\n"
+                    "File pehle jaisi users ko ja rahi hai (caption me naya naam).")
+    audit_log(f"❌ Badi file rename fail · {ist_now()}\n📄 {job.get('fn', '')[:80]}\nWajah: {reason[:120]}")
+
+
+@app.post("/api/bigfile-job")
+def bigfile_job_api() -> Any:
+    """The GitHub Action asks for work. Auth: GitHub OIDC token of this repo's bigfile workflow on main."""
+    body = request.get_json(silent=True) or {}
+    try:
+        claims = verify_oidc(str(body.get("oidc") or ""))
+    except InputError as exc:
+        return jsonify({"ok": False, "error": "unauthorized", "why": str(exc)}), 401
+    except Exception as exc:
+        return jsonify({"ok": False, "error": "unauthorized", "why": type(exc).__name__}), 401
+    q = bigfile_sweep(save=False)
+    runner_has = body.get("has") or {}
+    jobs_out: List[Dict[str, Any]] = []
+    claim = [j for j in q if j.get("st") == "pending"][:5]
+    if claim:
+        ids = ",".join(str(int(j["b"])) for j in claim)
+        rows = {int(r["id"]): r for r in supabase("books", "GET", query=f"?id=in.({ids})&select=*")}
+        for j in claim:
+            r = rows.get(int(j["b"]))
+            if not r:
+                j["st"], j["err"] = "failed", "file DB me nahi mili"
+                continue
+            if str(r.get("title") or "").strip() != j.get("n"):
+                j["st"], j["err"] = "replaced", "naam fir badal gaya"
+                continue
+            j["st"], j["ct"], j["tries"] = "running", int(time.time()), int(j.get("tries") or 0) + 1
+            j["run"] = str(claims.get("run_id") or "")
+            target = get_setting("backup_chat_id") or r.get("backup_chat_id")
+            jobs_out.append({"j": j["j"], "k": big_job_key(j["j"]), "book": int(r["id"]), "file_name": j["fn"],
+                             "caption": delivery_caption(r), "size": int(r.get("file_size") or 0),
+                             "file_id": r.get("telegram_file_id"),
+                             "from": [x for x in ([r.get("backup_chat_id"), r.get("backup_message_id")],
+                                                  [r.get("source_chat_id"), r.get("source_message_id")]) if x[0] and x[1]],
+                             "to": target, "try": j["tries"]})
+        bigq_save(q)
+    out: Dict[str, Any] = {"ok": True, "jobs": jobs_out}
+    if jobs_out:
+        creds: Dict[str, Any] = {}
+        if not runner_has.get("bot_token") and BOT_TOKEN:
+            creds["bot_token"] = BOT_TOKEN
+        if not runner_has.get("api") and TG_API_ID and TG_API_HASH:
+            creds["api_id"], creds["api_hash"] = TG_API_ID, TG_API_HASH
+        out["creds"] = creds
+    flush_request()
+    return jsonify(out)
+
+
+def big_read_file_id(job: Dict[str, Any], chat_id: Any, message_id: Any) -> Dict[str, Any]:
+    """Forward the new post to a private chat, read document.file_id / file_name, delete the forward."""
+    target = job.get("chat") or get_setting("log_chat_id") or (sorted(ADMIN_USER_IDS)[0] if ADMIN_USER_IDS else None)
+    res = telegram("forwardMessage", {"chat_id": int(target), "from_chat_id": int(chat_id), "message_id": int(message_id),
+                                      "disable_notification": True})
+    msg = (res or {}).get("result") or {}
+    doc = msg.get("document") or msg.get("video") or msg.get("audio") or {}
+    try:
+        telegram("deleteMessage", {"chat_id": int(target), "message_id": int(msg.get("message_id"))})
+    except Exception:
+        pass
+    return {"file_id": doc.get("file_id"), "file_name": doc.get("file_name"), "file_unique_id": doc.get("file_unique_id")}
+
+
+@app.post("/api/bigfile-done")
+def bigfile_done_api() -> Any:
+    """The GitHub Action reports a job. Auth: X-Filesbull-Signature = HMAC-SHA256(job key, raw body)."""
+    raw = request.get_data() or b""
+    try:
+        body = json.loads(raw.decode("utf-8") or "{}")
+    except Exception:
+        body = {}
+    jid = str(body.get("j") or "")
+    sig = request.headers.get("X-Filesbull-Signature", "")
+    if not jid or not sig or not BOT_TOKEN or not hmac.compare_digest(sig, big_sign(jid, raw)):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    _REQ.clear()
+    _LOG_QUEUE.clear()
+    q = bigq_load()
+    job = next((j for j in q if j.get("j") == jid), None)
+    if not job:
+        return jsonify({"ok": False, "error": "unknown job"}), 404
+    if job.get("st") != "running":
+        return jsonify({"ok": True, "ignored": job.get("st")})
+    result: Dict[str, Any] = {"ok": True}
+    if body.get("ok") and body.get("chat_id") and body.get("message_id"):
+        try:
+            info = big_read_file_id(job, body["chat_id"], body["message_id"])
+            if not info.get("file_id"):
+                raise RuntimeError("nayi file ka file_id nahi mila")
+            if info.get("file_name") and info["file_name"] != job.get("fn"):
+                raise RuntimeError(f"file ka naam galat aaya: {str(info['file_name'])[:60]}")
+            set_setting(f"dlf:{int(job['b'])}", json.dumps({"f": info["file_id"], "n": job.get("n"), "fn": job.get("fn"),
+                                                          "c": int(body["chat_id"]), "m": int(body["message_id"])},
+                                                         ensure_ascii=False))
+            try:
+                rows = supabase("books", "GET", query=f"?id=eq.{int(job['b'])}&select=id,backup_chat_id&limit=1")
+                if rows and str(rows[0].get("backup_chat_id") or "") in ("", str(body["chat_id"])):
+                    supabase("books", "PATCH", {"backup_chat_id": int(body["chat_id"]), "backup_message_id": int(body["message_id"])},
+                             f"?id=eq.{int(job['b'])}")
+            except Exception:
+                log_error("big backup ids")
+            job["st"], job["err"], job["done_at"] = "done", "", int(time.time())
+            job["file_name"] = info.get("file_name") or job.get("fn")
+            big_notify(job, f"✅ Ho gaya: {job.get('fn', '')[:80]}\nAb users ko file isi naam se jayegi.")
+            audit_log(f"✅ Badi file ka naam badla · {ist_now()}\n📄 {job.get('fn', '')[:80]} ({human_size(job.get('sz'))})")
+            result["file_name"] = job["file_name"]
+        except Exception as exc:
+            log_error("bigfile done")
+            big_fail(job, str(exc))
+    else:
+        big_fail(job, str(body.get("error") or "GitHub Action fail hua"))
+    bigq_save(q)
+    if job.get("st") == "pending":
+        result["retry"] = bigfile_dispatch(jid)
+    result["state"] = job.get("st")
+    flush_request()
+    return jsonify(result)
 
 
 _SEEN_UPDATES: List[Any] = []

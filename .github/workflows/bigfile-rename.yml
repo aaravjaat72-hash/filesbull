@@ -1,0 +1,45 @@
+name: bigfile-rename
+# Gives files over 20 MB their real new FILE name (Aarav, Oct 26 2026). The bot can't do it over the normal Bot API
+# (20 MB download limit), so this job logs in as the same bot over MTProto (up to 2 GB), re-uploads the file under
+# the clean name to the Backup channel and tells the bot the new post. See tools/bigfile_runner.py.
+# Started by the bot (workflow_dispatch) right after a rename; the 5-minute schedule picks up anything left in the
+# queue. Credentials come from the bot after GitHub's OIDC token proves this run is this workflow on main
+# (or from Actions secrets BOT_TOKEN / TG_API_ID / TG_API_HASH when those exist). Nothing secret is printed.
+on:
+  workflow_dispatch:
+    inputs:
+      job:
+        description: "queue job id (optional)"
+        required: false
+        default: ""
+  repository_dispatch:
+    types: [bigfile-rename]
+  schedule:
+    - cron: "*/5 * * * *"
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: bigfile-rename
+  cancel-in-progress: false
+
+jobs:
+  rename:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: tools
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Rename big files
+        env:
+          JOB: ${{ github.event.inputs.job }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+        run: python tools/bigfile_runner.py
