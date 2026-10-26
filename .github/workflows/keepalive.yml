@@ -1,0 +1,29 @@
+name: keepalive
+# Keeps the Telegram bot connected: after every push (once Vercel has deployed) and every
+# 10 minutes it opens https://filesbull.vercel.app/ , which checks the webhook and fixes it
+# only if something is wrong (no change when all is fine).
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Wait for the Vercel deploy
+        if: github.event_name == 'push'
+        run: sleep 90
+      - name: Check / fix the bot webhook
+        run: |
+          for i in 1 2 3; do
+            if curl -fsS --max-time 60 https://filesbull.vercel.app/ -o health.json; then
+              python3 -c "import json; s=json.load(open('health.json'))['status']; print('webhook ok:', s.get('webhook_registered'), '| self-heal:', (s.get('self_heal') or {}).get('action'))"
+              exit 0
+            fi
+            sleep 30
+          done
+          exit 1
