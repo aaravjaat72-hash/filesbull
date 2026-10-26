@@ -4,6 +4,7 @@ import json
 import io
 import os
 import re
+import time
 import traceback
 import urllib.error
 import urllib.parse
@@ -236,10 +237,16 @@ def file_info(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return None
 
 
-def extract_pdf_text(file_id: Optional[str], file_name: str = "") -> str:
+def extract_pdf_text(file_id: Optional[str], file_name: str = "", file_size: Optional[int] = None) -> str:
     """Best-effort extraction for normal text PDFs; scanned PDFs need OCR."""
     if not file_id or not file_name.lower().endswith(".pdf") or not BOT_TOKEN:
         return ""
+    # Telegram's getFile only serves files up to 20 MB, and only the first 8 MB are read
+    # below (a cut-off PDF usually can't be parsed), so skip big files instead of
+    # spending the webhook's time on a download that cannot work.
+    if file_size and file_size > 8 * 1024 * 1024:
+        return ""
+    started = time.monotonic()
     try:
         file_result = telegram("getFile", {"file_id": file_id}).get("result", {})
         file_path = file_result.get("file_path")
@@ -252,7 +259,8 @@ def extract_pdf_text(file_id: Optional[str], file_name: str = "") -> str:
         chunks = []
         for page in reader.pages[:25]:
             chunks.append(page.extract_text() or "")
-            if sum(len(x) for x in chunks) >= 120000:
+            # Keep the webhook fast: stop after ~8 s so Telegram/Vercel don't time out.
+            if sum(len(x) for x in chunks) >= 120000 or time.monotonic() - started > 8:
                 break
         return clean_text(" ".join(chunks))[:120000]
     except Exception:
@@ -264,7 +272,7 @@ def build_metadata(message: Dict[str, Any], channel: Dict[str, Any]) -> Dict[str
     caption = message.get("caption", "") or ""
     raw_name = info.get("file_name", "")
     title = clean_text(caption) or clean_text(os.path.splitext(raw_name)[0])
-    content_text = extract_pdf_text(info.get("file_id"), raw_name)
+    content_text = extract_pdf_text(info.get("file_id"), raw_name, info.get("file_size"))
     searchable = " ".join([title, caption, raw_name, channel.get("title", ""), content_text])
     # Captions can contain explicit tags such as #ssc #english; retain them for search.
     keywords = clean_text(searchable)
