@@ -1,7 +1,8 @@
 name: userbot-forward
-# Auto-forward NEW file posts from source channels where the bot is NOT admin into the Backup channel, using the
-# owner's own Telegram login (Aarav, Oct 26 2026). Gentle: every 10 min, max 25 files per run, 2–4 s apart, stops on
-# FloodWait. The session comes from the bot only after GitHub's OIDC token proves this is this workflow on main; it is
+# Userbot: file posts (new + full history) from source channels where the bot is NOT admin go into the separate
+# "filesbull Userbot Inbox" channel (never straight into Backup); the bot then names/categorises them and settles them
+# into Backup (Aarav, Oct 26 2026). Gentle: every 10 min, max 25 files per run (15 after a long FloodWait), live first,
+# 2–4 s apart, stops on FloodWait. The session comes from the bot only after GitHub's OIDC token proves this is this workflow on main; it is
 # never printed. See tools/userbot_runner.py. "🔄 Abhi check karo" in the bot starts it at once (workflow_dispatch).
 on:
   workflow_dispatch:
