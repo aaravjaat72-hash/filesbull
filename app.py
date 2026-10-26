@@ -41,6 +41,8 @@ ADMIN_USER_IDS = {
 }
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+# AI keys added from inside the bot (Admin Panel -> 🔑 AI Keys), stored in bot_settings "ai_keys".
+_DBKEYS: Dict[str, Any] = {"t": 0.0, "v": []}
 # Telegram sends this value in the X-Telegram-Bot-Api-Secret-Token header on every
 # webhook call, so forged updates (fake "admin" messages) can be rejected.
 # Set WEBHOOK_SECRET in Vercel to choose your own; otherwise it is derived from BOT_TOKEN.
@@ -52,7 +54,7 @@ WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip() or (
 def log_error(where: str) -> None:
     # Printed tracebacks show up in Vercel -> Project -> Logs. Never print the token.
     text = traceback.format_exc()
-    for secret in (BOT_TOKEN, OPENAI_API_KEY, SUPABASE_KEY, *GROQ_KEYS):
+    for secret in (BOT_TOKEN, OPENAI_API_KEY, SUPABASE_KEY, *GROQ_KEYS, *[x.get("k", "") for x in _DBKEYS["v"]]):
         if secret:
             text = text.replace(secret, "***")
     print(f"[filesbull] error in {where}:\n{text}", flush=True)
@@ -519,8 +521,10 @@ def user_menu() -> Dict[str, Any]:
     return {"inline_keyboard": [list(r) for r in USER_KEYBOARD_ROWS]}
 
 
-def admin_menu() -> Dict[str, Any]:
+def admin_menu(user_id: Optional[int] = None) -> Dict[str, Any]:
     # One clear button per row (labels <= 20 chars so they never cut off on a phone).
+    # 🔑 AI Keys is owner-only, so sub-admins don't see it.
+    keys_row = [{"text": "🔑 AI Keys", "callback_data": "ad:keys"}] if (user_id is None or is_owner(user_id)) else []
     return {"inline_keyboard": [
         [{"text": "➕ Join Channel Jodo", "callback_data": "ad:addreq"}],
         [{"text": "📋 Join Channels", "callback_data": "ad:reqlist"}],
@@ -530,6 +534,7 @@ def admin_menu() -> Dict[str, Any]:
         [{"text": "💾 Backup: purani files bhi", "callback_data": "ad:bkold"}],
         [{"text": "👥 Users", "callback_data": "ad:users"}, {"text": "👮 Admins", "callback_data": "ad:admins"}],
         [{"text": "✏️ File Rename", "callback_data": "ad:rename"}, {"text": "📊 Report", "callback_data": "ad:report"}],
+        keys_row + [{"text": "🔄 Bot Restart", "callback_data": "ad:restart"}],
         [{"text": "🩺 Status", "callback_data": "ad:status"}, {"text": "❓ Admin Help", "callback_data": "ad:help"}],
         [{"text": "🔍 Search Menu", "callback_data": "ad:usermenu"}],
     ]}
@@ -561,6 +566,9 @@ PROMPTS = {
     "rename": ("✏️ Kis file ka naam badalna hai? File ka naam/keyword bhejo (ya ID aur naya naam: 12 Lucent GK Hindi).\n"
                "(/cancel = band)", "lucent"),
     "rename_to": ("✏️ Is file ka naya naam bhejo. (/cancel = band)", "Naya naam"),
+    "addkey": ("🔑 Groq ya OpenAI ki API key yahan paste karke bhejo.\n"
+               "Key wala message main turant chat se delete kar dunga 🔒\n"
+               "(Groq key: console.groq.com → API Keys → Create API Key. /cancel = band)", "gsk_..."),
 }
 
 
@@ -774,10 +782,13 @@ ADMIN_HELP = (
     "👮 Admins — sub-admin jodo/hatao (sirf owner)\n"
     "✏️ File Rename — file ka search naam badlo\n"
     "📊 Report — files aur delivery count\n"
-    "🩺 Status — aapka ID, role, channels me bot admin hai ya nahi\n\n"
+    "🩺 Status — aapka ID, role, channels me bot admin hai ya nahi\n"
+    "🔑 AI Keys — Groq/OpenAI key bot me hi jodo/hatao, Vercel deploy nahi (sirf owner)\n"
+    "🔄 Bot Restart — bot ruk jaye to webhook + menu dobara set\n"
+    "Hatane wale har button pe pehle ✅ Accept / ❌ Deny aayega\n\n"
     "Commands bhi chalti hain: /admin, /requirechannel @ch, /removerequired @ch, /addchannel @ch, /removechannel @ch, "
     "/channels, /requiredchannels, /setbackupchannel, /setlogchat, /addadmin ID, /removeadmin ID, /rename ID naam, "
-    "/report, /stats, /status, /user ID, /backupold, /myid, /cancel\n"
+    "/report, /stats, /status, /restart, /keys, /user ID, /backupold, /myid, /cancel\n"
     "Kisi channel ki post bot ko forward karoge to wo source channel ban jayega."
 )
 
@@ -798,7 +809,26 @@ def handle_admin_input(message: Dict[str, Any], action: str, extra: Any) -> None
     chat_id = message["chat"]["id"]
     user_id = message["from"]["id"]
     text = (message.get("text") or message.get("caption") or "").strip()
-    retry = {"inline_keyboard": [[{"text": "🔁 Dobara try", "callback_data": f"ad:{action if action != 'rename_to' else 'rename'}"}], BACK_ROW]}
+    retry = {"inline_keyboard": [[{"text": "🔁 Dobara try", "callback_data": f"ad:{ {'rename_to': 'rename', 'addkey': 'keyadd'}.get(action, action)}"}], BACK_ROW]}
+    if action == "addkey":
+        # The message carries a secret: never echo it, never log it, delete it from the chat.
+        clear_pending(user_id)
+        if not is_owner(user_id):
+            try:
+                telegram("deleteMessage", {"chat_id": chat_id, "message_id": message.get("message_id")})
+            except Exception:
+                pass
+            send_text(chat_id, "🔑 AI key sirf owner jod sakta hai. Maine message hata diya 🔒", {"inline_keyboard": [BACK_ROW]})
+            return
+        try:
+            add_ai_key(message, chat_id, text)
+        except InputError as exc:
+            set_pending(user_id, action, extra)
+            send_text(chat_id, f"❌ Nahi hua: {exc}\n\nSahi key dobara bhejo, ya /cancel.", retry)
+        except Exception:
+            print("[filesbull] error in add_ai_key (details hidden: message held a key)", flush=True)
+            send_text(chat_id, "❌ Key save nahi hui, thodi der baad dobara try karo.", retry)
+        return
     try:
         if action == "addreq":
             title = add_required_channel(text, message)
@@ -903,9 +933,17 @@ def handle_admin_callback(query: Dict[str, Any], data: str, chat_id: int, user_i
               "admin_add_source": "ad:addsrc", "admin_report": "ad:report"}
     data = legacy.get(data, data)
     cmd = data[3:]
+    if cmd.startswith("y:"):
+        cmd = cmd[2:]          # ✅ Accept on a confirm prompt: run the remove now
+    elif is_destructive(cmd):
+        if cmd.startswith(("keyrm:", "rmadm:")) and not is_owner(user_id):
+            send_text(chat_id, "Ye sirf owner hata sakta hai.", {"inline_keyboard": [BACK_ROW]})
+            return
+        show(chat_id, *confirm_view(cmd), query=query)
+        return
     if cmd == "panel":
         clear_pending(user_id)
-        show(chat_id, ADMIN_PANEL_TEXT, admin_menu(), query, "HTML")
+        show(chat_id, ADMIN_PANEL_TEXT, admin_menu(user_id), query, "HTML")
     elif cmd == "usermenu":
         show(chat_id, welcome_text(query.get("from"), admin=True), admin_start_menu(), query, "HTML")
     elif cmd in {"addreq", "addsrc", "rename"}:
@@ -979,11 +1017,179 @@ def handle_admin_callback(query: Dict[str, Any], data: str, chat_id: int, user_i
     elif cmd == "report":
         show(chat_id, report_text(), {"inline_keyboard": [BACK_ROW]}, query)
     elif cmd == "status":
-        show(chat_id, status_text(user_id), {"inline_keyboard": [BACK_ROW]}, query)
+        show(chat_id, status_text(user_id), status_markup(), query)
     elif cmd == "help":
         show(chat_id, ADMIN_HELP, {"inline_keyboard": [BACK_ROW]}, query)
+    elif cmd == "restart":
+        try:
+            telegram("answerCallbackQuery", {"callback_query_id": query.get("id"), "text": "🔄 Restart ho raha hai..."})
+        except Exception:
+            pass
+        show(chat_id, restart_text(), status_markup(), query)
+    elif cmd == "keys" or cmd.startswith("key"):
+        if not is_owner(user_id):
+            send_text(chat_id, "🔑 AI Keys sirf owner badal sakta hai.", {"inline_keyboard": [BACK_ROW]})
+            return
+        if cmd == "keyadd":
+            ask_input(chat_id, user_id, "addkey")
+        elif cmd == "keychk":
+            try:
+                telegram("answerCallbackQuery", {"callback_query_id": query.get("id"), "text": "🔄 Keys check ho rahi hain..."})
+            except Exception:
+                pass
+            for key in all_ai_keys():
+                st = check_ai_key(key)
+                if st == "ok":
+                    uncool_key(key)
+                elif st in {"invalid", "limit"}:
+                    cool_key(key, 3600 if st == "invalid" else KEY_COOLDOWN, st)
+            show(chat_id, *keys_view(), query=query)
+        elif cmd.startswith("keyrm:"):
+            kid = cmd.split(":", 1)[1]
+            keys = db_ai_keys(fresh=True)
+            gone = [x for x in keys if key_id(x["k"]) == kid]
+            save_db_ai_keys([x for x in keys if key_id(x["k"]) != kid])
+            text, kb = keys_view()
+            show(chat_id, (f"✅ Key hata di ({mask_key(gone[0]['k'])})\n\n" if gone else "") + text, kb, query)
+        else:
+            show(chat_id, *keys_view(), query=query)
     else:
-        show(chat_id, ADMIN_PANEL_TEXT, admin_menu(), query, "HTML")
+        show(chat_id, ADMIN_PANEL_TEXT, admin_menu(user_id), query, "HTML")
+
+
+# ---- confirm before any remove (Aarav 5:08/5:11 PM: one confirm, ✅ Accept / ❌ Deny)
+
+DESTRUCTIVE_PREFIXES = ("rmreq:", "rmsrc:", "rmadm:", "keyrm:")
+DESTRUCTIVE_CMDS = {"backupoff", "logoff"}
+
+
+def is_destructive(cmd: str) -> bool:
+    return cmd in DESTRUCTIVE_CMDS or cmd.startswith(DESTRUCTIVE_PREFIXES)
+
+
+def confirm_view(cmd: str) -> Any:
+    """'⚠️ <item> hatana hai?' with ✅ Accept (runs ad:y:<cmd>) / ❌ Deny (back to the list)."""
+    arg = cmd.split(":", 1)[1] if ":" in cmd else ""
+    name, back = cmd, "ad:panel"
+    try:
+        if cmd.startswith("rmreq:"):
+            rows = supabase("required_channels", "GET", query=f"?chat_id=eq.{urllib.parse.quote(arg)}&select=title&limit=1")
+            name, back = f"Join channel \"{(rows[0].get('title') if rows else None) or arg}\"", "ad:reqlist"
+        elif cmd.startswith("rmsrc:"):
+            rows = supabase("channels", "GET", query=f"?chat_id=eq.{urllib.parse.quote(arg)}&select=title&limit=1")
+            name, back = f"Source channel \"{(rows[0].get('title') if rows else None) or arg}\"", "ad:srclist"
+        elif cmd.startswith("rmadm:"):
+            name, back = f"Sub-admin {arg}", "ad:admins"
+        elif cmd.startswith("keyrm:"):
+            found = [x["k"] for x in db_ai_keys() if key_id(x["k"]) == arg]
+            name, back = f"AI key {mask_key(found[0]) if found else ''}".strip(), "ad:keys"
+        elif cmd == "backupoff":
+            name, back = "Backup channel", "ad:backup"
+        elif cmd == "logoff":
+            name, back = "Log chat", "ad:log"
+    except Exception:
+        log_error("confirm_view")
+    return (f"⚠️ {name} hatana hai?",
+            {"inline_keyboard": [[{"text": "✅ Accept", "callback_data": f"ad:y:{cmd}"[:64]},
+                                  {"text": "❌ Deny", "callback_data": back}]]})
+
+
+# ---- 🔑 AI Keys (owner only): add/remove Groq / OpenAI keys without a Vercel redeploy
+
+def all_ai_keys() -> List[str]:
+    return list(dict.fromkeys(groq_pool() + openai_pool()))
+
+
+def key_status_word(key: str) -> str:
+    st = key_state(key)
+    return {"": "✅ ok", "limit": "⏳ limit", "invalid": "❌ invalid"}.get(st, "⏳ " + st)
+
+
+def keys_view() -> Any:
+    env = [(n, k) for n, k in (("GROQ_API_KEY", GROQ_API_KEY), ("GROQ_API_KEY_2", GROQ_API_KEY_2),
+                                ("GROQ_API_KEY_3", GROQ_API_KEY_3), ("OPENAI_API_KEY", OPENAI_API_KEY)) if k]
+    db = db_ai_keys(fresh=True)
+    lines = ["🔑 AI Keys", ""]
+    lines.append("Vercel wali keys:" if env else "Vercel wali keys: koi nahi")
+    for n, k in env:
+        lines.append(f"• {n}: {mask_key(k)} — {key_status_word(k)}")
+    lines.append("")
+    lines.append("Bot me judi keys:" if db else "Bot me judi keys: abhi koi nahi")
+    kb = []
+    for i, x in enumerate(db, 1):
+        k = x["k"]
+        lines.append(f"{i}. {mask_key(k)} — {'Groq' if key_provider(k) == 'groq' else 'OpenAI'} — {key_status_word(k)}")
+        kb.append([{"text": f"❌ Hatao {mask_key(k)}", "callback_data": f"ad:keyrm:{key_id(k)}"}])
+    lines.append("")
+    lines.append(f"AI: {'ON ✅' if ai_provider() else 'OFF ❌'} — saari keys backup ki tarah chalti hain: "
+                 "ek limit pe ya band ho to agli turant.")
+    lines.append("✅ ok = chal rahi · ⏳ limit = thodi der ruki · ❌ invalid = galat/band key")
+    kb = [[{"text": "➕ Key Jodo", "callback_data": "ad:keyadd"}]] + kb + \
+         [[{"text": "🔄 Keys Check", "callback_data": "ad:keychk"}], BACK_ROW]
+    return "\n".join(lines), {"inline_keyboard": kb}
+
+
+def add_ai_key(message: Dict[str, Any], chat_id: int, text: str) -> None:
+    """Owner pasted a key: delete their message first (always), validate for free, save."""
+    try:
+        telegram("deleteMessage", {"chat_id": chat_id, "message_id": message.get("message_id")})
+        deleted = True
+    except Exception:
+        deleted = False
+    found = KEY_RE.search(text or "")
+    note = "" if deleted else "\n⚠️ Key wala message khud delete kar do."
+    if not found:
+        raise InputError("Ye API key jaisi nahi lag rahi. Groq key \"gsk_\" se, OpenAI key \"sk-\" se shuru hoti hai." + note)
+    key = found.group(1)
+    keys = db_ai_keys(fresh=True)
+    if key in GROQ_KEYS or key == OPENAI_API_KEY or any(x["k"] == key for x in keys):
+        raise InputError(f"Ye key ({mask_key(key)}) pehle se judi hai." + note)
+    st = check_ai_key(key)
+    if st == "invalid":
+        raise InputError(f"Ye key ({mask_key(key)}) kaam nahi kar rahi (invalid). Nayi key banao aur dobara bhejo." + note)
+    if st == "error":
+        raise InputError("Key check nahi ho payi (network). Thodi der baad dobara bhejo." + note)
+    keys.append({"k": key, "p": key_provider(key), "ts": int(time.time())})
+    save_db_ai_keys(keys)
+    if st == "limit":
+        cool_key(key, KEY_COOLDOWN, "limit")
+    else:
+        uncool_key(key)
+    send_text(chat_id, f"✅ Key jud gayi ({mask_key(key)})" + (" — abhi limit pe hai, thodi der me chalu" if st == "limit" else "") +
+              f"\nAb kul AI keys: {len(all_ai_keys())}" + note,
+              {"inline_keyboard": [[{"text": "🔑 AI Keys", "callback_data": "ad:keys"}], BACK_ROW]})
+
+
+# ---- 🔄 Bot Restart / webhook self-heal
+
+def status_markup() -> Dict[str, Any]:
+    return {"inline_keyboard": [
+        [{"text": "🔄 Bot Restart", "callback_data": "ad:restart"}],
+        [{"text": "🌐 Web kholo (restart)", "url": PUBLIC_HOME + "?restart=1"}],
+        BACK_ROW]}
+
+
+def restart_text() -> str:
+    try:
+        ensure_webhook(force=True)
+        info = telegram("getWebhookInfo", {}).get("result", {}) or {}
+    except Exception as exc:
+        return ("❌ Restart nahi hua: " + friendly_tg_error(exc)[:150] +
+                "\n\nNiche 🌐 Web kholo dabao (site khulte hi bot dobara chalu hota hai).")
+    ok_url = info.get("url") == webhook_url()
+    err = info.get("last_error_message")
+    lines = ["🔄 Bot Restart ho gaya ✅" if ok_url else "⚠️ Restart kiya, par webhook sahi nahi laga",
+             "", f"Webhook: {'✅ sahi' if ok_url else '❌ galat'}",
+             f"Pending updates: {info.get('pending_update_count', 0)}",
+             "Commands menu: ✅ set"]
+    if err:
+        when = info.get("last_error_date")
+        ago = f" ({max(0, int(time.time()) - int(when)) // 60} min pehle)" if when else ""
+        lines.append(f"Last error{ago}: {str(err)[:120]}")
+    else:
+        lines.append("Last error: koi nahi ✅")
+    lines.append("\nDeploy ke baad bot apne-aap chalu rehta hai; phir bhi ruke to yahi button ya 🌐 Web kholo.")
+    return "\n".join(lines)
 
 
 # ================================================================ smart chat (cheap first, AI second)
@@ -1219,54 +1425,149 @@ def save_ctx(user_id: Optional[int], ctx: Dict[str, Any]) -> None:
 
 # ---- AI (only when the local step cannot decide)
 
+KEY_RE = re.compile(r"\b(gsk_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_\-]{20,})")
+
+
+def key_provider(key: str) -> str:
+    return "groq" if key.startswith("gsk_") else "openai"
+
+
+def key_id(key: str) -> str:
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
+
+
+def mask_key(key: str) -> str:
+    return (key[:4] if key.startswith("gsk_") else key[:3]) + "…" + key[-4:]
+
+
+def db_ai_keys(fresh: bool = False) -> List[Dict[str, Any]]:
+    """Keys the owner pasted in the bot: [{"k", "p": groq|openai, "ts"}]. Cached 60 s per instance."""
+    if not fresh and time.time() - _DBKEYS["t"] < 60:
+        return _DBKEYS["v"]
+    keys = _DBKEYS["v"]
+    try:
+        raw = get_setting("ai_keys") if (SUPABASE_URL and SUPABASE_KEY) else None
+        data = json.loads(raw) if raw else []
+        keys = [x for x in data if isinstance(x, dict) and isinstance(x.get("k"), str) and x["k"]]
+    except Exception:
+        log_error("ai_keys")
+    _DBKEYS.update(t=time.time(), v=keys)
+    return keys
+
+
+def save_db_ai_keys(keys: List[Dict[str, Any]]) -> None:
+    set_setting("ai_keys", json.dumps(keys))
+    _DBKEYS.update(t=time.time(), v=keys)
+
+
+def groq_pool() -> List[str]:
+    """Env keys first (GROQ_API_KEY, _2, _3), then keys added in the bot. Same failover for all."""
+    return [k for k in dict.fromkeys(GROQ_KEYS + [x["k"] for x in db_ai_keys() if key_provider(x["k"]) == "groq"]) if k]
+
+
+def openai_pool() -> List[str]:
+    return [k for k in dict.fromkeys([OPENAI_API_KEY] + [x["k"] for x in db_ai_keys() if key_provider(x["k"]) == "openai"]) if k]
+
+
 def ai_provider() -> str:
-    return "groq" if GROQ_KEYS else ("openai" if OPENAI_API_KEY else "")
+    return "groq" if groq_pool() else ("openai" if openai_pool() else "")
 
 
-_KEY_COOL: Dict[int, float] = {}
+_KEY_COOL: Dict[str, float] = {}
 KEY_COOLDOWN = 300   # seconds a rate-limited / failing key is skipped
 
 
-def key_cooling(index: int) -> bool:
-    until = _KEY_COOL.get(index)
+def key_state(key: str) -> str:
+    """"" (usable) | "limit" | "invalid" — from the cooling record in bot_settings."""
+    kid = key_id(key)
+    raw = get_setting(f"aikey_cool:{kid}") or ""
+    until, _, reason = raw.partition("|")
+    try:
+        cooling = float(until) > time.time()
+    except ValueError:
+        cooling = False
+    return (reason or "limit") if cooling else ""
+
+
+def key_cooling(key: str) -> bool:
+    kid = key_id(key)
+    until = _KEY_COOL.get(kid)
     if until is None:
-        raw = get_setting(f"aikey_cool:{index}")
+        raw = (get_setting(f"aikey_cool:{kid}") or "").partition("|")[0]
         until = float(raw) if raw and raw.replace(".", "", 1).isdigit() else 0.0
-        _KEY_COOL[index] = until
+        _KEY_COOL[kid] = until
     return until > time.time()
 
 
-def cool_key(index: int, seconds: int = KEY_COOLDOWN) -> None:
+def cool_key(key: str, seconds: int = KEY_COOLDOWN, reason: str = "limit") -> None:
     until = time.time() + seconds
-    _KEY_COOL[index] = until
+    _KEY_COOL[key_id(key)] = until
     try:
-        set_setting(f"aikey_cool:{index}", str(int(until)))
+        set_setting(f"aikey_cool:{key_id(key)}", f"{int(until)}|{reason}")
     except Exception:
         log_error("cool_key")
+
+
+def uncool_key(key: str) -> None:
+    _KEY_COOL[key_id(key)] = 0.0
+    try:
+        supabase("bot_settings", "DELETE", query=f"?key=eq.{urllib.parse.quote('aikey_cool:' + key_id(key))}")
+    except Exception:
+        log_error("uncool_key")
+
+
+def check_ai_key(key: str) -> str:
+    """Free check (lists models, spends no tokens): "ok" | "invalid" | "limit" | "error"."""
+    url = "https://api.groq.com/openai/v1/models" if key_provider(key) == "groq" else "https://api.openai.com/v1/models"
+    try:
+        http_json(url, "GET", None, {"Authorization": f"Bearer {key}"}, timeout=6)
+        return "ok"
+    except Exception as exc:
+        low = str(exc).lower()
+        if "http 401" in low or "http 403" in low or "invalid" in low:
+            return "invalid"
+        if "http 429" in low:
+            return "limit"
+        return "error"
+
+
+def fail_reason(exc: Exception) -> str:
+    low = str(exc).lower()
+    return "invalid" if ("http 401" in low or "http 403" in low or "invalid api key" in low) else "limit"
 
 
 def ai_complete(system: str, user_text: str, max_tokens: int = 150) -> Optional[str]:
     messages = [{"role": "system", "content": system}, {"role": "user", "content": user_text}]
     models = [m for m in dict.fromkeys([GROQ_MODEL, "llama-3.1-8b-instant", "llama-3.3-70b-versatile"]) if m]
-    usable = [i for i in range(len(GROQ_KEYS)) if not key_cooling(i)] or list(range(len(GROQ_KEYS)))
-    for index in usable:
-        key = GROQ_KEYS[index]
+    pool = groq_pool()
+    usable = [k for k in pool if not key_cooling(k)] or pool
+    # One overall time cap, however many keys there are: the webhook must answer Telegram fast,
+    # or Telegram retries with growing pauses and the bot looks dead.
+    deadline = time.time() + 9
+    for n, key in enumerate(usable):
         for model in models:
+            if time.time() > deadline - 1:
+                return None
             try:
                 res = http_json("https://api.groq.com/openai/v1/chat/completions", "POST", {
                     "model": model, "messages": messages, "max_tokens": max_tokens, "temperature": 0.1,
-                    "response_format": {"type": "json_object"}}, {"Authorization": f"Bearer {key}"}, timeout=6)
+                    "response_format": {"type": "json_object"}}, {"Authorization": f"Bearer {key}"},
+                    timeout=max(1.0, min(6.0, deadline - time.time())))
                 return res["choices"][0]["message"]["content"]
             except Exception as exc:
                 low = str(exc).lower()
                 if "model" in low and any(x in low for x in ("not found", "decommission", "does not exist", "not supported")):
                     continue   # same key, next model
-                print(f"[filesbull] groq key {index + 1} error: {str(exc)[:160].replace(key, '***')}", flush=True)
+                print(f"[filesbull] groq key {n + 1} ({mask_key(key)}) error: {str(exc)[:160].replace(key, '***')}", flush=True)
                 # 429 limit / 401-403 bad key / 5xx / timeout: skip this key for a while, try the next one now.
                 m = re.search(r"try again in (\d+)m", low)
-                cool_key(index, max(KEY_COOLDOWN, int(m.group(1)) * 60) if m else KEY_COOLDOWN)
+                reason = fail_reason(exc)
+                cool_key(key, 3600 if reason == "invalid" else (max(KEY_COOLDOWN, int(m.group(1)) * 60) if m else KEY_COOLDOWN), reason)
                 break
-    if OPENAI_API_KEY:
+    opool = openai_pool()
+    for key in ([k for k in opool if not key_cooling(k)] or opool):
+        if time.time() > deadline - 2:
+            break
         body: Dict[str, Any] = {"model": OPENAI_MODEL, "messages": messages, "response_format": {"type": "json_object"}}
         if OPENAI_MODEL.startswith(("gpt-5", "o1", "o3", "o4")):
             body["reasoning_effort"] = "minimal" if OPENAI_MODEL.startswith("gpt-5") else "low"
@@ -1276,10 +1577,12 @@ def ai_complete(system: str, user_text: str, max_tokens: int = 150) -> Optional[
             body["temperature"] = 0.1
         try:
             res = http_json("https://api.openai.com/v1/chat/completions", "POST", body,
-                            {"Authorization": f"Bearer {OPENAI_API_KEY}"}, timeout=8)
+                            {"Authorization": f"Bearer {key}"}, timeout=max(1.0, min(8.0, deadline - time.time())))
             return res["choices"][0]["message"]["content"]
         except Exception as exc:
-            print(f"[filesbull] openai error: {str(exc)[:200]}", flush=True)
+            print(f"[filesbull] openai key {mask_key(key)} error: {str(exc)[:200].replace(key, '***')}", flush=True)
+            reason = fail_reason(exc)
+            cool_key(key, 3600 if reason == "invalid" else KEY_COOLDOWN, reason)
     return None
 
 
@@ -2033,6 +2336,8 @@ USER_MENU = [
 ADMIN_MENU = USER_MENU + [
     {"command": "admin", "description": "Admin Panel (saare buttons)"},
     {"command": "status", "description": "Admin: ID, role, channels status"},
+    {"command": "restart", "description": "Admin: bot restart (webhook dobara set)"},
+    {"command": "keys", "description": "Owner: AI keys jodo/hatao"},
     {"command": "requirechannel", "description": "Admin: join channel jodo"},
     {"command": "requiredchannels", "description": "Admin: join channels list"},
     {"command": "removerequired", "description": "Admin: join channel hatao"},
@@ -2188,6 +2493,18 @@ def handle_private_message(message: Dict[str, Any]) -> None:
         send_text(chat_id, f"⛔ Ye command sirf admin ke liye hai.\nAapka Telegram ID: {user_id}")
         return
 
+    if not command and KEY_RE.search(text) and message.get("chat", {}).get("type") == "private":
+        # An API key must never be searched, sent to the AI or written to logs.
+        if is_subadmin(user_id):
+            handle_admin_input(message, "addkey", None)   # owner: saved; sub-admin: deleted + refused
+            return
+        try:
+            telegram("deleteMessage", {"chat_id": chat_id, "message_id": message.get("message_id")})
+        except Exception:
+            pass
+        send_text(chat_id, "🔒 API key chat me mat bhejo — maine message hata diya.")
+        return
+
     if is_subadmin(user_id) and message.get("chat", {}).get("type") == "private" and not command:
         # Answer to an admin-panel prompt (reply to the prompt, or the next message after a button).
         action = prompt_action(message)
@@ -2321,11 +2638,18 @@ def handle_admin_command(message: Dict[str, Any]) -> None:
         send_text(chat_id, f"❌ Nahi hua: {str(exc)[:300]}")
 
     if command in {"/admin", "/panel", "/menu"}:
-        send_text(chat_id, ADMIN_PANEL_TEXT, admin_menu(), "HTML")
+        send_text(chat_id, ADMIN_PANEL_TEXT, admin_menu(user_id), "HTML")
     elif command == "/cancel":
-        send_text(chat_id, "✅ Cancel ho gaya.", admin_menu())
+        send_text(chat_id, "✅ Cancel ho gaya.", admin_menu(user_id))
     elif command in {"/status", "/debug"}:
-        send_text(chat_id, status_text(user_id), {"inline_keyboard": [BACK_ROW]})
+        send_text(chat_id, status_text(user_id), status_markup())
+    elif command == "/restart":
+        send_text(chat_id, restart_text(), status_markup())
+    elif command in {"/keys", "/aikeys"}:
+        if is_owner(user_id):
+            send_text(chat_id, *keys_view())
+        else:
+            send_text(chat_id, "🔑 AI Keys sirf owner badal sakta hai.")
     elif command == "/addadmin":
         if not is_owner(user_id):
             send_text(chat_id, "Sirf primary owner sub-admin add kar sakta hai.")
@@ -2339,13 +2663,7 @@ def handle_admin_command(message: Dict[str, Any]) -> None:
         elif not arg.isdigit():
             send_text(chat_id, *admins_view(user_id))
         else:
-            supabase("admins", "DELETE", query=f"?user_id=eq.{arg}")
-            _SUBADMIN_CACHE.pop(int(arg), None)
-            try:
-                telegram("deleteMyCommands", {"scope": {"type": "chat", "chat_id": int(arg)}})
-            except Exception:
-                log_error("remove admin menu")
-            send_text(chat_id, f"✅ Sub-admin {arg} hata diya.")
+            send_text(chat_id, *confirm_view(f"rmadm:{arg}"))
     elif command == "/requirechannel":
         if not arg and not forwarded_source(message):
             ask_input(chat_id, user_id, "addreq")
@@ -2360,8 +2678,7 @@ def handle_admin_command(message: Dict[str, Any]) -> None:
             try:
                 ref = parse_chat_ref(arg)
                 cid = ref if isinstance(ref, int) else telegram("getChat", {"chat_id": ref}).get("result", {}).get("id")
-                supabase("required_channels", "DELETE", query=f"?chat_id=eq.{cid}")
-                send_text(chat_id, "✅ Join channel hata diya.")
+                send_text(chat_id, *confirm_view(f"rmreq:{cid}"))
             except Exception as exc:
                 fail(InputError(friendly_tg_error(exc)) if not isinstance(exc, InputError) else exc)
     elif command == "/addchannel":
@@ -2378,8 +2695,7 @@ def handle_admin_command(message: Dict[str, Any]) -> None:
             try:
                 ref = parse_chat_ref(arg)
                 cid = ref if isinstance(ref, int) else telegram("getChat", {"chat_id": ref}).get("result", {}).get("id")
-                supabase("channels", "PATCH", {"active": False}, f"?chat_id=eq.{cid}")
-                send_text(chat_id, "✅ Source channel hata diya (purani files search me rahengi).")
+                send_text(chat_id, *confirm_view(f"rmsrc:{cid}"))
             except Exception as exc:
                 fail(InputError(friendly_tg_error(exc)) if not isinstance(exc, InputError) else exc)
     elif command == "/setbackupchannel":
@@ -2411,7 +2727,7 @@ def handle_admin_command(message: Dict[str, Any]) -> None:
         else:
             ask_input(chat_id, user_id, "rename")
     else:
-        send_text(chat_id, "Ye command nahi pehchani. Admin Panel:", admin_menu())
+        send_text(chat_id, "Ye command nahi pehchani. Admin Panel:", admin_menu(user_id))
 
 
 def handle_channel_post(message: Dict[str, Any]) -> None:
@@ -2518,28 +2834,100 @@ def handle_callback(query: Dict[str, Any]) -> None:
         deliver_result(chat_id, rows[0], query.get("from"))
 
 
+PUBLIC_HOME = "https://" + (os.environ.get("PUBLIC_URL") or os.environ.get("VERCEL_PROJECT_PRODUCTION_URL")
+                            or "filesbull.vercel.app").replace("https://", "").replace("http://", "").strip("/") + "/"
+ALLOWED_UPDATES = ["message", "channel_post", "callback_query"]
+
+
 def webhook_url() -> str:
     # Always register the production domain over https, even if a preview URL was opened.
-    host = os.environ.get("PUBLIC_URL") or os.environ.get("VERCEL_PROJECT_PRODUCTION_URL") or request.host
+    try:
+        req_host = request.host
+    except RuntimeError:
+        req_host = ""
+    host = os.environ.get("PUBLIC_URL") or os.environ.get("VERCEL_PROJECT_PRODUCTION_URL") or req_host or "filesbull.vercel.app"
     host = host.replace("https://", "").replace("http://", "").strip("/")
     return f"https://{host}/api/webhook"
 
 
+def webhook_fingerprint() -> str:
+    # Changes when the URL, the secret (WEBHOOK_SECRET / BOT_TOKEN) or the update types change.
+    return hashlib.sha256(f"{webhook_url()}|{WEBHOOK_SECRET}|{','.join(ALLOWED_UPDATES)}".encode("utf-8")).hexdigest()[:16]
+
+
+def commands_fingerprint() -> str:
+    return hashlib.sha256(json.dumps([USER_MENU, ADMIN_MENU, sorted(ADMIN_USER_IDS)], ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
+
+
+def _setting_or_none(key: str) -> Optional[str]:
+    try:
+        return get_setting(key) if (SUPABASE_URL and SUPABASE_KEY) else None
+    except Exception:
+        return None
+
+
+def ensure_webhook(force: bool = False) -> Dict[str, Any]:
+    """Idempotent and cheap: one getWebhookInfo; setWebhook only when something is wrong.
+    Called by GET / (GitHub Actions keepalive after every push + every 10 min) and 🔄 Bot Restart."""
+    info = telegram("getWebhookInfo", {}).get("result", {}) or {}
+    want = webhook_url()
+    now = int(time.time())
+    pending = int(info.get("pending_update_count") or 0)
+    err_date = int(info.get("last_error_date") or 0)
+    before = {"url_ok": info.get("url") == want, "pending_updates": pending,
+              "last_error": info.get("last_error_message"),
+              "last_error_min_ago": (now - err_date) // 60 if err_date else None}
+    reasons = []
+    if force:
+        reasons.append("manual restart")
+    if info.get("url") != want:
+        reasons.append("webhook url missing/wrong")
+    fp = webhook_fingerprint()
+    if _setting_or_none("webhook_fp") != fp:
+        reasons.append("secret/settings changed or not recorded")
+    if sorted(info.get("allowed_updates") or []) != sorted(ALLOWED_UPDATES):
+        reasons.append("update types")
+    if pending and err_date and now - err_date < 3600:
+        # Telegram backs off after failed deliveries and holds every later message behind them;
+        # setWebhook makes it retry right away.
+        reasons.append("stuck: delivery errors with pending updates")
+    action = "none"
+    if reasons:
+        telegram("setWebhook", {"url": want, "secret_token": WEBHOOK_SECRET, "allowed_updates": ALLOWED_UPDATES})
+        action = "re-set (" + ", ".join(reasons) + ")"
+        try:
+            set_setting("webhook_fp", fp)
+        except Exception:
+            log_error("save webhook_fp")
+    cfp = commands_fingerprint()
+    commands = "unchanged"
+    if reasons or _setting_or_none("commands_fp") != cfp:
+        set_command_menu()
+        commands = "set"
+        try:
+            set_setting("commands_fp", cfp)
+        except Exception:
+            log_error("save commands_fp")
+    return {"action": action, "commands": commands, "before": before}
+
+
 @app.get("/")
 def health() -> Any:
-    # Visiting the deployed URL once is enough to register the webhook.
-    # This keeps first-time setup simple for non-technical admins.
+    # Opening the site (or the GitHub Actions keepalive) checks the webhook and fixes it only if
+    # it is wrong — safe to call any number of times.
     registered = None
+    heal: Dict[str, Any] = {}
     if BOT_TOKEN:
         try:
-            result = telegram("setWebhook", {"url": webhook_url(), "secret_token": WEBHOOK_SECRET,
-                                             "allowed_updates": ["message", "channel_post", "callback_query"]})
-            registered = bool(result.get("ok"))
-            set_command_menu()
-        except Exception:
+            heal = ensure_webhook(force=request.args.get("restart") == "1")
+            registered = True
+        except Exception as exc:
             log_error("setup")
+            registered = False
+            heal = {"error": type(exc).__name__ + ": " + str(exc)[:120].replace(BOT_TOKEN, "***")}
     status = setup_status()
     status["webhook_registered"] = registered
+    status["self_heal"] = heal
     return jsonify({"ok": True, "service": "telegram-book-bot", "status": status})
 
 
@@ -2606,6 +2994,7 @@ def setup_status() -> Dict[str, Any]:
             "GROQ_API_KEY_3": bool(GROQ_API_KEY_3),
         },
         "ai": ("on (" + ai_provider() + ")") if ai_provider() else "off",
+        "ai_keys_in_bot": len(db_ai_keys()),
     }
     if GROQ_KEYS:
         # Key check without spending tokens (lists models). Never shows a key.
@@ -2659,6 +3048,13 @@ def setup_status() -> Dict[str, Any]:
     else:
         status["database"] = "not configured (set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)"
     return status
+
+
+@app.after_request
+def build_header(response: Any) -> Any:
+    # Which commit is serving (lets a deploy be verified without opening the home page).
+    response.headers["X-Filesbull-Build"] = os.environ.get("VERCEL_GIT_COMMIT_SHA", "")[:7] or "local"
+    return response
 
 
 @app.post("/api/webhook")
