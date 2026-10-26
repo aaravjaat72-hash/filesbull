@@ -278,12 +278,14 @@ class Run:
             "kind": "file", "lane": lane, "inbox": self.inbox_id, "inbox_msg": bid, "mode": mode,
             "src": {"id": cid, "title": self.s["titles"].get(str(cid)) or "", "username": getattr(ent, "username", "") or "",
                     "msg": m.id, "date": int(m.date.timestamp()) if getattr(m, "date", None) else 0}})
-        if reported.get("result") not in ("saved", "dup"):
-            # Never checkpoint an unindexed file: the Inbox post stays; next run tries this source post again and the
-            # DB's file_unique_id catches it if the report did land.
-            self.stop = "Inbox post ka bot me save confirm nahi hua, agli baar phir check"
-            self.s["error"] = "Inbox me file aayi par bot me save confirm nahi hua; agle run me dobara check"
-            raise Stop()
+        if reported.get("result") not in ("saved", "dup", "queued"):
+            # Unconfirmed save must NEVER stop the run (Aarav 11:04 PM Oct 26): the Inbox post stays, the bot retries
+            # cataloguing it from the Inbox (pending-retry list in the final report) and the run goes on.
+            self.s.setdefault("unconfirmed", []).append({
+                "inbox": self.inbox_id, "inbox_msg": bid, "lane": lane,
+                "src": {"id": cid, "title": self.s["titles"].get(str(cid)) or "", "username": getattr(ent, "username", "") or "",
+                        "msg": m.id, "date": int(m.date.timestamp()) if getattr(m, "date", None) else 0}})
+            print("save not confirmed yet: queued for the bot to retry")
         await asyncio.sleep(random.uniform(float(self.gap[0]), float(self.gap[1])))
         return True
 

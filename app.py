@@ -10913,9 +10913,15 @@ def _ub_done(body: Dict[str, Any], st: Dict[str, Any]) -> Any:
             st["recent_backup"] = recent[-100:]
         c["title"] = str(src.get("title") or c.get("title") or "")[:60]
         c["n"] = int(c.get("n") or 0) + (1 if res in ("saved", "review") else 0)
+        if res not in ("saved", "review", "dup"):
+            ub_queue_retry(st, body, res)                # never lost: retried from the Inbox on the next settle calls
+            res = "queued"
         out["result"] = "saved" if res == "review" else res
     elif kind == "final":
         fatal = str(body.get("fatal") or "")
+        for u in (body.get("unconfirmed") or [])[:60]:
+            if isinstance(u, dict):
+                ub_queue_retry(st, u, "unconfirmed")
         for cid, last in (body.get("last") or {}).items():
             c = ch.setdefault(str(cid), {})
             c["last"] = max(int(c.get("last") or 0), int(last or 0))
@@ -11023,6 +11029,58 @@ def _ub_done(body: Dict[str, Any], st: Dict[str, Any]) -> Any:
     return jsonify(out)
 
 
+
+# ---- pending-retry: an Inbox post whose catalog save wasn't confirmed (timeout / read error) is retried from the
+# Inbox on the next settle calls (max 3 tries) — it never stops a run (Aarav 11:04 PM Oct 26).
+UB_RETRY_TRIES = 3
+
+
+def ub_queue_retry(st: Dict[str, Any], body: Dict[str, Any], why: str) -> None:
+    q = st.setdefault("iretry", [])
+    mid = int(body.get("inbox_msg") or body.get("backup_msg") or 0)
+    if not mid or any(int(x.get("inbox_msg") or 0) == mid and str(x.get("inbox")) == str(body.get("inbox")) for x in q):
+        return
+    q.append({"inbox": body.get("inbox") or ub_inbox(), "inbox_msg": mid, "lane": body.get("lane") or "live", "src": body.get("src") or {},
+              "tries": 0, "why": str(why)[:40]})
+    st["iretry"] = q[-100:]
+    st["ingest_err"] = {"t": int(time.time()), "why": str(why)[:40]}
+
+
+def ub_ingest_retry(st: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    q = st.get("iretry") or []
+    if not q or req_elapsed() > 2.0:
+        return None
+    u = q.pop(0)
+    try:
+        res = ub_ingest(u, st)
+    except Exception as exc:
+        log_error("ub ingest retry")
+        res = "error"
+    f = _UB_REQ.get("file") or {}
+    src = u.get("src") or {}
+    if res in ("saved", "review"):
+        ub_cnt(st, "new")
+        ub_cnt(st, "in")
+        if res == "review":
+            ub_cnt(st, "review")
+        c = st.setdefault("ch", {}).setdefault(str(src.get("id")), {})
+        c["n"] = int(c.get("n") or 0) + 1
+        if u.get("lane") == "bf":
+            bf = c.setdefault("bf", {})
+            bf["n"] = int(bf.get("n") or 0) + 1
+        inbox_alert(f"📥 {f.get('n') or 'file'} · {human_size(f.get('s'))} · from {str(src.get('title') or '')[:40]} (dobara try se save)")
+    elif res == "dup":
+        ub_cnt(st, "dup")
+    else:
+        u["tries"] = int(u.get("tries") or 0) + 1
+        if u["tries"] < UB_RETRY_TRIES:
+            q.append(u)
+        else:
+            inbox_alert(f"⚠️ Inbox ki ek file bot me save nahi hui (3 baar try): {f.get('n') or ('post ' + str(u.get('inbox_msg')))} "
+                        f"· {str(src.get('title') or '')[:40]}")
+    st["iretry"] = q
+    return {"did": "retry_" + str(res), "left": len(q) + 1}
+
 @app.post("/api/userbot-settle")
 def ub_settle_api() -> Any:
     """The runner pumps this after forwarding: each call settles ONE Inbox file (or retries naming one review file)."""
@@ -11036,7 +11094,8 @@ def ub_settle_api() -> Any:
     st.setdefault("rn", {})
     _UB_REQ["st"] = st
     try:
-        out = ub_settle_step(st)
+        out = ub_ingest_retry(st) if st.get("iretry") else None
+        out = out or ub_settle_step(st)
     except Exception as exc:
         log_error("ub settle")
         out = {"did": "error", "error": type(exc).__name__, "left": 0}
