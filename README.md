@@ -35,11 +35,14 @@ The bot must only be used for files you own or are authorized to distribute. Tel
    - `SUPABASE_URL`
    - `SUPABASE_SERVICE_ROLE_KEY`
    - `ADMIN_USER_IDS`
-   - Optional: `OPENAI_API_KEY`, `OPENAI_MODEL=gpt-5-mini`
+   - Optional: `OPENAI_API_KEY`, `OPENAI_MODEL=gpt-5-mini`, `WEBHOOK_SECRET`
 
-6. After deployment, set the Telegram webhook once in a browser or shell:
-
-   `https://api.telegram.org/bot<BOT_TOKEN>/setWebhook?url=https://<your-vercel-domain>/api/webhook`
+6. After deployment, open `https://<your-vercel-domain>/` once in a browser. It registers the
+   Telegram webhook (with a secret token) and the command menus, and shows a setup status:
+   which env vars are set (true/false), whether every Supabase table exists, and Telegram's
+   last webhook error. Do NOT set the webhook manually with a plain `setWebhook?url=...` link:
+   without the secret token the bot rejects Telegram's calls (401). If that happens, just open
+   the home URL again. Optional: set `WEBHOOK_SECRET` to choose your own secret.
 
 7. Add the bot as an administrator to each channel, then send the bot:
 
