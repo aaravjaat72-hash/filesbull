@@ -160,22 +160,32 @@ def join_markup() -> Dict[str, Any]:
 def ai_rank(query: str, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not OPENAI_API_KEY or len(rows) < 2:
         return rows
-    compact = [{"id": r.get("id"), "title": r.get("title"), "keywords": r.get("keywords", "")[:500], "content": r.get("content_text", "")[:700]} for r in rows[:10]]
+    # Old rows can have NULL keywords/content_text; `or ""` avoids a crash that made every
+    # search reply "Database abhi available nahi hai" once OPENAI_API_KEY is set.
+    compact = [{"id": r.get("id"), "title": r.get("title"), "keywords": (r.get("keywords") or "")[:500], "content": (r.get("content_text") or "")[:700]} for r in rows[:10]]
     prompt = "Select only the IDs of files that best satisfy the user's request. Return JSON with an ids array of numbers. Never invent IDs. User: " + query + "\nFiles: " + json.dumps(compact, ensure_ascii=False)
+    body: Dict[str, Any] = {
+        "model": OPENAI_MODEL,
+        "messages": [{"role": "system", "content": "You rank a private PDF catalog. Output valid JSON only."}, {"role": "user", "content": prompt}],
+        "response_format": {"type": "json_object"},
+        "max_completion_tokens": 300,
+    }
+    if OPENAI_MODEL.startswith(("gpt-5", "o1", "o3", "o4")):
+        # Reasoning models reject temperature=0 and spend tokens on reasoning first.
+        body["reasoning_effort"] = "minimal" if OPENAI_MODEL.startswith("gpt-5") else "low"
+        body["max_completion_tokens"] = 2000
+    else:
+        body["temperature"] = 0
     try:
-        result = http_json("https://api.openai.com/v1/chat/completions", "POST", {
-            "model": OPENAI_MODEL,
-            "messages": [{"role": "system", "content": "You rank a private PDF catalog. Output valid JSON only."}, {"role": "user", "content": prompt}],
-            "response_format": {"type": "json_object"},
-            "temperature": 0,
-            "max_completion_tokens": 300,
-        }, {"Authorization": f"Bearer {OPENAI_API_KEY}"})
+        result = http_json("https://api.openai.com/v1/chat/completions", "POST", body,
+                           {"Authorization": f"Bearer {OPENAI_API_KEY}"})
         content = result["choices"][0]["message"]["content"]
         ids = json.loads(content).get("ids", [])
         by_id = {str(r.get("id")): r for r in rows}
         ranked = [by_id[str(i)] for i in ids if str(i) in by_id]
         return ranked or rows
     except Exception:
+        log_error("ai_rank")
         return rows
 
 
