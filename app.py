@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import html
 import json
 import io
 import os
@@ -299,13 +300,13 @@ def add_source_channel(target: str, message: Optional[Dict[str, Any]] = None) ->
     return chat
 
 
-def missing_required(user_id: Optional[int]) -> List[Dict[str, Any]]:
+def missing_required(user_id: Optional[int], channels: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
     """Required channels this user has NOT joined. A channel the bot cannot check
     (bot not admin / removed) is skipped and logged instead of locking everyone out."""
     missing = []
     if not user_id:
         return missing
-    for channel in required_channels():
+    for channel in (required_channels() if channels is None else channels):
         try:
             member = telegram("getChatMember", {"chat_id": channel["chat_id"], "user_id": user_id}).get("result", {}) or {}
         except Exception:
@@ -336,40 +337,118 @@ def join_url(channel: Dict[str, Any]) -> Optional[str]:
     return url
 
 
-def join_markup(channels: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+def esc(value: Any) -> str:
+    """Escape user/channel text for parse_mode HTML (names like <Raj> or A&B stay safe)."""
+    return html.escape(str(value if value is not None else ""), quote=False)
+
+
+def first_name(user: Optional[Dict[str, Any]]) -> str:
+    name = str((user or {}).get("first_name") or "").strip() or "dost"
+    return esc(name[:40])
+
+
+VERIFY_BUTTON = "✅ Joined / Verify"
+
+
+def join_markup(channels: Optional[List[Dict[str, Any]]] = None, total: int = 0) -> Dict[str, Any]:
+    """Join buttons for the channels still missing. With more than one join channel in total,
+    each button carries the channel's name so the user knows which one is left."""
+    chans = required_channels() if channels is None else channels
+    named = max(total, len(chans)) > 1
     rows = []
-    for channel in (required_channels() if channels is None else channels):
+    for channel in chans:
         url = join_url(channel)
         if url:
-            rows.append([{"text": f"📢 Join: {str(channel.get('title') or 'Channel')[:30]}", "url": url}])
-    rows.append([{"text": "✅ Join kar liya - Verify", "callback_data": "verify_join"}])
+            label = f"📢 Join: {str(channel.get('title') or 'Channel')[:28]}" if named else "📢 Join Channel"
+            rows.append([{"text": label, "url": url}])
+    rows.append([{"text": VERIFY_BUTTON, "callback_data": "verify_join"}])
     return {"inline_keyboard": rows}
 
 
-def send_join_gate(chat_id: int, missing: List[Dict[str, Any]]) -> None:
-    names = "\n".join(f"• {c.get('title') or 'Channel'}" for c in missing)
-    send_text(chat_id, "🔒 Bot use karne ke liye pehle ye channel join karein:\n" + names +
-              "\n\nJoin karne ke baad ✅ Verify dabayein.", join_markup(missing))
+def gate_text(missing: List[Dict[str, Any]], left: bool = False, total: int = 0) -> str:
+    many = max(total, len(missing)) > 1
+    names = "\n".join(f"• {esc(c.get('title') or 'Channel')}" for c in missing) if many else ""
+    if left:
+        head = "⁉️ <b>Aapne hamara channel chhod diya!</b>"
+        body = ("Bot ka access rok diya gaya hai 🔒\n"
+                + ("Ye channels dobara join karo:\n" + names + "\n\nPhir ✅ Joined dabao." if many
+                   else "Dobara channel join karo aur ✅ Joined dabao."))
+        return f"{head}\n\n{body}"
+    if many:
+        return ("⁉️ <b>Bot use karne ke liye pehle hamare channels join karo!</b>\n\n" + names +
+                "\n\nNiche har 📢 Join button dabao, join karo, phir ✅ Joined / Verify dabao.")
+    return ("⁉️ <b>Bot use karne ke liye pehle hamara channel join karo!</b>\n\n"
+            "Niche 📢 Join Channel dabao, join karo, phir ✅ Joined / Verify dabao.")
+
+
+# ---- verified memory: who has passed the gate before (to tell "left" apart from "new").
+# Stored in bot_settings as key "verified:<user_id>" (no schema change needed).
+_VERIFIED_CACHE: Dict[int, bool] = {}
+
+
+def was_verified(user_id: Optional[int]) -> bool:
+    if not user_id:
+        return False
+    if user_id in _VERIFIED_CACHE:
+        return _VERIFIED_CACHE[user_id]
+    value = bool(get_setting(f"verified:{user_id}"))
+    _VERIFIED_CACHE[user_id] = value
+    return value
+
+
+def mark_verified(user_id: Optional[int]) -> None:
+    if not user_id or _VERIFIED_CACHE.get(user_id):
+        return
+    if not was_verified(user_id):
+        try:
+            set_setting(f"verified:{user_id}", str(int(time.time())))
+        except Exception:
+            log_error("mark_verified")
+            return
+    _VERIFIED_CACHE[user_id] = True
+
+
+def send_join_gate(chat_id: int, missing: List[Dict[str, Any]], left: bool = False, total: int = 0) -> None:
+    send_text(chat_id, gate_text(missing, left, total), join_markup(missing, total), "HTML")
 
 
 def gate_blocks(user_id: Optional[int], chat_id: int) -> bool:
-    """True (and the join prompt is sent) when a normal user still has to join channels."""
+    """True (and the join prompt is sent) when a normal user still has to join channels.
+    A user who passed before and is now missing gets the "you left our channel" message."""
     if is_subadmin(user_id):
         return False
-    missing = missing_required(user_id)
+    reqs = required_channels()
+    missing = missing_required(user_id, reqs)
     if missing:
-        send_join_gate(chat_id, missing)
+        send_join_gate(chat_id, missing, left=was_verified(user_id), total=len(reqs))
         return True
+    if reqs:
+        mark_verified(user_id)
     return False
 
 
 # ---------------------------------------------------------------- admin panel
 
 USER_KEYBOARD_ROWS = [
-    [{"text": "🔍 Search PDF", "callback_data": "user_search"}],
-    [{"text": "🗂️ Categories", "callback_data": "user_categories"}, {"text": "📚 PDF List", "callback_data": "user_list"}],
+    [{"text": "🔍 Book Search Karo", "callback_data": "user_search"}],
+    [{"text": "📚 PDF List", "callback_data": "user_list"}],
+    [{"text": "🗂️ Categories", "callback_data": "user_categories"}],
     [{"text": "❓ Help", "callback_data": "user_help"}],
 ]
+
+ADMIN_PANEL_BUTTON = [{"text": "⚙️ Admin Panel", "callback_data": "ad:panel"}]
+
+
+def welcome_text(user: Optional[Dict[str, Any]], admin: bool = False) -> str:
+    if admin:
+        return (f"👋 <b>Namaste Admin, {first_name(user)}!</b>\n\n"
+                "Book / PDF ka naam likho — ya ⚙️ Admin Panel kholo.")
+    return (f"📚 <b>Files Bull me swagat hai, {first_name(user)}!</b>\n\n"
+            "Book / PDF ka naam, subject ya exam likho — main turant dhoondh dunga 🔍")
+
+
+def admin_start_menu() -> Dict[str, Any]:
+    return {"inline_keyboard": [list(r) for r in USER_KEYBOARD_ROWS] + [list(ADMIN_PANEL_BUTTON)]}
 
 BACK_ROW = [{"text": "🔙 Admin Panel", "callback_data": "ad:panel"}]
 
@@ -379,17 +458,22 @@ def user_menu() -> Dict[str, Any]:
 
 
 def admin_menu() -> Dict[str, Any]:
+    # One clear button per row (labels <= 20 chars so they never cut off on a phone).
     return {"inline_keyboard": [
-        [{"text": "➕ Join Channel Jodo", "callback_data": "ad:addreq"}, {"text": "📋 Join Channels", "callback_data": "ad:reqlist"}],
-        [{"text": "➕ Source Channel Jodo", "callback_data": "ad:addsrc"}, {"text": "📋 Source Channels", "callback_data": "ad:srclist"}],
+        [{"text": "➕ Join Channel Jodo", "callback_data": "ad:addreq"}],
+        [{"text": "📋 Join Channels", "callback_data": "ad:reqlist"}],
+        [{"text": "➕ Source Channel Jodo", "callback_data": "ad:addsrc"}],
+        [{"text": "📋 Source Channels", "callback_data": "ad:srclist"}],
         [{"text": "💾 Backup Channel", "callback_data": "ad:backup"}, {"text": "📝 Log Chat", "callback_data": "ad:log"}],
         [{"text": "👮 Admins", "callback_data": "ad:admins"}, {"text": "✏️ File Rename", "callback_data": "ad:rename"}],
-        [{"text": "📊 Report", "callback_data": "ad:report"}, {"text": "🩺 Status / Debug", "callback_data": "ad:status"}],
+        [{"text": "📊 Report", "callback_data": "ad:report"}, {"text": "🩺 Status", "callback_data": "ad:status"}],
         [{"text": "❓ Admin Help", "callback_data": "ad:help"}, {"text": "🔍 Search Menu", "callback_data": "ad:usermenu"}],
     ]}
 
 
-ADMIN_PANEL_TEXT = "⚙️ Admin Panel\nNeeche se kaam chuno. (Search ke liye seedha book ka naam bhi bhej sakte ho.)"
+ADMIN_PANEL_TEXT = ("⚙️ <b>Admin Panel</b>\n\n"
+                    "Niche se kaam chuno 👇\n"
+                    "<i>Search ke liye seedha book ka naam bhej sakte ho.</i>")
 
 # Prompts for buttons that need input. The admin answers with a reply (ForceReply) or just
 # sends the next message within 15 minutes (pending state in bot_settings).
@@ -410,20 +494,23 @@ PROMPTS = {
 }
 
 
-def show(chat_id: int, text: str, markup: Optional[Dict[str, Any]] = None, query: Optional[Dict[str, Any]] = None) -> None:
+def show(chat_id: int, text: str, markup: Optional[Dict[str, Any]] = None, query: Optional[Dict[str, Any]] = None,
+         parse_mode: Optional[str] = None) -> None:
     """Edit the button's own message (clean navigation); fall back to a new message."""
     message_id = ((query or {}).get("message") or {}).get("message_id")
     if message_id:
         payload: Dict[str, Any] = {"chat_id": chat_id, "message_id": message_id, "text": text, "disable_web_page_preview": True}
         if markup:
             payload["reply_markup"] = markup
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
         try:
             telegram("editMessageText", payload)
             return
         except Exception as exc:
             if "not modified" in str(exc).lower():
                 return
-    send_text(chat_id, text, markup)
+    send_text(chat_id, text, markup, parse_mode)
 
 
 def set_pending(user_id: int, action: str, extra: Any = None) -> None:
@@ -713,9 +800,9 @@ def handle_admin_callback(query: Dict[str, Any], data: str, chat_id: int, user_i
     cmd = data[3:]
     if cmd == "panel":
         clear_pending(user_id)
-        show(chat_id, ADMIN_PANEL_TEXT, admin_menu(), query)
+        show(chat_id, ADMIN_PANEL_TEXT, admin_menu(), query, "HTML")
     elif cmd == "usermenu":
-        show(chat_id, "🔍 Book/file ka naam, subject ya exam likhkar bhejo.", {"inline_keyboard": [list(r) for r in USER_KEYBOARD_ROWS] + [[{"text": "⚙️ Admin Panel", "callback_data": "ad:panel"}]]}, query)
+        show(chat_id, welcome_text(query.get("from"), admin=True), admin_start_menu(), query, "HTML")
     elif cmd in {"addreq", "addsrc", "rename"}:
         ask_input(chat_id, user_id, cmd)
     elif cmd == "reqlist":
@@ -780,7 +867,7 @@ def handle_admin_callback(query: Dict[str, Any], data: str, chat_id: int, user_i
     elif cmd == "help":
         show(chat_id, ADMIN_HELP, {"inline_keyboard": [BACK_ROW]}, query)
     else:
-        show(chat_id, ADMIN_PANEL_TEXT, admin_menu(), query)
+        show(chat_id, ADMIN_PANEL_TEXT, admin_menu(), query, "HTML")
 
 
 def ai_rank(query: str, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -964,11 +1051,24 @@ def search_books(query: str) -> List[Dict[str, Any]]:
     return ai_rank(query, [row for _, row in scored[:10]])
 
 
-def send_text(chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None) -> None:
+def send_text(chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None,
+              parse_mode: Optional[str] = None) -> None:
     payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
     if reply_markup:
         payload["reply_markup"] = reply_markup
-    telegram("sendMessage", payload)
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    try:
+        telegram("sendMessage", payload)
+    except Exception as exc:
+        # A formatting slip must never cost the user the message: resend as plain text.
+        if parse_mode and "parse" in str(exc).lower():
+            payload.pop("parse_mode", None)
+            payload["text"] = re.sub(r"</?(b|i|u|code)>", "", text)
+            payload["text"] = html.unescape(payload["text"])
+            telegram("sendMessage", payload)
+        else:
+            raise
 
 
 USER_MENU = [
@@ -1160,22 +1260,20 @@ def handle_private_message(message: Dict[str, Any]) -> None:
     if command == "/start":
         if is_subadmin(user_id):
             clear_pending(user_id)
-            kb = [list(r) for r in USER_KEYBOARD_ROWS] + [[{"text": "⚙️ Admin Panel", "callback_data": "ad:panel"}]]
-            send_text(chat_id, "Namaste Admin! 👋\nBook/file ka naam likhkar search karo, ya ⚙️ Admin Panel kholo.", {"inline_keyboard": kb})
+            send_text(chat_id, welcome_text(user, admin=True), admin_start_menu(), "HTML")
             return
-        send_text(chat_id, "Namaste! 🙏\nBook/file ka naam, subject ya exam likhkar search karein.", user_menu())
+        send_text(chat_id, welcome_text(user), user_menu(), "HTML")
         return
     if command == "/help":
-        extra = "\nAdmin: /admin se Admin Panel khulega." if is_subadmin(user_id) else ""
-        send_text(chat_id, "Book, subject ya exam ka naam likhkar bhejo — bot matching files dikhayega.\n"
-                           "/search <naam> - search\n/myid - aapka Telegram ID" + extra)
+        extra = "\n\n⚙️ Admin: /admin se Admin Panel khulega." if is_subadmin(user_id) else ""
+        send_text(chat_id, USER_HELP + extra, None, "HTML")
         return
     if command_name(text) == "/search":
         query = text.split(None, 1)[1].strip() if len(text.split(None, 1)) > 1 else ""
     else:
         query = text
     if not query:
-        send_text(chat_id, "Search ke liye book ka naam ya keywords bhejiye.")
+        send_text(chat_id, SEARCH_PROMPT, None, "HTML")
         return
 
     try:
@@ -1185,16 +1283,28 @@ def handle_private_message(message: Dict[str, Any]) -> None:
         send_text(chat_id, "Database abhi available nahi hai. Admin se setup check karne ko kahen.")
         return
     if not results:
-        send_text(chat_id, "Is search ke liye koi matching file nahi mili.")
+        send_text(chat_id, f"😕 <b>\"{esc(query[:60])}\" ke liye koi file nahi mili</b>\n\n"
+                           "Dusra naam, chhota keyword ya sahi spelling try karo.\n"
+                           "Jaise: <i>lucent</i>, <i>ssc gd gk</i>, <i>polity</i>", None, "HTML")
         return
     buttons = []
     for index, row in enumerate(results):
-        label = f"{index + 1}. {row.get('title', 'Untitled')[:45]}"
+        label = f"📄 {str(row.get('title') or 'Untitled')[:45]}"
         buttons.append([{ "text": label, "callback_data": f"book:{row['id']}" }])
-    send_text(chat_id, f"{len(results)} result mile. File select karein:", {"inline_keyboard": buttons})
+    send_text(chat_id, f"🔎 <b>{len(results)} file mili</b> — jo chahiye us par tap karo 👇", {"inline_keyboard": buttons}, "HTML")
 
 
 USER_COMMANDS = {"/start", "/help", "/search", "/myid"}
+
+SEARCH_PROMPT = ("🔍 <b>Kya dhoondhna hai?</b>\n\n"
+                 "Book / PDF ka naam, subject ya exam likhkar bhejo.\n"
+                 "Jaise: <i>lucent gk</i>, <i>ssc gd</i>, <i>polity notes</i>")
+USER_HELP = ("❓ <b>Bot kaise use kare</b>\n\n"
+             "1️⃣ Book / PDF ka naam, subject ya exam likho\n"
+             "2️⃣ List me se file par tap karo\n"
+             "3️⃣ File seedha chat me aa jayegi 📥\n\n"
+             "/search &lt;naam&gt; — search\n"
+             "/myid — aapka Telegram ID")
 
 
 def command_name(text: str) -> str:
@@ -1221,7 +1331,7 @@ def handle_admin_command(message: Dict[str, Any]) -> None:
         send_text(chat_id, f"❌ Nahi hua: {str(exc)[:300]}")
 
     if command in {"/admin", "/panel", "/menu"}:
-        send_text(chat_id, ADMIN_PANEL_TEXT, admin_menu())
+        send_text(chat_id, ADMIN_PANEL_TEXT, admin_menu(), "HTML")
     elif command == "/cancel":
         send_text(chat_id, "✅ Cancel ho gaya.", admin_menu())
     elif command in {"/status", "/debug"}:
@@ -1348,20 +1458,31 @@ def handle_callback(query: Dict[str, Any]) -> None:
             # An expired callback must not stop the button from working.
             log_error("answerCallbackQuery")
     if data == "verify_join":
-        missing = [] if is_subadmin(user_id) else missing_required(user_id)
+        admin = is_subadmin(user_id)
+        reqs = [] if admin else required_channels()
+        missing = missing_required(user_id, reqs) if reqs else []
         if not missing:
             try:
-                telegram("answerCallbackQuery", {"callback_query_id": query.get("id"), "text": "✅ Verified"})
+                telegram("answerCallbackQuery", {"callback_query_id": query.get("id"), "text": "✅ Verified!"})
             except Exception:
                 pass
-            show(chat_id, "✅ Verified! Shukriya.\nAb book/file ka naam, subject ya exam likhkar bhejo.", user_menu(), query)
+            if reqs:
+                mark_verified(user_id)
+            # The gate message turns into a thank-you (buttons gone), then the welcome + menu.
+            show(chat_id, "✅ <b>Shukriya!</b> Ab aap bot use kar sakte ho 🎉", None, query, "HTML")
+            if chat_id:
+                send_text(chat_id, welcome_text(query.get("from"), admin=admin),
+                          admin_start_menu() if admin else user_menu(), "HTML")
         else:
             names = ", ".join(str(c.get("title") or "Channel") for c in missing)
+            alert = "❌ Abhi join nahi kiya! Pehle channel join karo, phir Verify dabao."
+            alert += f"\n\nBaaki: {names}"
             try:
-                telegram("answerCallbackQuery", {"callback_query_id": query.get("id"), "text": f"Abhi join nahi kiya: {names}", "show_alert": True})
+                telegram("answerCallbackQuery", {"callback_query_id": query.get("id"), "text": alert[:200], "show_alert": True})
             except Exception:
                 pass
-            send_join_gate(chat_id, missing)
+            # Refresh the same gate message in place (no new message spam on every tap).
+            show(chat_id, gate_text(missing, was_verified(user_id), len(reqs)), join_markup(missing, len(reqs)), query, "HTML")
         return
     if (data.startswith("ad:") or data.startswith("admin_")) and chat_id:
         if not is_subadmin(user_id):
@@ -1375,19 +1496,21 @@ def handle_callback(query: Dict[str, Any]) -> None:
     if chat_id and gate_blocks(user_id, chat_id):
         return
     if data == "user_help":
-        send_text(chat_id, "Book, subject, exam ya keyword bhejiye. Bot available indexed files me se result dega.")
+        send_text(chat_id, USER_HELP, None, "HTML")
         return
     if data == "user_categories":
         rows = supabase("books", "GET", query="?select=title,language&status=eq.indexed&limit=500")
         langs = sorted({r.get("language") for r in rows if r.get("language")})
-        send_text(chat_id, "Available language/categories metadata:\n" + ("\n".join(f"- {x}" for x in langs) if langs else "Abhi categories indexed nahi hain."))
+        send_text(chat_id, "🗂️ <b>Categories</b>\n\n" + ("\n".join(f"▸ {esc(x)}" for x in langs) if langs else "Abhi koi category nahi hai.") +
+                  "\n\n<i>Book ka naam likhkar search karo 🔍</i>", None, "HTML")
         return
     if data == "user_list":
         rows = supabase("books", "GET", query="?select=id,title,source_chat_title&status=eq.indexed&order=title&limit=30")
-        send_text(chat_id, "Available PDFs:\n" + ("\n".join(f"- {r.get('title')} ({r.get('source_chat_title', 'source')})" for r in rows) if rows else "Abhi koi file indexed nahi hai."))
+        send_text(chat_id, "📚 <b>PDF List</b>\n\n" + ("\n".join(f"📄 {esc(r.get('title'))}" for r in rows) if rows else "Abhi koi file nahi hai.") +
+                  "\n\n<i>Jo chahiye uska naam likhkar bhejo 🔍</i>", None, "HTML")
         return
     if data == "user_search":
-        send_text(chat_id, "Search ke liye book, subject ya exam ka naam bhejiye.")
+        send_text(chat_id, SEARCH_PROMPT, None, "HTML")
         return
     if not data.startswith("book:"):
         return
