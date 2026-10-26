@@ -21,8 +21,10 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5-mini")
+# Owner IDs from Vercel env. Accept any separator/format people paste:
+# "123,456", "123 456", '"123"', "[123]", "@123", "-123", newlines...
 ADMIN_USER_IDS = {
-    int(x.strip()) for x in os.environ.get("ADMIN_USER_IDS", "").split(",") if x.strip().isdigit()
+    int(x) for x in re.findall(r"\d+", os.environ.get("ADMIN_USER_IDS", ""))
 }
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
@@ -94,21 +96,32 @@ def is_owner(user_id: Optional[int]) -> bool:
     return is_admin(user_id)
 
 
+_SUBADMIN_CACHE: Dict[int, Any] = {}
+
+
 def is_subadmin(user_id: Optional[int]) -> bool:
     if is_admin(user_id):
         return True
     if not user_id:
         return False
+    hit = _SUBADMIN_CACHE.get(user_id)
+    if hit and time.time() - hit[0] < 20:
+        return hit[1]
     try:
-        return bool(supabase("admins", "GET", query=f"?user_id=eq.{user_id}&select=user_id&limit=1"))
+        value = bool(supabase("admins", "GET", query=f"?user_id=eq.{user_id}&select=user_id&limit=1"))
     except Exception:
+        log_error("is_subadmin")
         return False
+    _SUBADMIN_CACHE[user_id] = (time.time(), value)
+    return value
 
 
 def required_channels() -> List[Dict[str, Any]]:
     try:
         return supabase("required_channels", "GET", query="?active=eq.true&select=*&order=title")
     except Exception:
+        # Logged, not silent: a broken read here would quietly switch the join gate off.
+        log_error("required_channels")
         return []
 
 
@@ -143,55 +156,626 @@ def backup_message(source_chat_id: int, source_message_id: int) -> Optional[Dict
         return None
 
 
+_BOT_INFO: Dict[str, Any] = {}
+
+
+def bot_info() -> Dict[str, Any]:
+    if not _BOT_INFO:
+        _BOT_INFO.update(telegram("getMe", {}).get("result", {}) or {})
+    return _BOT_INFO
+
+
+def bot_mention() -> str:
+    try:
+        name = bot_info().get("username")
+        return f"@{name}" if name else "bot"
+    except Exception:
+        return "bot"
+
+
+def role_of(user_id: Optional[int]) -> str:
+    if is_admin(user_id):
+        return "owner"
+    if is_subadmin(user_id):
+        return "admin"
+    return "user"
+
+
+class InputError(ValueError):
+    """A problem the admin can fix; the message is shown to them as-is (Hinglish)."""
+
+
+PRIVATE_LINK_MSG = ("Ye private invite link (t.me/+...) hai, isse bot channel pehchan nahi sakta.\n"
+                    "Iske bajaye:\n1. Bot ko us channel me admin banao\n2. Phir channel ki koi bhi post yahan forward karo "
+                    "(ya channel ka -100... ID bhejo).")
+
+
+def parse_chat_ref(text: str) -> Any:
+    """@username, username, t.me/username, https://t.me/username/123, t.me/c/123/4, -100123, 123 -> getChat id."""
+    t = (text or "").strip().strip("\"'<>`").strip()
+    if not t:
+        raise InputError("Channel ka @username, t.me link ya -100... ID bhejo.")
+    m = re.match(r"^(?:https?://)?(?:www\.)?(?:t|telegram)\.(?:me|dog)/(.+)$", t, re.I)
+    if m:
+        parts = [p for p in m.group(1).split("?")[0].split("/") if p]
+        if not parts or parts[0].startswith("+") or parts[0].lower() == "joinchat":
+            raise InputError(PRIVATE_LINK_MSG)
+        if parts[0].lower() == "c" and len(parts) > 1 and parts[1].isdigit():
+            return int("-100" + parts[1])
+        if parts[0].lower() == "s" and len(parts) > 1:
+            parts = parts[1:]
+        t = parts[0]
+    if re.fullmatch(r"-?\d+", t):
+        # A channel ID copied without its -100 prefix still works.
+        return int(t) if t.startswith("-") else int("-100" + t)
+    t = t.lstrip("@")
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,}", t):
+        return "@" + t
+    raise InputError("Ye channel pehchana nahi gaya. Channel ka @username, t.me/... link ya -100... ID bhejo, "
+                     "ya us channel ki koi post yahan forward karo.")
+
+
+def friendly_tg_error(exc: Exception) -> str:
+    msg = str(exc)
+    low = msg.lower()
+    if "chat not found" in low or "username" in low and "invalid" in low:
+        return ("Channel nahi mila. Username/ID check karo. Private channel hai to pehle bot ko admin banao, "
+                "phir channel ki koi post yahan forward karo.")
+    if "member list is inaccessible" in low or "not enough rights" in low or "need administrator" in low:
+        return f"Bot is channel me admin nahi hai. Pehle {bot_mention()} ko channel ka admin banao."
+    if "bot was kicked" in low or "bot is not a member" in low:
+        return f"Bot is channel me nahi hai. {bot_mention()} ko channel me add karke admin banao."
+    return "Telegram error: " + msg[:200]
+
+
+def resolve_chat(message: Optional[Dict[str, Any]], text: str) -> Dict[str, Any]:
+    """Find the chat an admin means: a forwarded channel post, or typed @username / link / ID."""
+    source = forwarded_source(message or {}) if message else None
+    ref: Any = source.get("id") if source and source.get("id") else parse_chat_ref(text)
+    try:
+        chat = telegram("getChat", {"chat_id": ref}).get("result", {}) or {}
+    except Exception as exc:
+        if source and source.get("id"):
+            chat = dict(source)
+        else:
+            raise InputError(friendly_tg_error(exc)) from None
+    if not chat.get("id"):
+        raise InputError("Channel nahi mila.")
+    return chat
+
+
+def bot_member(chat_id: Any) -> Dict[str, Any]:
+    return telegram("getChatMember", {"chat_id": chat_id, "user_id": bot_info().get("id")}).get("result", {}) or {}
+
+
+def ensure_bot_admin(chat: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        member = bot_member(chat["id"])
+    except Exception as exc:
+        raise InputError(friendly_tg_error(exc)) from None
+    if member.get("status") not in {"administrator", "creator"}:
+        raise InputError(f"Bot \"{chat.get('title', 'channel')}\" me admin nahi hai.\n"
+                         f"Channel → Administrators → Add Admin → {bot_mention()} → Save, phir dobara bhejo.")
+    return member
+
+
+def make_join_link(chat: Dict[str, Any]) -> Optional[str]:
+    """Public channel: t.me/username. Private: the bot's invite link (bot must be admin with invite rights)."""
+    if chat.get("username"):
+        return f"https://t.me/{chat['username']}"
+    if chat.get("invite_link"):
+        return chat["invite_link"]
+    try:
+        return telegram("createChatInviteLink", {"chat_id": chat["id"], "name": "filesbull join"}).get("result", {}).get("invite_link")
+    except Exception:
+        log_error("createChatInviteLink")
+    try:
+        return telegram("exportChatInviteLink", {"chat_id": chat["id"]}).get("result")
+    except Exception:
+        log_error("exportChatInviteLink")
+    return None
+
+
+def save_required_channel(chat: Dict[str, Any]) -> Dict[str, Any]:
+    ensure_bot_admin(chat)
+    link = make_join_link(chat)
+    if not link:
+        raise InputError("Is private channel ka join link nahi ban paya. Bot ko admin rights me "
+                         "\"Invite users via link\" permission do, phir dobara bhejo.")
+    row = {"chat_id": chat["id"], "title": chat.get("title") or str(chat["id"]), "username": chat.get("username"),
+           "invite_link": link, "active": True}
+    supabase("required_channels", "POST", row, "?on_conflict=chat_id")
+    return row
+
+
+def add_required_channel(target: str, message: Optional[Dict[str, Any]] = None) -> str:
+    return save_required_channel(resolve_chat(message, target))["title"]
+
+
+def add_source_channel(target: str, message: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    chat = resolve_chat(message, target)
+    ensure_bot_admin(chat)  # Telegram only sends channel posts to a bot that is admin there.
+    register_channel(chat)
+    return chat
+
+
+def missing_required(user_id: Optional[int]) -> List[Dict[str, Any]]:
+    """Required channels this user has NOT joined. A channel the bot cannot check
+    (bot not admin / removed) is skipped and logged instead of locking everyone out."""
+    missing = []
+    if not user_id:
+        return missing
+    for channel in required_channels():
+        try:
+            member = telegram("getChatMember", {"chat_id": channel["chat_id"], "user_id": user_id}).get("result", {}) or {}
+        except Exception:
+            log_error(f"gate check {channel.get('chat_id')}")
+            continue
+        status = member.get("status")
+        if status in {"left", "kicked"} or (status == "restricted" and not member.get("is_member", True)):
+            missing.append(channel)
+    return missing
+
+
 def user_has_required_access(user_id: Optional[int]) -> bool:
     if is_subadmin(user_id):
         return True
-    channels = required_channels()
-    if not channels or not user_id:
-        return True
-    for channel in channels:
-        try:
-            member = telegram("getChatMember", {"chat_id": channel["chat_id"], "user_id": user_id}).get("result", {})
-            if member.get("status") in {"left", "kicked"}:
-                return False
-        except Exception:
-            return False
-    return True
+    return not missing_required(user_id)
 
 
-def join_markup() -> Dict[str, Any]:
-    rows = []
-    for channel in required_channels():
-        url = channel.get("invite_link") or (f"https://t.me/{channel['username']}" if channel.get("username") else None)
+def join_url(channel: Dict[str, Any]) -> Optional[str]:
+    url = channel.get("invite_link") or (f"https://t.me/{channel['username']}" if channel.get("username") else None)
+    if url:
+        return url
+    try:
+        url = make_join_link({"id": channel["chat_id"]})
         if url:
-            rows.append([{"text": f"Join: {channel.get('title', 'Channel')[:30]}", "url": url}])
-    rows.append([{"text": "I Joined - Verify", "callback_data": "verify_join"}])
+            supabase("required_channels", "PATCH", {"invite_link": url}, f"?chat_id=eq.{channel['chat_id']}")
+    except Exception:
+        log_error("join link")
+    return url
+
+
+def join_markup(channels: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    rows = []
+    for channel in (required_channels() if channels is None else channels):
+        url = join_url(channel)
+        if url:
+            rows.append([{"text": f"📢 Join: {str(channel.get('title') or 'Channel')[:30]}", "url": url}])
+    rows.append([{"text": "✅ Join kar liya - Verify", "callback_data": "verify_join"}])
     return {"inline_keyboard": rows}
+
+
+def send_join_gate(chat_id: int, missing: List[Dict[str, Any]]) -> None:
+    names = "\n".join(f"• {c.get('title') or 'Channel'}" for c in missing)
+    send_text(chat_id, "🔒 Bot use karne ke liye pehle ye channel join karein:\n" + names +
+              "\n\nJoin karne ke baad ✅ Verify dabayein.", join_markup(missing))
+
+
+def gate_blocks(user_id: Optional[int], chat_id: int) -> bool:
+    """True (and the join prompt is sent) when a normal user still has to join channels."""
+    if is_subadmin(user_id):
+        return False
+    missing = missing_required(user_id)
+    if missing:
+        send_join_gate(chat_id, missing)
+        return True
+    return False
+
+
+# ---------------------------------------------------------------- admin panel
+
+USER_KEYBOARD_ROWS = [
+    [{"text": "🔍 Search PDF", "callback_data": "user_search"}],
+    [{"text": "🗂️ Categories", "callback_data": "user_categories"}, {"text": "📚 PDF List", "callback_data": "user_list"}],
+    [{"text": "❓ Help", "callback_data": "user_help"}],
+]
+
+BACK_ROW = [{"text": "🔙 Admin Panel", "callback_data": "ad:panel"}]
+
+
+def user_menu() -> Dict[str, Any]:
+    return {"inline_keyboard": [list(r) for r in USER_KEYBOARD_ROWS]}
 
 
 def admin_menu() -> Dict[str, Any]:
     return {"inline_keyboard": [
-        [{"text": "Add Required Channel", "callback_data": "admin_add_required"}],
-        [{"text": "Required Channels", "callback_data": "admin_required_list"}],
-        [{"text": "Add Source Channel", "callback_data": "admin_add_source"}],
-        [{"text": "Report", "callback_data": "admin_report"}],
+        [{"text": "➕ Join Channel Jodo", "callback_data": "ad:addreq"}, {"text": "📋 Join Channels", "callback_data": "ad:reqlist"}],
+        [{"text": "➕ Source Channel Jodo", "callback_data": "ad:addsrc"}, {"text": "📋 Source Channels", "callback_data": "ad:srclist"}],
+        [{"text": "💾 Backup Channel", "callback_data": "ad:backup"}, {"text": "📝 Log Chat", "callback_data": "ad:log"}],
+        [{"text": "👮 Admins", "callback_data": "ad:admins"}, {"text": "✏️ File Rename", "callback_data": "ad:rename"}],
+        [{"text": "📊 Report", "callback_data": "ad:report"}, {"text": "🩺 Status / Debug", "callback_data": "ad:status"}],
+        [{"text": "❓ Admin Help", "callback_data": "ad:help"}, {"text": "🔍 Search Menu", "callback_data": "ad:usermenu"}],
     ]}
 
 
-def add_required_channel(target: str) -> str:
-    target = (target or "").strip()
-    if target.startswith("https://t.me/"):
-        target = "@" + target.rstrip("/").split("/")[-1].split("?")[0]
-    if not target:
-        raise ValueError("channel username ya link missing hai")
-    channel = telegram("getChat", {"chat_id": target}).get("result", {})
-    bot_id = telegram("getMe", {}).get("result", {}).get("id")
-    membership = telegram("getChatMember", {"chat_id": channel["id"], "user_id": bot_id}).get("result", {})
-    if membership.get("status") not in {"administrator", "creator"}:
-        raise ValueError("pehle bot ko us channel me administrator banayein")
-    link = f"https://t.me/{channel['username']}" if channel.get("username") else None
-    supabase("required_channels", "POST", {"chat_id": channel["id"], "title": channel.get("title", target), "username": channel.get("username"), "invite_link": link, "active": True}, "?on_conflict=chat_id")
-    return channel.get("title", target)
+ADMIN_PANEL_TEXT = "⚙️ Admin Panel\nNeeche se kaam chuno. (Search ke liye seedha book ka naam bhi bhej sakte ho.)"
+
+# Prompts for buttons that need input. The admin answers with a reply (ForceReply) or just
+# sends the next message within 15 minutes (pending state in bot_settings).
+PROMPTS = {
+    "addreq": ("➕ Join channel: channel ka @username, t.me/... link ya -100... ID bhejo, ya us channel ki koi post forward karo.\n"
+               "(Pehle bot ko us channel me admin banao. /cancel = band)", "@channelusername"),
+    "addsrc": ("➕ Source channel: channel ka @username, t.me/... link ya -100... ID bhejo, ya us channel ki koi post forward karo.\n"
+               "(Bot us channel me admin hona chahiye. /cancel = band)", "@channelusername"),
+    "setbackup": ("💾 Backup channel: private channel ka -100... ID / @username bhejo, ya uski koi post forward karo.\n"
+                  "(Bot wahan admin hona chahiye. /cancel = band)", "-1001234567890"),
+    "setlog": ("📝 Log chat: group/channel ka -100... ID / @username bhejo, ya uski post forward karo. \"me\" bhejo to logs isi chat me aayenge.\n"
+               "(/cancel = band)", "-1001234567890 ya me"),
+    "addadmin": ("👮 Naye admin ka Telegram numeric ID bhejo (wo bot me /myid bhejkar dekh sakta hai), ya uska koi message forward karo.\n"
+                 "(/cancel = band)", "123456789"),
+    "rename": ("✏️ Kis file ka naam badalna hai? File ka naam/keyword bhejo (ya ID aur naya naam: 12 Lucent GK Hindi).\n"
+               "(/cancel = band)", "lucent"),
+    "rename_to": ("✏️ Is file ka naya naam bhejo. (/cancel = band)", "Naya naam"),
+}
+
+
+def show(chat_id: int, text: str, markup: Optional[Dict[str, Any]] = None, query: Optional[Dict[str, Any]] = None) -> None:
+    """Edit the button's own message (clean navigation); fall back to a new message."""
+    message_id = ((query or {}).get("message") or {}).get("message_id")
+    if message_id:
+        payload: Dict[str, Any] = {"chat_id": chat_id, "message_id": message_id, "text": text, "disable_web_page_preview": True}
+        if markup:
+            payload["reply_markup"] = markup
+        try:
+            telegram("editMessageText", payload)
+            return
+        except Exception as exc:
+            if "not modified" in str(exc).lower():
+                return
+    send_text(chat_id, text, markup)
+
+
+def set_pending(user_id: int, action: str, extra: Any = None) -> None:
+    try:
+        set_setting(f"pending:{user_id}", json.dumps({"a": action, "x": extra, "ts": int(time.time())}))
+    except Exception:
+        log_error("set_pending")
+
+
+def get_pending(user_id: int) -> Optional[Dict[str, Any]]:
+    raw = get_setting(f"pending:{user_id}")
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        return data if time.time() - int(data.get("ts", 0)) < 900 else None
+    except Exception:
+        return None
+
+
+def clear_pending(user_id: int) -> None:
+    try:
+        supabase("bot_settings", "DELETE", query=f"?key=eq.{urllib.parse.quote(f'pending:{user_id}')}")
+    except Exception:
+        log_error("clear_pending")
+
+
+def ask_input(chat_id: int, user_id: int, action: str, extra: Any = None, prefix: str = "") -> None:
+    text, placeholder = PROMPTS[action]
+    set_pending(user_id, action, extra)
+    send_text(chat_id, prefix + text, {"force_reply": True, "input_field_placeholder": placeholder})
+
+
+def prompt_action(message: Dict[str, Any]) -> Optional[str]:
+    replied = ((message.get("reply_to_message") or {}).get("text") or "")
+    for action, (text, _) in PROMPTS.items():
+        if replied and replied.startswith(text[:30]):
+            return action
+    if replied.startswith("Channel ka @username"):  # prompt sent by the old version
+        return "addreq"
+    return None
+
+
+def count_rows(table: str, query: str = "", col: str = "id") -> int:
+    """Exact row count (Supabase returns at most 1000 rows per read, so don't count a list)."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise RuntimeError("Supabase environment variables are not configured")
+    req = urllib.request.Request(f"{SUPABASE_URL}/rest/v1/{table}?select={col}{query}&limit=1", method="GET", headers={
+        "apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Prefer": "count=exact"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as response:
+            total = (response.headers.get("Content-Range") or "").split("/")[-1]
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"HTTP {exc.code} counting {table}") from None
+    return int(total) if total.isdigit() else 0
+
+
+def chat_check(chat_id: Any) -> str:
+    try:
+        st = bot_member(chat_id).get("status")
+        return "✅ bot admin" if st in {"administrator", "creator"} else f"❌ bot admin nahi ({st})"
+    except Exception as exc:
+        return "❌ " + friendly_tg_error(exc)[:60]
+
+
+def source_channels() -> List[Dict[str, Any]]:
+    return supabase("channels", "GET", query="?select=*&active=eq.true&order=title")
+
+
+def required_list_view() -> Any:
+    rows = required_channels()
+    lines = ["📋 Join Channels (naye users ko ye join karne padenge):"]
+    kb = []
+    for i, r in enumerate(rows, 1):
+        lines.append(f"{i}. {r.get('title')} — {chat_check(r['chat_id'])}" + ("" if (r.get("invite_link") or r.get("username")) else " — ⚠️ join link nahi"))
+        kb.append([{"text": f"❌ Hatao: {str(r.get('title'))[:28]}", "callback_data": f"ad:rmreq:{r['chat_id']}"}])
+    if not rows:
+        lines.append("Koi join channel nahi hai, isliye abhi gate band hai (sab users bina join kiye use kar sakte hain).")
+    kb.append([{"text": "➕ Join Channel Jodo", "callback_data": "ad:addreq"}])
+    kb.append(BACK_ROW)
+    return "\n".join(lines), {"inline_keyboard": kb}
+
+
+def source_list_view() -> Any:
+    rows = source_channels()
+    lines = ["📋 Source Channels (inki nayi files index hoti hain):"]
+    kb = []
+    for i, r in enumerate(rows, 1):
+        lines.append(f"{i}. {r.get('title')} ({'@' + r['username'] if r.get('username') else r.get('chat_id')}) — {chat_check(r['chat_id'])}")
+        kb.append([{"text": f"❌ Hatao: {str(r.get('title'))[:28]}", "callback_data": f"ad:rmsrc:{r['chat_id']}"}])
+    if not rows:
+        lines.append("Koi source channel nahi hai.")
+    kb.append([{"text": "➕ Source Channel Jodo", "callback_data": "ad:addsrc"}])
+    kb.append(BACK_ROW)
+    return "\n".join(lines), {"inline_keyboard": kb}
+
+
+def chat_title(chat_id: Any) -> str:
+    try:
+        chat = telegram("getChat", {"chat_id": int(chat_id)}).get("result", {}) or {}
+        return chat.get("title") or chat.get("first_name") or str(chat_id)
+    except Exception:
+        return f"{chat_id} (bot ko access nahi)"
+
+
+def setting_view(key: str, label: str, set_cb: str, off_cb: str, about: str) -> Any:
+    current = get_setting(key)
+    text = f"{label}\n{about}\n\nAbhi: " + (f"✅ {chat_title(current)}" if current else "❌ OFF")
+    kb = [[{"text": "✏️ Set / Badlo", "callback_data": set_cb}]]
+    if current:
+        kb.append([{"text": "🚫 Band karo", "callback_data": off_cb}])
+    kb.append(BACK_ROW)
+    return text, {"inline_keyboard": kb}
+
+
+def admins_view(user_id: int) -> Any:
+    try:
+        subs = supabase("admins", "GET", query="?select=user_id,role&limit=100")
+    except Exception:
+        subs = []
+    lines = ["👮 Admins", f"Owner (Vercel ADMIN_USER_IDS): {', '.join(str(x) for x in sorted(ADMIN_USER_IDS)) or 'koi nahi'}"]
+    lines.append("Sub-admins: " + (", ".join(str(r.get("user_id")) for r in subs) if subs else "koi nahi"))
+    kb = []
+    if is_owner(user_id):
+        kb.append([{"text": "➕ Admin Jodo", "callback_data": "ad:addadm"}])
+        for r in subs:
+            kb.append([{"text": f"❌ Hatao: {r.get('user_id')}", "callback_data": f"ad:rmadm:{r.get('user_id')}"}])
+    else:
+        lines.append("(Admin jodna/hatana sirf owner kar sakta hai.)")
+    kb.append(BACK_ROW)
+    return "\n".join(lines), {"inline_keyboard": kb}
+
+
+def report_text() -> str:
+    try:
+        files = count_rows("books")
+        logs = count_rows("delivery_logs")
+        today = time.strftime("%Y-%m-%d", time.gmtime())
+        today_logs = count_rows("delivery_logs", f"&created_at=gte.{today}")
+        req = len(required_channels())
+        src = len(source_channels())
+        return (f"📊 Report\nIndexed files: {files}\nFiles bheji gayi (total): {logs}\nAaj bheji gayi: {today_logs}\n"
+                f"Join channels: {req}\nSource channels: {src}\nAI ranking: {'ON' if OPENAI_API_KEY else 'OFF'}\n"
+                f"Backup: {'ON' if get_setting('backup_chat_id') else 'OFF'}\nLog chat: {'ON' if get_setting('log_chat_id') else 'OFF'}")
+    except Exception as exc:
+        return f"Report nahi ban payi: {str(exc)[:200]}"
+
+
+def status_text(user_id: Optional[int]) -> str:
+    role = role_of(user_id)
+    role_word = {"owner": "✅ Owner (ADMIN_USER_IDS me hai)", "admin": "✅ Sub-admin (admins table)", "user": "❌ Normal user (admin nahi)"}[role]
+    lines = [f"🩺 Status", f"Aapka Telegram ID: {user_id}", f"Role: {role_word}", f"Owner IDs set: {len(ADMIN_USER_IDS)}"]
+    try:
+        lines.append(f"Bot: {bot_mention()}")
+    except Exception:
+        pass
+    reqs = required_channels()
+    lines.append(f"\nJoin gate: {'ON' if reqs else 'OFF (koi join channel nahi)'}")
+    for r in reqs:
+        lines.append(f"• {r.get('title')}: {chat_check(r['chat_id'])}, link {'✅' if (r.get('invite_link') or r.get('username')) else '❌'}")
+    try:
+        lines.append(f"\nSource channels: {len(source_channels())}")
+    except Exception as exc:
+        lines.append(f"\nSource channels: error {str(exc)[:80]}")
+    lines.append(f"Backup: {'ON' if get_setting('backup_chat_id') else 'OFF'} | Log chat: {'ON' if get_setting('log_chat_id') else 'OFF'}")
+    lines.append("\nNote: admins par join gate lagu nahi hota. Gate test karne ke liye dusre (normal) account se /start karo.")
+    return "\n".join(lines)
+
+
+ADMIN_HELP = (
+    "❓ Admin Help\n"
+    "➕ Join Channel Jodo — naye users ko ye channel join karna padega (bot wahan admin ho)\n"
+    "📋 Join Channels — list, ❌ se hatao\n"
+    "➕ Source Channel Jodo — is channel ki nayi files apne-aap index hongi\n"
+    "📋 Source Channels — list, ❌ se hatao\n"
+    "💾 Backup Channel — har nayi file ki copy yahan, source fail ho to yahan se bhejega\n"
+    "📝 Log Chat — file index/delivery ke logs\n"
+    "👮 Admins — sub-admin jodo/hatao (sirf owner)\n"
+    "✏️ File Rename — file ka search naam badlo\n"
+    "📊 Report — files aur delivery count\n"
+    "🩺 Status — aapka ID, role, channels me bot admin hai ya nahi\n\n"
+    "Commands bhi chalti hain: /admin, /requirechannel @ch, /removerequired @ch, /addchannel @ch, /removechannel @ch, "
+    "/channels, /requiredchannels, /setbackupchannel, /setlogchat, /addadmin ID, /removeadmin ID, /rename ID naam, "
+    "/report, /stats, /status, /myid, /cancel\n"
+    "Kisi channel ki post bot ko forward karoge to wo source channel ban jayega."
+)
+
+
+def do_rename(chat_id: int, book_id: Any, new_title: str) -> None:
+    new_title = new_title.strip()[:500]
+    if not new_title:
+        raise InputError("Naya naam khali hai.")
+    rows = supabase("books", "GET", query=f"?id=eq.{int(book_id)}&select=id,title&limit=1")
+    if not rows:
+        raise InputError(f"File ID {book_id} nahi mili.")
+    supabase("books", "PATCH", {"title": new_title, "keywords": new_title[:4000]}, f"?id=eq.{int(book_id)}")
+    send_text(chat_id, f"✅ Naam badal diya:\n{rows[0].get('title')}\n→ {new_title}", {"inline_keyboard": [BACK_ROW]})
+
+
+def handle_admin_input(message: Dict[str, Any], action: str, extra: Any) -> None:
+    """The admin answered a prompt (ForceReply / pending)."""
+    chat_id = message["chat"]["id"]
+    user_id = message["from"]["id"]
+    text = (message.get("text") or message.get("caption") or "").strip()
+    retry = {"inline_keyboard": [[{"text": "🔁 Dobara try", "callback_data": f"ad:{action if action != 'rename_to' else 'rename'}"}], BACK_ROW]}
+    try:
+        if action == "addreq":
+            title = add_required_channel(text, message)
+            clear_pending(user_id)
+            send_text(chat_id, f"✅ Join channel jud gaya: {title}\nAb naye users ko /start par ye channel join karna padega.\n"
+                               "(Aap admin ho, aap par gate nahi lagega — dusre account se test karo.)",
+                      {"inline_keyboard": [[{"text": "📋 Join Channels", "callback_data": "ad:reqlist"}], BACK_ROW]})
+        elif action == "addsrc":
+            chat = add_source_channel(text, message)
+            clear_pending(user_id)
+            send_text(chat_id, f"✅ Source channel jud gaya: {chat.get('title')}\nAb is channel me aane wali nayi files index hongi.\n"
+                               "Purani files ke liye unhe bot ko forward karo.",
+                      {"inline_keyboard": [[{"text": "📋 Source Channels", "callback_data": "ad:srclist"}], BACK_ROW]})
+        elif action == "setbackup":
+            chat = resolve_chat(message, text)
+            ensure_bot_admin(chat)
+            set_setting("backup_chat_id", str(chat["id"]))
+            clear_pending(user_id)
+            send_text(chat_id, f"✅ Backup channel set: {chat.get('title')}\nNayi indexed files ki copy yahan jayegi.", {"inline_keyboard": [BACK_ROW]})
+        elif action == "setlog":
+            if text.lower() in {"me", "yahan", "yaha", "here"}:
+                chat = {"id": chat_id, "title": "Ye chat"}
+            else:
+                chat = resolve_chat(message, text)
+            try:
+                telegram("sendMessage", {"chat_id": chat["id"], "text": "✅ filesbull log chat set ho gaya. Yahan logs aayenge."})
+            except Exception as exc:
+                raise InputError("Bot is chat me message nahi bhej pa raha. Bot ko wahan add/admin karo.\n" + friendly_tg_error(exc)) from None
+            set_setting("log_chat_id", str(chat["id"]))
+            clear_pending(user_id)
+            send_text(chat_id, f"✅ Log chat set: {chat.get('title')}", {"inline_keyboard": [BACK_ROW]})
+        elif action == "addadmin":
+            if not is_owner(user_id):
+                raise InputError("Admin sirf owner jod sakta hai.")
+            origin = message.get("forward_origin") or {}
+            target = (origin.get("sender_user") or {}).get("id") or (message.get("forward_from") or {}).get("id")
+            if not target:
+                digits = re.findall(r"\d{5,}", text)
+                if not digits:
+                    if origin.get("type") == "hidden_user":
+                        raise InputError("Us user ki privacy settings ki wajah se ID nahi mili. Use bot me /myid bhejne ko kaho aur ID yahan bhejo.")
+                    raise InputError("Numeric Telegram ID bhejo (jaise 123456789). Wo bot me /myid bhejkar dekh sakta hai.")
+                target = int(digits[0])
+            supabase("admins", "POST", {"user_id": int(target), "role": "subadmin"}, "?on_conflict=user_id")
+            _SUBADMIN_CACHE.pop(int(target), None)
+            set_admin_menu(int(target))
+            clear_pending(user_id)
+            send_text(chat_id, f"✅ Sub-admin jud gaya: {target}\nWo bot me /start karke ⚙️ Admin Panel dekh sakta hai.", {"inline_keyboard": [BACK_ROW]})
+        elif action == "rename":
+            m = re.match(r"^(\d+)\s+(.+)$", text, re.S)
+            if m:
+                clear_pending(user_id)
+                do_rename(chat_id, m.group(1), m.group(2))
+                return
+            results = search_books(text)[:8] if text else []
+            if not results:
+                raise InputError("Is naam se koi file nahi mili. Dusra naam/keyword bhejo.")
+            kb = [[{"text": f"{r['id']}. {str(r.get('title', ''))[:45]}", "callback_data": f"ad:rn:{r['id']}"}] for r in results]
+            kb.append(BACK_ROW)
+            clear_pending(user_id)
+            send_text(chat_id, "Kaunsi file? Chuno:", {"inline_keyboard": kb})
+        elif action == "rename_to":
+            clear_pending(user_id)
+            do_rename(chat_id, extra, text)
+    except InputError as exc:
+        set_pending(user_id, action, extra)  # keep waiting for a corrected answer
+        send_text(chat_id, f"❌ Nahi hua: {exc}\n\nSahi value dobara bhejo, ya /cancel.", retry)
+    except Exception as exc:
+        log_error(f"admin input {action}")
+        send_text(chat_id, f"❌ Nahi hua: {str(exc)[:250]}", retry)
+
+
+def handle_admin_callback(query: Dict[str, Any], data: str, chat_id: int, user_id: int) -> None:
+    legacy = {"admin_add_required": "ad:addreq", "admin_required_list": "ad:reqlist",
+              "admin_add_source": "ad:addsrc", "admin_report": "ad:report"}
+    data = legacy.get(data, data)
+    cmd = data[3:]
+    if cmd == "panel":
+        clear_pending(user_id)
+        show(chat_id, ADMIN_PANEL_TEXT, admin_menu(), query)
+    elif cmd == "usermenu":
+        show(chat_id, "🔍 Book/file ka naam, subject ya exam likhkar bhejo.", {"inline_keyboard": [list(r) for r in USER_KEYBOARD_ROWS] + [[{"text": "⚙️ Admin Panel", "callback_data": "ad:panel"}]]}, query)
+    elif cmd in {"addreq", "addsrc", "rename"}:
+        ask_input(chat_id, user_id, cmd)
+    elif cmd == "reqlist":
+        show(chat_id, *required_list_view(), query=query)
+    elif cmd == "srclist":
+        show(chat_id, *source_list_view(), query=query)
+    elif cmd.startswith("rmreq:"):
+        cid = cmd.split(":", 1)[1]
+        supabase("required_channels", "DELETE", query=f"?chat_id=eq.{urllib.parse.quote(cid)}")
+        text, kb = required_list_view()
+        show(chat_id, "✅ Join channel hata diya.\n\n" + text, kb, query)
+    elif cmd.startswith("rmsrc:"):
+        cid = cmd.split(":", 1)[1]
+        supabase("channels", "PATCH", {"active": False}, f"?chat_id=eq.{urllib.parse.quote(cid)}")
+        text, kb = source_list_view()
+        show(chat_id, "✅ Source channel hata diya (purani files search me rahengi).\n\n" + text, kb, query)
+    elif cmd.startswith("mkreq:"):
+        cid = int(cmd.split(":", 1)[1])
+        try:
+            row = save_required_channel(resolve_chat(None, str(cid)))
+            send_text(chat_id, f"✅ Join channel bhi bana diya: {row['title']}", {"inline_keyboard": [BACK_ROW]})
+        except InputError as exc:
+            send_text(chat_id, f"❌ Nahi hua: {exc}", {"inline_keyboard": [BACK_ROW]})
+    elif cmd == "backup":
+        show(chat_id, *setting_view("backup_chat_id", "💾 Backup Channel", "ad:setbackup", "ad:backupoff",
+                                    "Har nayi indexed file ki copy is private channel me jayegi; source se file na jaye to yahan se bheji jayegi."), query=query)
+    elif cmd == "log":
+        show(chat_id, *setting_view("log_chat_id", "📝 Log Chat", "ad:setlog", "ad:logoff",
+                                    "File index hone aur file bhejne ke logs yahan aayenge."), query=query)
+    elif cmd in {"setbackup", "setlog"}:
+        ask_input(chat_id, user_id, cmd)
+    elif cmd in {"backupoff", "logoff"}:
+        key = "backup_chat_id" if cmd == "backupoff" else "log_chat_id"
+        supabase("bot_settings", "DELETE", query=f"?key=eq.{key}")
+        show(chat_id, ("💾 Backup" if key == "backup_chat_id" else "📝 Log chat") + " band kar diya ✅", {"inline_keyboard": [BACK_ROW]}, query)
+    elif cmd == "admins":
+        show(chat_id, *admins_view(user_id), query=query)
+    elif cmd == "addadm":
+        if is_owner(user_id):
+            ask_input(chat_id, user_id, "addadmin")
+        else:
+            send_text(chat_id, "Admin sirf owner jod sakta hai.")
+    elif cmd.startswith("rmadm:"):
+        if not is_owner(user_id):
+            send_text(chat_id, "Admin sirf owner hata sakta hai.")
+            return
+        target = cmd.split(":", 1)[1]
+        supabase("admins", "DELETE", query=f"?user_id=eq.{urllib.parse.quote(target)}")
+        _SUBADMIN_CACHE.pop(int(target), None)
+        try:
+            telegram("deleteMyCommands", {"scope": {"type": "chat", "chat_id": int(target)}})
+        except Exception:
+            log_error("remove admin menu")
+        text, kb = admins_view(user_id)
+        show(chat_id, f"✅ Sub-admin {target} hata diya.\n\n" + text, kb, query)
+    elif cmd.startswith("rn:"):
+        ask_input(chat_id, user_id, "rename_to", int(cmd.split(":", 1)[1]))
+    elif cmd == "report":
+        show(chat_id, report_text(), {"inline_keyboard": [BACK_ROW]}, query)
+    elif cmd == "status":
+        show(chat_id, status_text(user_id), {"inline_keyboard": [BACK_ROW]}, query)
+    elif cmd == "help":
+        show(chat_id, ADMIN_HELP, {"inline_keyboard": [BACK_ROW]}, query)
+    else:
+        show(chat_id, ADMIN_PANEL_TEXT, admin_menu(), query)
 
 
 def ai_rank(query: str, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -386,20 +970,24 @@ USER_MENU = [
     {"command": "start", "description": "Bot start karein"},
     {"command": "search", "description": "Book/file search karein"},
     {"command": "help", "description": "Help aur instructions"},
+    {"command": "myid", "description": "Apna Telegram ID dekhein"},
 ]
 ADMIN_MENU = USER_MENU + [
-    {"command": "addchannel", "description": "Admin: channel add karein"},
-    {"command": "channels", "description": "Admin: active channels"},
-    {"command": "removechannel", "description": "Admin: channel disable karein"},
-    {"command": "stats", "description": "Admin: indexed files count"},
-    {"command": "addadmin", "description": "Owner: sub-admin add karein"},
-    {"command": "removeadmin", "description": "Owner: sub-admin remove karein"},
-    {"command": "requirechannel", "description": "Admin: join channel set karein"},
+    {"command": "admin", "description": "Admin Panel (saare buttons)"},
+    {"command": "status", "description": "Admin: ID, role, channels status"},
+    {"command": "requirechannel", "description": "Admin: join channel jodo"},
     {"command": "requiredchannels", "description": "Admin: join channels list"},
-    {"command": "setbackupchannel", "description": "Admin: backup chat set karein"},
-    {"command": "setlogchat", "description": "Admin: audit log chat set karein"},
-    {"command": "report", "description": "Admin: usage report"},
-    {"command": "rename", "description": "Admin: indexed file rename"},
+    {"command": "removerequired", "description": "Admin: join channel hatao"},
+    {"command": "addchannel", "description": "Admin: source channel jodo"},
+    {"command": "channels", "description": "Admin: source channels list"},
+    {"command": "removechannel", "description": "Admin: source channel hatao"},
+    {"command": "setbackupchannel", "description": "Admin: backup channel set karein"},
+    {"command": "setlogchat", "description": "Admin: log chat set karein"},
+    {"command": "report", "description": "Admin: report"},
+    {"command": "rename", "description": "Admin: file ka naam badlo"},
+    {"command": "addadmin", "description": "Owner: sub-admin jodo"},
+    {"command": "removeadmin", "description": "Owner: sub-admin hatao"},
+    {"command": "cancel", "description": "Admin: chal raha kaam cancel"},
 ]
 
 
@@ -505,17 +1093,28 @@ def handle_private_message(message: Dict[str, Any]) -> None:
     if not chat_id:
         return
 
-    if not user_has_required_access(user.get("id")):
-        send_text(chat_id, "Bot use karne ke liye pehle required channel join karein, phir Verify dabayein.", join_markup())
+    user_id = user.get("id")
+    command = command_name(text)
+    if command == "/myid":
+        role = {"owner": "Owner ✅", "admin": "Sub-admin ✅", "user": "Normal user"}[role_of(user_id)]
+        send_text(chat_id, f"Aapka Telegram ID: {user_id}\nRole: {role}")
+        return
+    if command and command not in USER_COMMANDS and not is_subadmin(user_id):
+        send_text(chat_id, f"⛔ Ye command sirf admin ke liye hai.\nAapka Telegram ID: {user_id}")
         return
 
-    replied = message.get("reply_to_message", {}).get("text", "") or ""
-    if is_subadmin(user.get("id")) and replied.startswith("Channel ka @username") and text and not text.startswith("/"):
-        try:
-            title = add_required_channel(text)
-            send_text(chat_id, f"Required channel add ho gaya: {title}")
-        except Exception as exc:
-            send_text(chat_id, f"Channel add nahi hua: {str(exc)[:250]}")
+    if is_subadmin(user_id) and message.get("chat", {}).get("type") == "private" and not command:
+        # Answer to an admin-panel prompt (reply to the prompt, or the next message after a button).
+        action = prompt_action(message)
+        extra = None
+        pending = get_pending(user_id)
+        if pending and (action is None or action == pending.get("a")):
+            action, extra = pending.get("a"), pending.get("x")
+        if action in PROMPTS:
+            handle_admin_input(message, action, extra)
+            return
+
+    if gate_blocks(user_id, chat_id):
         return
 
     info = file_info(message)
@@ -538,7 +1137,9 @@ def handle_private_message(message: Dict[str, Any]) -> None:
                 upsert_item(record)
                 send_text(chat_id, f"Channel auto-add aur file index ho gayi: {source.get('title', 'source')}\nFile: {clean_text(info.get('file_name', 'file'))}")
             else:
-                send_text(chat_id, f"Channel auto-add ho gaya: {source.get('title', 'source')}\nAb is channel ki nayi files index hongi.")
+                send_text(chat_id, f"✅ Source channel jud gaya: {source.get('title', 'source')}\nAb is channel ki nayi files index hongi.\n"
+                                   "Isse join channel (naye users ke liye zaroori) bhi banana hai to neeche dabao.",
+                          {"inline_keyboard": [[{"text": "➕ Ise Join Channel bhi banao", "callback_data": f"ad:mkreq:{source['id']}"}], BACK_ROW]})
         except Exception as exc:
             send_text(chat_id, f"Forwarded channel add nahi hua: {str(exc)[:250]}")
         return
@@ -551,15 +1152,18 @@ def handle_private_message(message: Dict[str, Any]) -> None:
         send_text(chat_id, f"Indexed: {record['title']}\nLanguage: {record['language']}\nAb admin is file ko search se dhoondh sakte hain.")
         return
 
-    if text.startswith("/start"):
-        if is_subadmin(user.get("id")):
-            send_text(chat_id, "Admin panel", admin_menu())
+    if command == "/start":
+        if is_subadmin(user_id):
+            clear_pending(user_id)
+            kb = [list(r) for r in USER_KEYBOARD_ROWS] + [[{"text": "⚙️ Admin Panel", "callback_data": "ad:panel"}]]
+            send_text(chat_id, "Namaste Admin! 👋\nBook/file ka naam likhkar search karo, ya ⚙️ Admin Panel kholo.", {"inline_keyboard": kb})
             return
-        menu = {"inline_keyboard": [[{"text": "Search PDF", "callback_data": "user_search"}], [{"text": "Categories", "callback_data": "user_categories"}, {"text": "PDF List", "callback_data": "user_list"}], [{"text": "Help", "callback_data": "user_help"}]]}
-        send_text(chat_id, "Namaste! Book/file ka naam, subject ya exam likhkar search karein.", menu)
+        send_text(chat_id, "Namaste! 🙏\nBook/file ka naam, subject ya exam likhkar search karein.", user_menu())
         return
-    if text.startswith("/help"):
-        send_text(chat_id, "/search <keywords> - book search\nCategories - category list\nPDF List - available files\nAdmin commands menu se alag dikhengi.")
+    if command == "/help":
+        extra = "\nAdmin: /admin se Admin Panel khulega." if is_subadmin(user_id) else ""
+        send_text(chat_id, "Book, subject ya exam ka naam likhkar bhejo — bot matching files dikhayega.\n"
+                           "/search <naam> - search\n/myid - aapka Telegram ID" + extra)
         return
     if command_name(text) == "/search":
         query = text.split(None, 1)[1].strip() if len(text.split(None, 1)) > 1 else ""
@@ -585,7 +1189,7 @@ def handle_private_message(message: Dict[str, Any]) -> None:
     send_text(chat_id, f"{len(results)} result mile. File select karein:", {"inline_keyboard": buttons})
 
 
-USER_COMMANDS = {"/start", "/help", "/search"}
+USER_COMMANDS = {"/start", "/help", "/search", "/myid"}
 
 
 def command_name(text: str) -> str:
@@ -600,129 +1204,102 @@ def handle_admin_command(message: Dict[str, Any]) -> None:
     chat_id = message.get("chat", {}).get("id")
     user_id = message.get("from", {}).get("id")
     if not is_subadmin(user_id):
-        send_text(chat_id, "Ye admin command hai.")
+        send_text(chat_id, f"⛔ Ye admin command hai.\nAapka Telegram ID: {user_id}")
         return
-    if text.startswith("/addadmin"):
+    command = command_name(text)
+    arg = text.split(None, 1)[1].strip() if len(text.split(None, 1)) > 1 else ""
+    clear_pending(user_id) if get_pending(user_id) else None
+
+    def fail(exc: Exception) -> None:
+        if not isinstance(exc, InputError):
+            log_error(f"admin command {command}")
+        send_text(chat_id, f"❌ Nahi hua: {str(exc)[:300]}")
+
+    if command in {"/admin", "/panel", "/menu"}:
+        send_text(chat_id, ADMIN_PANEL_TEXT, admin_menu())
+    elif command == "/cancel":
+        send_text(chat_id, "✅ Cancel ho gaya.", admin_menu())
+    elif command in {"/status", "/debug"}:
+        send_text(chat_id, status_text(user_id), {"inline_keyboard": [BACK_ROW]})
+    elif command == "/addadmin":
         if not is_owner(user_id):
             send_text(chat_id, "Sirf primary owner sub-admin add kar sakta hai.")
-            return
-        target = text[len("/addadmin"):].strip()
-        if not target.isdigit():
-            send_text(chat_id, "Use: /addadmin TELEGRAM_NUMERIC_ID")
-            return
-        supabase("admins", "POST", {"user_id": int(target), "role": "subadmin"}, "?on_conflict=user_id")
-        set_admin_menu(int(target))
-        send_text(chat_id, "Sub-admin add ho gaya.")
-        return
-    if text.startswith("/removeadmin"):
+        elif not arg:
+            ask_input(chat_id, user_id, "addadmin")
+        else:
+            handle_admin_input(dict(message, text=arg), "addadmin", None)
+    elif command == "/removeadmin":
         if not is_owner(user_id):
             send_text(chat_id, "Sirf primary owner sub-admin remove kar sakta hai.")
-            return
-        target = text[len("/removeadmin"):].strip()
-        if target.isdigit():
-            supabase("admins", "DELETE", query=f"?user_id=eq.{target}")
+        elif not arg.isdigit():
+            send_text(chat_id, *admins_view(user_id))
+        else:
+            supabase("admins", "DELETE", query=f"?user_id=eq.{arg}")
+            _SUBADMIN_CACHE.pop(int(arg), None)
             try:
-                telegram("deleteMyCommands", {"scope": {"type": "chat", "chat_id": int(target)}})
+                telegram("deleteMyCommands", {"scope": {"type": "chat", "chat_id": int(arg)}})
             except Exception:
                 log_error("remove admin menu")
-            send_text(chat_id, "Sub-admin remove ho gaya.")
-        return
-    if text.startswith("/requirechannel"):
-        target = text[len("/requirechannel"):].strip()
-        if not target:
-            send_text(chat_id, "Required channel add karne ke liye:\n1. /requirechannel @channelusername bhejein, ya\n2. Us channel ki koi post is bot ko forward karein.")
-            return
-        try:
-            channel = telegram("getChat", {"chat_id": target}).get("result", {})
-            link = f"https://t.me/{channel['username']}" if channel.get("username") else None
-            supabase("required_channels", "POST", {"chat_id": channel["id"], "title": channel.get("title", target), "username": channel.get("username"), "invite_link": link, "active": True}, "?on_conflict=chat_id")
-            send_text(chat_id, "Required join channel save ho gaya.")
-        except Exception as exc:
-            send_text(chat_id, f"Required channel add nahi hua: {str(exc)[:250]}")
-        return
-    if text.startswith("/requiredchannels"):
-        rows = required_channels()
-        send_text(chat_id, "Required channels:\n" + ("\n".join(f"- {r.get('title')}" for r in rows) if rows else "Koi required channel nahi hai."))
-        return
-    if text.startswith("/setbackupchannel"):
-        target = text[len("/setbackupchannel"):].strip()
-        if not target:
-            send_text(chat_id, "Use: /setbackupchannel CHAT_ID ya @publicgroup")
-            return
-        try:
-            chat = telegram("getChat", {"chat_id": target}).get("result", {})
-            set_setting("backup_chat_id", str(chat["id"]))
-            send_text(chat_id, f"Backup chat set: {chat.get('title', chat['id'])}")
-        except Exception as exc:
-            send_text(chat_id, f"Backup chat set nahi hua: {str(exc)[:250]}")
-        return
-    if text.startswith("/setlogchat"):
-        target = text[len("/setlogchat"):].strip()
-        if target:
-            set_setting("log_chat_id", target)
-            send_text(chat_id, "Private audit log chat set ho gaya.")
+            send_text(chat_id, f"✅ Sub-admin {arg} hata diya.")
+    elif command == "/requirechannel":
+        if not arg and not forwarded_source(message):
+            ask_input(chat_id, user_id, "addreq")
         else:
-            send_text(chat_id, "Use: /setlogchat CHAT_ID")
-        return
-    if text.startswith("/report"):
-        try:
-            files = supabase("books", "GET", query="?select=id&limit=1000")
-            logs = supabase("delivery_logs", "GET", query="?select=id&limit=1000")
-            send_text(chat_id, f"Professional report\nIndexed files: {len(files)}\nDelivery logs: {len(logs)}\nAI ranking: {'ON' if OPENAI_API_KEY else 'OFF'}\nBackup: {'ON' if get_setting('backup_chat_id') else 'OFF'}")
-        except Exception as exc:
-            send_text(chat_id, f"Report nahi ban payi: {str(exc)[:250]}")
-        return
-    if text.startswith("/rename"):
+            handle_admin_input(dict(message, text=arg), "addreq", None)
+    elif command == "/requiredchannels":
+        send_text(chat_id, *required_list_view())
+    elif command in {"/removerequired", "/removerequirechannel"}:
+        if not arg:
+            send_text(chat_id, *required_list_view())
+        else:
+            try:
+                ref = parse_chat_ref(arg)
+                cid = ref if isinstance(ref, int) else telegram("getChat", {"chat_id": ref}).get("result", {}).get("id")
+                supabase("required_channels", "DELETE", query=f"?chat_id=eq.{cid}")
+                send_text(chat_id, "✅ Join channel hata diya.")
+            except Exception as exc:
+                fail(InputError(friendly_tg_error(exc)) if not isinstance(exc, InputError) else exc)
+    elif command == "/addchannel":
+        if not arg and not forwarded_source(message):
+            ask_input(chat_id, user_id, "addsrc")
+        else:
+            handle_admin_input(dict(message, text=arg), "addsrc", None)
+    elif command == "/channels":
+        send_text(chat_id, *source_list_view())
+    elif command == "/removechannel":
+        if not arg:
+            send_text(chat_id, *source_list_view())
+        else:
+            try:
+                ref = parse_chat_ref(arg)
+                cid = ref if isinstance(ref, int) else telegram("getChat", {"chat_id": ref}).get("result", {}).get("id")
+                supabase("channels", "PATCH", {"active": False}, f"?chat_id=eq.{cid}")
+                send_text(chat_id, "✅ Source channel hata diya (purani files search me rahengi).")
+            except Exception as exc:
+                fail(InputError(friendly_tg_error(exc)) if not isinstance(exc, InputError) else exc)
+    elif command == "/setbackupchannel":
+        if not arg:
+            send_text(chat_id, *setting_view("backup_chat_id", "💾 Backup Channel", "ad:setbackup", "ad:backupoff", "Nayi files ki copy is channel me."))
+        else:
+            handle_admin_input(dict(message, text=arg), "setbackup", None)
+    elif command == "/setlogchat":
+        if not arg:
+            send_text(chat_id, *setting_view("log_chat_id", "📝 Log Chat", "ad:setlog", "ad:logoff", "Index/delivery logs yahan."))
+        else:
+            handle_admin_input(dict(message, text=arg), "setlog", None)
+    elif command in {"/report", "/stats"}:
+        send_text(chat_id, report_text())
+    elif command == "/rename":
         parts = text.split(maxsplit=2)
-        if len(parts) < 3 or not parts[1].isdigit():
-            send_text(chat_id, "Use: /rename BOOK_ID New professional title")
-            return
-        supabase("books", "PATCH", {"title": parts[2][:500], "keywords": parts[2][:4000]}, f"?id=eq.{parts[1]}")
-        send_text(chat_id, "File ka title aur search keywords update ho gaye.")
-        return
-    if text.startswith("/addchannel"):
-        target = text[len("/addchannel"):].strip()
-        if not target:
-            send_text(chat_id, "2 tareeqe:\n1. /addchannel @channelusername\n2. Channel ki file/post bot ko forward karein; channel automatic add ho jayega.")
-            return
-        try:
-            if target.startswith("https://t.me/"):
-                target = "@" + target.rstrip("/").split("/")[-1].split("?")[0]
-            channel = telegram("getChat", {"chat_id": target}).get("result", {})
-            bot_id = telegram("getMe", {}).get("result", {}).get("id")
-            membership = telegram("getChatMember", {"chat_id": channel["id"], "user_id": bot_id}).get("result", {})
-            if membership.get("status") not in {"administrator", "creator"}:
-                raise ValueError("Bot channel ka administrator nahi hai")
-            register_channel(channel)
-            send_text(chat_id, f"Channel add ho gaya: {channel.get('title', target)}")
-        except Exception as exc:
-            send_text(chat_id, f"Channel add nahi hua. Bot admin hai aur username/ID sahi hai?\n{str(exc)[:300]}")
-        return
-    if text.startswith("/channels"):
-        rows = supabase("channels", "GET", query="?select=*&active=eq.true&order=title")
-        if not rows:
-            send_text(chat_id, "Abhi koi active channel nahi hai.")
+        if len(parts) >= 3 and parts[1].isdigit():
+            try:
+                do_rename(chat_id, parts[1], parts[2])
+            except Exception as exc:
+                fail(exc)
         else:
-            send_text(chat_id, "Active channels:\n" + "\n".join(f"- {r.get('title')} ({r.get('username') or r.get('chat_id')})" for r in rows))
-        return
-    if text.startswith("/removechannel"):
-        target = text[len("/removechannel"):].strip()
-        if not target:
-            send_text(chat_id, "Use: /removechannel @channelusername ya channel ID")
-            return
-        try:
-            if target.startswith("@"):
-                target = str(telegram("getChat", {"chat_id": target}).get("result", {}).get("id"))
-            supabase("channels", "PATCH", {"active": False}, f"?chat_id=eq.{urllib.parse.quote(target)}")
-            send_text(chat_id, "Channel disable kar diya gaya.")
-        except Exception as exc:
-            send_text(chat_id, f"Channel disable nahi hua: {str(exc)[:250]}")
-        return
-    if text.startswith("/stats"):
-        rows = supabase("books", "GET", query="?select=id&limit=1000")
-        send_text(chat_id, f"Indexed files: {len(rows)}")
-        return
-    send_text(chat_id, "Admin commands: /addchannel, /channels, /removechannel, /stats")
+            ask_input(chat_id, user_id, "rename")
+    else:
+        send_text(chat_id, "Ye command nahi pehchani. Admin Panel:", admin_menu())
 
 
 def handle_channel_post(message: Dict[str, Any]) -> None:
@@ -758,42 +1335,39 @@ def handle_group_file(message: Dict[str, Any]) -> None:
 def handle_callback(query: Dict[str, Any]) -> None:
     data = query.get("data", "")
     chat_id = query.get("message", {}).get("chat", {}).get("id")
-    try:
-        telegram("answerCallbackQuery", {"callback_query_id": query.get("id")})
-    except Exception:
-        # An expired callback must not stop the button from working.
-        log_error("answerCallbackQuery")
     user_id = query.get("from", {}).get("id")
+    if data != "verify_join":
+        try:
+            telegram("answerCallbackQuery", {"callback_query_id": query.get("id")})
+        except Exception:
+            # An expired callback must not stop the button from working.
+            log_error("answerCallbackQuery")
     if data == "verify_join":
-        if user_has_required_access(user_id):
+        missing = [] if is_subadmin(user_id) else missing_required(user_id)
+        if not missing:
             try:
-                telegram("editMessageReplyMarkup", {"chat_id": chat_id, "message_id": query.get("message", {}).get("message_id"), "reply_markup": {"inline_keyboard": []}})
+                telegram("answerCallbackQuery", {"callback_query_id": query.get("id"), "text": "✅ Verified"})
             except Exception:
                 pass
-            send_text(chat_id, "Verified. Join buttons hata diye gaye hain. Ab aap bot use kar sakte hain.")
+            show(chat_id, "✅ Verified! Shukriya.\nAb book/file ka naam, subject ya exam likhkar bhejo.", user_menu(), query)
         else:
-            send_text(chat_id, "Abhi required channel join nahi mila. Pehle Join button dabayein, phir Verify karein.", join_markup())
+            names = ", ".join(str(c.get("title") or "Channel") for c in missing)
+            try:
+                telegram("answerCallbackQuery", {"callback_query_id": query.get("id"), "text": f"Abhi join nahi kiya: {names}", "show_alert": True})
+            except Exception:
+                pass
+            send_join_gate(chat_id, missing)
         return
-    if data == "admin_add_required" and is_subadmin(user_id):
-        send_text(chat_id, "Channel ka @username ya https://t.me/... link isi message ke reply me bhejein.", {"force_reply": True, "input_field_placeholder": "@channelusername ya channel link"})
-        return
-    if data == "admin_required_list" and is_subadmin(user_id):
-        rows = required_channels()
-        send_text(chat_id, "Required channels:\n" + ("\n".join(f"- {r.get('title')} ({r.get('username') or r.get('chat_id')})" for r in rows) if rows else "Koi channel add nahi hai."))
-        return
-    if data == "admin_report" and is_subadmin(user_id):
+    if (data.startswith("ad:") or data.startswith("admin_")) and chat_id:
+        if not is_subadmin(user_id):
+            send_text(chat_id, f"⛔ Ye button sirf admin ke liye hai.\nAapka Telegram ID: {user_id}")
+            return
         try:
-            files = supabase("books", "GET", query="?select=id&limit=1000")
-            logs = supabase("delivery_logs", "GET", query="?select=id&limit=1000")
-            send_text(chat_id, f"Report\nIndexed files: {len(files)}\nDelivered files: {len(logs)}\nAI: {'ON' if OPENAI_API_KEY else 'OFF'}")
-        except Exception:
-            send_text(chat_id, "Report abhi available nahi hai.")
+            handle_admin_callback(query, data, chat_id, user_id)
+        except InputError as exc:
+            send_text(chat_id, f"❌ Nahi hua: {exc}", {"inline_keyboard": [BACK_ROW]})
         return
-    if data == "admin_add_source" and is_subadmin(user_id):
-        send_text(chat_id, "Source channel add karne ke liye /addchannel @channelusername bhejein.")
-        return
-    if not is_subadmin(user_id) and not user_has_required_access(user_id):
-        send_text(chat_id, "Pehle required channel join karein.", join_markup())
+    if chat_id and gate_blocks(user_id, chat_id):
         return
     if data == "user_help":
         send_text(chat_id, "Book, subject, exam ya keyword bhejiye. Bot available indexed files me se result dega.")
@@ -843,6 +1417,41 @@ def health() -> Any:
     return jsonify({"ok": True, "service": "telegram-book-bot", "status": status})
 
 
+def diagnostics() -> Dict[str, Any]:
+    """Counts and per-channel bot-admin checks for the health page. No IDs of people, no secrets."""
+    d: Dict[str, Any] = {"owner_ids_in_env": len(ADMIN_USER_IDS)}
+    try:
+        d["username"] = bot_info().get("username")
+    except Exception:
+        pass
+    try:
+        d["subadmins"] = count_rows("admins", col="user_id")
+    except Exception as exc:
+        d["subadmins"] = "error: " + str(exc)[:60]
+    try:
+        reqs = required_channels()
+        d["join_gate"] = "on" if reqs else "off (no required channels saved)"
+        d["required_channels"] = []
+        for r in reqs:
+            try:
+                ok = bot_member(r["chat_id"]).get("status") in {"administrator", "creator"}
+            except Exception:
+                ok = False
+            d["required_channels"].append({"title": r.get("title"), "bot_is_admin": ok,
+                                           "has_join_link": bool(r.get("invite_link") or r.get("username"))})
+    except Exception as exc:
+        d["required_channels"] = "error: " + str(exc)[:60]
+    try:
+        srcs = source_channels()
+        d["source_channels"] = len(srcs)
+        d["source_channels_bot_admin"] = sum(1 for r in srcs if chat_check(r["chat_id"]).startswith("✅"))
+    except Exception as exc:
+        d["source_channels"] = "error: " + str(exc)[:60]
+    d["backup_channel_set"] = bool(get_setting("backup_chat_id"))
+    d["log_chat_set"] = bool(get_setting("log_chat_id"))
+    return d
+
+
 def setup_status() -> Dict[str, Any]:
     """Names-only setup check, so a missing Vercel variable or a broken webhook is
     visible without opening logs. Never returns secret values."""
@@ -887,6 +1496,7 @@ def setup_status() -> Dict[str, Any]:
                 tables[name] = "missing/error: " + str(exc)[:80]
         status["database"] = "ok" if all(v == "ok" for v in tables.values()) else "incomplete"
         status["tables"] = tables
+        status["bot"] = diagnostics()
     else:
         status["database"] = "not configured (set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)"
     return status
