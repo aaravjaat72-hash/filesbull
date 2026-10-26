@@ -28,7 +28,8 @@ create table if not exists public.books (
   updated_at timestamptz not null default now()
 );
 
-create index if not exists books_title_idx on public.books using gin (to_tsvector('simple', coalesce(title,'') || ' ' || coalesce(keywords,'') || ' ' || coalesce(caption,'')));
+create index if not exists books_title_idx on public.books(title);
+create index if not exists books_keywords_idx on public.books(keywords);
 create index if not exists books_source_chat_idx on public.books(source_chat_id);
 
 alter table public.channels enable row level security;
