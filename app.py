@@ -2365,6 +2365,31 @@ def live_provider() -> str:
     return ch[0] if ch else ""
 
 
+PROBE_NO_SLEEP = [False]
+_KEY_OK: Dict[str, float] = {}
+
+
+def mark_key_ok(key: str, now: bool = False) -> None:
+    """Remember that this key has had at least one successful call (health shows 'untested' until then)."""
+    kid = key_id(key)
+    if _KEY_OK.get(kid):
+        return
+    _KEY_OK[kid] = time.time()
+
+    def write() -> None:
+        try:
+            if not get_setting(f"aikey_ok:{kid}"):
+                set_setting(f"aikey_ok:{kid}", str(int(time.time())))
+        except Exception:
+            log_error("mark_key_ok")
+    write() if now else defer(write)
+
+
+def key_tested(key: str) -> bool:
+    kid = key_id(key)
+    return bool(_KEY_OK.get(kid) or get_setting(f"aikey_ok:{kid}"))
+
+
 def provider_state(p: str) -> str:
     """"none" (no key) | "ok" | "limit" | "invalid" — the best of its keys."""
     keys = provider_keys(p)
@@ -2761,6 +2786,7 @@ def ai_complete(system: str, user_text: str, max_tokens: int = 150, cap: float =
                             key_done = prov_done = True
                             break
                         _stat(p, True)
+                        mark_key_ok(key)
                         _AI_LAST.update(provider=p, model=model, ms=int((time.time() - t_call) * 1000), usage=r["usage"])
                         if model != models[0]:
                             promote_model(p, key, model)
@@ -2820,6 +2846,7 @@ def validate_key(p: str, key: str) -> Dict[str, Any]:
             r = provider_call(p, key, model, [{"role": "system", "content": "Reply ONLY with JSON {\"ok\":true}."},
                                               {"role": "user", "content": "ping"}], 20, 7, True, True)
             out.update(ms=int((time.monotonic() - t0) * 1000), model=model, reply=r["text"][:30], err=None)
+            mark_key_ok(key, now=True)
             if model != models[0]:
                 promote_model(p, key, model)
             return out
@@ -7592,7 +7619,10 @@ def ai_providers_summary() -> Dict[str, Any]:
         if p not in MAIN_PROVIDERS and not n:
             continue
         ok, bad = (today.get(p) or [0, 0])[:2]
-        out["providers"][p] = {"keys": n, "status": provider_state(p) if n else "no key",
+        stt = provider_state(p) if n else "no key"
+        if stt == "ok" and not ok and not any(key_tested(k) for k in provider_keys(p)):
+            stt = "untested"           # never had a successful call yet (a fresh key isn't "ok" until it answers once)
+        out["providers"][p] = {"keys": n, "status": stt,
                                "role": "live" if chain and chain[0] == p else (f"backup {chain.index(p)}" if p in chain else "off"),
                                "model": cfg["models"].get(p) or "auto", "calls_today": ok, "fails_today": bad}
     try:
@@ -7623,6 +7653,8 @@ def ai_test_text() -> str:
             ok = [t for t in tries if t.get("ok")]
             if ok:
                 lines.append(f"✅ {esc(label)}: chal raha hai — model {esc(ok[0]['model'])}, {ok[0]['ms']} ms")
+            elif tries and tries[-1].get("cls") == "limit" and "429" in str(tries[-1].get("error") or ""):
+                lines.append(f"⏳ {esc(label)}: limit (nayi free key? 1–2 min baad dobara test karo)")
             elif tries:
                 lines.append(f"❌ {esc(label)}: " + esc(str(tries[-1].get('error') or 'khali jawab')[:160]))
             else:
@@ -7664,9 +7696,20 @@ def _probe_provider(p: str, json_mode: bool, all_models: bool) -> List[Dict[str,
         for model in row["models_picked"][:4 if all_models else (8 if p == "nvidia" else 3)]:
             t0 = time.monotonic()
             try:
-                r = provider_call(p, key, model, [{"role": "system", "content": "Reply ONLY with JSON {\"ok\":true}."},
-                                                  {"role": "user", "content": "ping"}], 20, 8, True, json_mode)
+                for attempt in range(2):        # a 429 (e.g. a brand-new free key) gets one retry after ~2 s
+                    try:
+                        r = provider_call(p, key, model, [{"role": "system", "content": "Reply ONLY with JSON {\"ok\":true}."},
+                                                          {"role": "user", "content": "ping"}], 20, 8, True, json_mode)
+                        break
+                    except Exception as exc0:
+                        if attempt == 0 and "429" in str(exc0):
+                            if not PROBE_NO_SLEEP[0]:
+                                time.sleep(2.0)
+                            continue
+                        raise
                 txt = r["text"][:40]
+                if txt:
+                    mark_key_ok(key, now=True)
                 row["tries"].append({"model": model, "ok": bool(txt), "ms": int((time.monotonic() - t0) * 1000), "reply": txt})
                 if txt and model != row["models_picked"][0]:
                     promote_model(p, key, model)
@@ -7674,7 +7717,7 @@ def _probe_provider(p: str, json_mode: bool, all_models: bool) -> List[Dict[str,
                     break
             except Exception as exc:
                 row["tries"].append({"model": model, "ok": False, "ms": int((time.monotonic() - t0) * 1000),
-                                     "error": _err_class(exc, key)})
+                                     "error": _err_class(exc, key), "cls": ai_err_class(exc)})
                 if ai_err_class(exc) == "model":
                     drop_model(p, key, model)       # a 404 model never marks the key dead: next model
                 if ai_err_class(exc) in {"invalid", "limit"}:
