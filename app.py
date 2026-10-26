@@ -80,6 +80,12 @@ def http_json(url: str, method: str = "GET", payload: Optional[Dict[str, Any]] =
         try:
             detail = json.loads(exc.read().decode("utf-8", "replace"))
             reason = detail.get("description") or detail.get("message") or detail.get("error") or str(detail)
+            params = detail.get("parameters") if isinstance(detail, dict) else None
+            if isinstance(params, dict):
+                if params.get("migrate_to_chat_id"):
+                    reason = f"{reason} (migrate_to_chat_id={params['migrate_to_chat_id']})"
+                if params.get("retry_after") and "retry after" not in str(reason).lower():
+                    reason = f"{reason} (retry after {params['retry_after']})"
         except Exception:
             reason = exc.reason
         raise RuntimeError(f"HTTP {exc.code}: {str(reason)[:300]}") from None
@@ -194,8 +200,7 @@ def flush_logs() -> None:
         parts.append(chunk)
     for part in parts[:9]:
         try:
-            telegram("sendMessage", {"chat_id": int(target), "text": part[:4000], "disable_web_page_preview": True,
-                                     "disable_notification": True})
+            log_chat_send(part)
         except Exception:
             log_error("log chat")
             return
@@ -570,6 +575,7 @@ PROMPTS = {
                "1️⃣ Naya private channel/group banao (jaise \"Files Bull Users\")\n"
                "2️⃣ Bot ko wahan admin banao (Post Messages on)\n"
                "3️⃣ Uski koi post yahan FORWARD karo (ya -100... ID bhejo). \"me\" bhejo to logs isi chat me aayenge.\n"
+               "👥 GROUP hai to aasaan: bot ko group me add karke admin banao, phir us group me /setlogchat bhejo.\n"
                "(/cancel = band)", "Post forward karo ya me"),
     "addadmin": ("👮 Naye admin ka Telegram numeric ID bhejo (wo bot me /myid bhejkar dekh sakta hai), ya uska koi message forward karo.\n"
                  "(/cancel = band)", "123456789"),
@@ -747,7 +753,7 @@ def report_text() -> str:
         src = len(source_channels())
         return (f"📊 Report\nIndexed files: {files}\nFiles bheji gayi (total): {logs}\nAaj bheji gayi: {today_logs}\n"
                 f"Join channels: {req}\nSource channels: {src}\nSmart AI: {'ON (' + ai_provider() + ')' if ai_provider() else 'OFF (GROQ_API_KEY nahi)'}\n"
-                f"Backup: {'ON' if get_setting('backup_chat_id') else 'OFF'}\nLog chat: {'ON' if get_setting('log_chat_id') else 'OFF'}")
+                f"Backup: {'ON' if get_setting('backup_chat_id') else 'OFF'}\n{log_chat_line()}")
     except Exception as exc:
         return f"Report nahi ban payi: {str(exc)[:200]}"
 
@@ -774,7 +780,7 @@ def status_text(user_id: Optional[int]) -> str:
             lines.append("ℹ️ Auto-save off wale channels ki files forward karke save karo, ya bot ko admin banao. Purani files chalti rahengi.")
     except Exception as exc:
         lines.append(f"\nSource channels: error {str(exc)[:80]}")
-    lines.append(f"Backup: {'ON' if get_setting('backup_chat_id') else 'OFF'} | Log chat: {'ON' if get_setting('log_chat_id') else 'OFF (/logs se dekho)'}")
+    lines.append(f"Backup: {'ON' if get_setting('backup_chat_id') else 'OFF'} | {log_chat_line()}")
     try:
         nb = named_by_counts()
         lines.append(f"🏷️ Naam kaise bane: saaf naam {nb['clean']} · page padhke {nb['local_text']} (dono 0 token) · "
@@ -2528,6 +2534,7 @@ ADMIN_MENU = USER_MENU + [
     {"command": "removechannel", "description": "Admin: source channel hatao"},
     {"command": "setbackupchannel", "description": "Admin: backup channel set karein"},
     {"command": "setlogchat", "description": "Admin: log chat set karein"},
+    {"command": "logtest", "description": "Owner: log chat me test message"},
     {"command": "report", "description": "Admin: report"},
     {"command": "rename", "description": "Admin: file ka naam badlo"},
     {"command": "files", "description": "Admin: saari files (10-10 page)"},
@@ -2578,6 +2585,8 @@ def forwarded_source(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         source = dict(origin.get("chat") or {})
         source["message_id"] = origin.get("message_id")
         return source
+    if origin.get("type") == "chat" and origin.get("sender_chat"):
+        return dict(origin.get("sender_chat") or {})
     return message.get("forward_from_chat") or None
 
 
@@ -2920,6 +2929,24 @@ def handle_admin_command(message: Dict[str, Any]) -> None:
             send_text(chat_id, *setting_view("backup_chat_id", "💾 Backup Channel", "ad:setbackup", "ad:backupoff", "Nayi files ki copy is channel me."))
         else:
             handle_admin_input(dict(message, text=arg), "setbackup", None)
+    elif command == "/logtest":
+        if not is_owner(user_id):
+            send_text(chat_id, "Ye sirf owner ke liye hai.")
+        else:
+            send_text(chat_id, log_test_text(log_test()), {"inline_keyboard": [[{"text": "📜 Purani updates Log me bhejo", "callback_data": "ad:logfill"}]]}
+                      if message.get("chat", {}).get("type") == "private" else None)
+    elif command == "/setlogchat" and not arg and message.get("chat", {}).get("type") in {"group", "supergroup", "channel"}:
+        # Sent inside the group itself → this group becomes the Log Chat (no forwarding needed for groups).
+        try:
+            telegram("sendMessage", {"chat_id": chat_id, "text": "✅ Ye group ab filesbull ka 📝 Log Chat hai. Saari updates yahan aayengi."})
+            set_setting("log_chat_id", str(chat_id))
+            _log_chat_mark(True)
+        except Exception as exc:
+            log_error("setlogchat in group")
+            try:
+                telegram("sendMessage", {"chat_id": user_id, "text": "❌ Group Log Chat set nahi hua: " + log_chat_reason(exc)})
+            except Exception:
+                pass
     elif command == "/setlogchat":
         if not arg:
             send_text(chat_id, *log_setting_view())
@@ -3871,6 +3898,9 @@ def handle_admin_callback_v6(query: Dict[str, Any], cmd: str, chat_id: int, user
     if cmd == "logfill":
         logfill_preview(chat_id, user_id, query)
         return True
+    if cmd == "logtest":
+        show(chat_id, log_test_text(log_test()), {"inline_keyboard": [[{"text": "📜 Purani updates Log me bhejo", "callback_data": "ad:logfill"}], BACK_ROW]}, query)
+        return True
     if cmd == "logfill:go":
         st = logfill_state()
         if not logfill_active(st) and st.get("stopped") == "errors":
@@ -4113,6 +4143,12 @@ def diagnostics() -> Dict[str, Any]:
     except Exception:
         pass
     d["log_chat_set"] = bool(get_setting("log_chat_id"))
+    try:
+        _ls = log_chat_status()
+        d["log_chat_ok"] = _ls.get("ok") if _ls else None
+        d["log_chat_last_error"] = None if not _ls or _ls.get("ok") else _ls.get("reason")
+    except Exception:
+        pass
     try:
         _lf = logfill_state()
         d["log_backfill"] = ({"active": logfill_active(_lf), "sent": _lf.get("sent_files", 0), "total": _lf.get("total", 0),
@@ -5353,6 +5389,11 @@ def aidiag() -> Any:
     res["probe_json"] = ai_probe(True, request.args.get("all") == "1")
     if request.args.get("plain") == "1":
         res["probe_plain"] = ai_probe(False)
+    if request.args.get("logtest") == "1":
+        try:
+            res["logtest"] = log_test()
+        except Exception as exc:
+            res["logtest"] = {"error": _err_class(exc)}
     if request.args.get("name") == "1":
         try:
             res["naming"] = naming_diag(request.args.get("ids", ""))
@@ -5366,6 +5407,126 @@ def build_header(response: Any) -> Any:
     # Which commit is serving (lets a deploy be verified without opening the home page).
     response.headers["X-Filesbull-Build"] = os.environ.get("VERCEL_GIT_COMMIT_SHA", "")[:7] or "local"
     return response
+
+
+# ---- 📝 Log Chat sending (channel, group or supergroup) with the exact reason kept when it fails (Aarav 6:34 PM)
+LOGCHAT_STATUS_KEY = "log_chat_status"
+
+
+def log_chat_reason(exc: Exception) -> str:
+    low = str(exc).lower()
+    if "upgraded to a supergroup" in low or "migrate_to_chat_id" in low:
+        return "group supergroup ban gaya (ID badal gayi) — bot ne nayi ID le li"
+    if "chat not found" in low:
+        return "chat nahi mila — bot us group/channel me add nahi hai (ya ID galat)"
+    if "bot was kicked" in low:
+        return "bot ko group/channel se nikaal diya gaya"
+    if "bot is not a member" in low or "not a member" in low:
+        return "bot member nahi hai — bot ko group/channel me add karo"
+    if "not enough rights" in low or "have no rights" in low or "need administrator" in low or "admin_required" in low:
+        return "bot ko message bhejne ki permission nahi — bot ko admin banao (Post/Send Messages on)"
+    if "topic" in low or "thread" in low:
+        return "group me Topics on hain aur General topic band hai — General khol do ya Topics band karo"
+    if "retry after" in low or "too many requests" in low:
+        return "Telegram limit — thodi der baad apne-aap"
+    if "forbidden" in low:
+        return "bot ko yahan bhejne ki permission nahi (Forbidden)"
+    if "blocked" in low:
+        return "bot block hai"
+    return "Telegram error: " + re.sub(r"-?\d{6,}", "<id>", str(exc))[:120].replace(BOT_TOKEN or "\0", "***")
+
+
+def log_chat_status() -> Dict[str, Any]:
+    try:
+        d = json.loads(get_setting(LOGCHAT_STATUS_KEY) or "{}")
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _log_chat_mark(ok: bool, reason: str = "") -> None:
+    try:
+        old = log_chat_status()
+        if ok and old.get("ok") and time.time() - float(old.get("t") or 0) < 3600:
+            return                         # nothing new to store (saves a DB write per event)
+        set_setting(LOGCHAT_STATUS_KEY, json.dumps({"ok": ok, "t": int(time.time()), "reason": reason[:200]},
+                                                   ensure_ascii=False, separators=(",", ":")))
+    except Exception:
+        log_error("log_chat_status")
+
+
+def log_chat_send(text: str, silent: bool = True) -> Dict[str, Any]:
+    """Send one message to the 📝 Log Chat. A group that became a supergroup is followed to its new ID.
+    Raises on failure (after storing the reason) so callers can wait on Telegram's retry-after."""
+    target = get_setting("log_chat_id")
+    if not target:
+        raise RuntimeError("log chat not set")
+    for attempt in range(2):
+        try:
+            res = telegram("sendMessage", {"chat_id": int(target), "text": text[:4000], "disable_web_page_preview": True,
+                                           "disable_notification": silent})
+            _log_chat_mark(True)
+            return res
+        except Exception as exc:
+            m = re.search(r"migrate_to_chat_id=(-?\d+)", str(exc))
+            if m and attempt == 0:
+                target = m.group(1)
+                set_setting("log_chat_id", target)
+                continue
+            if "retry after" not in str(exc).lower():
+                _log_chat_mark(False, log_chat_reason(exc))
+            raise
+    raise RuntimeError("log chat send failed")
+
+
+def log_chat_line() -> str:
+    if not get_setting("log_chat_id"):
+        return "Log chat: OFF (/logs se dekho)"
+    st = log_chat_status()
+    if st and not st.get("ok"):
+        return f"Log chat: ❌ {st.get('reason') or 'bhej nahi pa raha'} (/logtest se check karo)"
+    if st.get("ok"):
+        return "Log chat: ✅ ON (bhej raha hai)"
+    return "Log chat: ON (abhi tak kuch bheja nahi — /logtest dabao)"
+
+
+def log_test() -> Dict[str, Any]:
+    """Post a test line to the Log Chat; returns {ok, chat_type, title?, reason?} — never the chat ID."""
+    out: Dict[str, Any] = {"set": bool(get_setting("log_chat_id"))}
+    if not out["set"]:
+        out.update(ok=False, reason="Log Chat set nahi hai")
+        return out
+    try:
+        info = telegram("getChat", {"chat_id": int(get_setting("log_chat_id"))}).get("result") or {}
+        out["chat_type"] = info.get("type")
+        out["title"] = info.get("title") or info.get("first_name")
+        out["topics"] = bool(info.get("is_forum"))
+    except Exception as exc:
+        m = re.search(r"migrate_to_chat_id=(-?\d+)", str(exc))
+        if m:
+            set_setting("log_chat_id", m.group(1))
+            out["migrated"] = True
+        else:
+            out["chat_error"] = log_chat_reason(exc)
+    try:
+        log_chat_send("✅ Log Chat connected — filesbull yahan updates bhejega (" + ist_now() + " IST)", silent=False)
+        out["ok"] = True
+    except Exception as exc:
+        out.update(ok=False, reason=log_chat_reason(exc))
+    return out
+
+
+def log_test_text(res: Dict[str, Any]) -> str:
+    kind = {"channel": "channel", "supergroup": "group (supergroup)", "group": "group", "private": "private chat"}.get(
+        str(res.get("chat_type") or ""), str(res.get("chat_type") or "?"))
+    if res.get("ok"):
+        return f"✅ Log Chat connected!\n{kind}: {res.get('title') or ''}\nTest message wahan chala gaya 👍"
+    if not res.get("set"):
+        return setlog_steps_text()
+    return (f"❌ Log Chat me message nahi gaya.\nWajah: {res.get('reason')}\n" + (f"({kind}: {res.get('title')})\n" if res.get("title") else "") +
+            "\nGroup ho to: bot ko group me add karo → admin banao (Send Messages on).\n"
+            "Channel ho to: bot admin + Post Messages on.\nAasaan tarika: us group me /setlogchat bhejo — wahi group Log Chat ban jayega.")
+
 
 
 # ================================================================ v9: admin text never gets the user off-topic reply + 📜 log backfill
@@ -5597,8 +5758,7 @@ def logfill_send(target: str, text: str, st: Dict[str, Any]) -> None:
     gap = LOGFILL_GAP - (time.time() - float(st.get("last_ts") or 0))
     if gap > 0:
         LOGFILL_SLEEP[0](gap)
-    telegram("sendMessage", {"chat_id": int(target), "text": text[:4000], "disable_web_page_preview": True,
-                             "disable_notification": True})
+    log_chat_send(text)
     st["last_ts"] = time.time()
     st["msgs"] = int(st.get("msgs") or 0) + 1
 
@@ -5766,6 +5926,10 @@ def log_setting_view() -> Any:
                             "📥 kis user ne kaunsi file li, 🗂️ nayi category bani. Set na ho to /logs se last 50 dekho.")
     rows = kb["inline_keyboard"]
     rows.insert(len(rows) - 1, [{"text": "📜 Purani updates Log me bhejo", "callback_data": "ad:logfill"}])
+    if get_setting("log_chat_id"):
+        rows.insert(len(rows) - 1, [{"text": "🧪 Log Test", "callback_data": "ad:logtest"}])
+        text += "\n" + log_chat_line()
+    text += "\n\n👥 Group ko Log Chat banana ho: bot ko group me admin banao, phir us group me /setlogchat bhejo."
     return text, kb
 
 
