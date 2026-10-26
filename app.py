@@ -219,6 +219,8 @@ def supabase(path: str, method: str = "GET", payload: Any = None,
     if not SUPABASE_URL or not SUPABASE_KEY:
         raise RuntimeError("Supabase environment variables are not configured")
     url = f"{SUPABASE_URL}/rest/v1/{path}{query}"
+    if method != "GET" and (path == "books" or (path == "bot_settings" and "catmap" in json.dumps(payload or query, default=str))):
+        books_changed()
     if path == "bot_settings" and method != "GET":
         if method == "POST" and isinstance(payload, dict) and payload.get("key"):
             settings_forget(f"key=eq.{urllib.parse.quote(str(payload['key']))}")
@@ -290,7 +292,7 @@ def _set_memo() -> Dict[str, Any]:
 
 
 def _set_ttl_ok(key: str) -> bool:
-    return key in _SET_TTL_KEYS or key.startswith("aimodels")
+    return key in _SET_TTL_KEYS or key.startswith(("aimodels", "admsearch:"))
 
 
 SETTINGS_MEMO = [True]
@@ -386,6 +388,27 @@ def par(*fns: Any) -> List[Any]:
             out.append(exc)
     _REQ["_set"] = memo
     return out
+
+
+# Short per-instance cache for list screens (📂 Files pages, 🗂️ Categories): paging back and forth is instant.
+# Any write to the books table or catmap through this instance clears it; other instances see changes within VIEW_TTL.
+VIEW_TTL = [20.0]
+_VIEW_CACHE: Dict[str, Any] = {}
+_BOOKS_GEN = [0]
+
+
+def view_cached(key: str, fn: Any) -> Any:
+    hit = _VIEW_CACHE.get(key)
+    if hit and hit[1] == _BOOKS_GEN[0] and time.monotonic() - hit[0] < VIEW_TTL[0]:
+        return hit[2]
+    val = fn()
+    _VIEW_CACHE[key] = (time.monotonic(), _BOOKS_GEN[0], val)
+    return val
+
+
+def books_changed() -> None:
+    _BOOKS_GEN[0] += 1
+    _VIEW_CACHE.clear()
 
 
 def _ok(v: Any, default: Any) -> Any:
@@ -1222,7 +1245,7 @@ def handle_admin_callback(query: Dict[str, Any], data: str, chat_id: int, user_i
     data = legacy.get(data, data)
     cmd = data[3:]
     # the settings most admin screens read, fetched in ONE round trip (was one DB call each)
-    if cmd in ("panel", "smode", "usermenu", "backup", "log", "logtest", "ainame", "cmdq") or cmd.startswith("cmdq:"):
+    if cmd in ("smode", "usermenu", "backup", "log", "logtest", "ainame", "cmdq") or cmd.startswith("cmdq:"):
         prefetch_settings([f"admsearch:{user_id}", f"pending:{user_id}", "log_chat_id", "backup_chat_id", "ai_naming",
                            LOGCHAT_STATUS_KEY] + (["ainame_cursor", "ainame_queue"] if cmd == "ainame" else []))
     _conf = cmd.startswith("y:")
@@ -1240,9 +1263,9 @@ def handle_admin_callback(query: Dict[str, Any], data: str, chat_id: int, user_i
     if handle_admin_callback_v6(query, cmd, chat_id, user_id):
         return
     if cmd == "panel":
-        if get_setting(f"pending:{user_id}"):
-            clear_pending(user_id)
         show(chat_id, ADMIN_PANEL_TEXT, admin_menu(user_id), query, "HTML")
+        if get_setting(f"pending:{user_id}"):      # after the screen is up
+            clear_pending(user_id)
     elif cmd == "usermenu":
         show(chat_id, welcome_text(query.get("from"), admin=True), admin_start_menu(), query, "HTML")
     elif cmd in {"addreq", "addsrc", "rename"}:
@@ -5710,7 +5733,8 @@ def files_view(page: int = 1) -> Any:
     def _rows(p: int) -> Any:
         return supabase("books", "GET", query="?select=id,title,file_size,language,source_chat_title&status=eq.indexed"
                                               f"&order=id.desc&offset={(p - 1) * FILES_PAGE}&limit={FILES_PAGE}")
-    total, rows = par(lambda: count_rows("books", "&status=eq.indexed"), lambda: _rows(page))   # both at once
+    total, rows = par(lambda: view_cached("files_total", lambda: count_rows("books", "&status=eq.indexed")),
+                      lambda: view_cached(f"files_p{page}", lambda: _rows(page)))   # both at once
     if isinstance(total, Exception):
         raise total
     pages = max(1, -(-total // FILES_PAGE))
@@ -6890,6 +6914,10 @@ def book_category(row: Dict[str, Any], cmap: Dict[str, str]) -> str:
 
 
 def category_rows() -> List[Dict[str, Any]]:
+    return [dict(r) for r in view_cached("catrows", _category_rows)]
+
+
+def _category_rows() -> List[Dict[str, Any]]:
     cols = "id,title,file_name" + (",category" if has_category_col() else "")
     rows = supabase("books", "GET", query=f"?select={cols}&status=eq.indexed&order=id.desc&limit=5000")
     cmap = {} if has_category_col() else catmap()
