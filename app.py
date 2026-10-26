@@ -5166,7 +5166,7 @@ def preview_rename(chat_id: int, user_id: int, items: List[Any], query: Optional
         if bigfile_ready() else big
     if big and bigfile_ready():
         lines.append("\n🔁 20 MB se badi file" + (f" ({len(big)})" if len(big) > 1 else "") +
-                     ": Accept ke baad bot use naye naam se dobara upload karega (1–2 min). Tab tak caption me naya naam dikhega.")
+                     ": Accept ke baad bot use naye naam se dobara upload karega (2–4 min). Tab tak caption me naya naam dikhega.")
     elif big:
         lines.append("\n⚠️ 20 MB se badi file ka asli naam Telegram badalne nahi deta, caption me naya naam dikhega"
                      + (f" ({len(big)} files)" if len(big) > 1 else ""))
@@ -8254,7 +8254,7 @@ BIG_TRIES = 2                       # first try + one retry
 BIG_STALE_SEC = 15 * 60            # a claimed job with no report after this counts as a failed try
 OIDC_ISS = "https://token.actions.githubusercontent.com"
 OIDC_AUD = "filesbull-bigfile"
-BIG_STATUS_TEXT = "⏳ Badi file ka naam badal raha hai (1–2 min)…"
+BIG_STATUS_TEXT = "⏳ Badi file ka naam badal raha hai (2–4 min)…"   # measured: 34.7 MB took 3 min 40 s on Oct 26
 BIG_STATUS_SLOW = "⏳ Badi file ka naam badal raha hai (5–15 min)…"
 _BIG_SECRETS = [s for s in (TG_API_HASH, GH_DISPATCH_TOKEN) if s]
 
