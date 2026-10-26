@@ -4,6 +4,8 @@ import base64
 import hashlib
 import hmac
 import html
+import http.client
+import threading
 import json
 import io
 import os
@@ -86,10 +88,79 @@ def diag_label(url: str, method: str) -> str:
     return "ext:" + urllib.parse.urlparse(url).netloc
 
 
+# Keep-alive HTTPS connections per host, reused across calls (and across updates on a warm instance):
+# a fresh TLS handshake to Supabase/Telegram costs ~200 ms per call, a reused connection one round trip.
+_POOL: Dict[str, List[Any]] = {}
+_POOL_LOCK = threading.Lock()
+_POOL_STATS = {"new": 0, "reused": 0}
+
+
+def _pool_get(host: str, timeout: float) -> Any:
+    with _POOL_LOCK:
+        free = _POOL.setdefault(host, [])
+        conn = free.pop() if free else None
+    if conn is None:
+        _POOL_STATS["new"] += 1
+        conn = http.client.HTTPSConnection(host, timeout=timeout)
+    else:
+        _POOL_STATS["reused"] += 1
+    conn.timeout = timeout
+    if conn.sock is not None:
+        try:
+            conn.sock.settimeout(timeout)
+        except Exception:
+            pass
+    return conn
+
+
+def _pool_put(host: str, conn: Any) -> None:
+    with _POOL_LOCK:
+        free = _POOL.setdefault(host, [])
+        if len(free) < 8:
+            free.append(conn)
+            return
+    conn.close()
+
+
+def http_raw(url: str, method: str = "GET", body: Optional[bytes] = None, headers: Optional[Dict[str, str]] = None,
+             timeout: float = 20) -> Any:
+    """One HTTPS request on a pooled keep-alive connection -> (status, headers, body bytes).
+    HTTP errors raise urllib.error.HTTPError (same as urllib) so callers keep their error handling."""
+    u = urllib.parse.urlsplit(url)
+    if u.scheme != "https":
+        req = urllib.request.Request(url, data=body, headers=headers or {}, method=method)
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            return response.status, response.headers, response.read()
+    path = u.path + ("?" + u.query if u.query else "")
+    for attempt in (1, 2):
+        conn = _pool_get(u.netloc, timeout)
+        reused = conn.sock is not None
+        try:
+            conn.request(method, path or "/", body=body, headers=headers or {})
+            resp = conn.getresponse()
+            data = resp.read()
+        except (http.client.RemoteDisconnected, BrokenPipeError, ConnectionResetError, http.client.CannotSendRequest,
+                http.client.BadStatusLine) as exc:
+            conn.close()
+            if attempt == 1 and reused:
+                continue      # the server closed an idle keep-alive connection: once more on a fresh one
+            raise urllib.error.URLError(exc) from None
+        except Exception:
+            conn.close()
+            raise
+        if resp.getheader("Connection", "").lower() == "close" or resp.will_close:
+            conn.close()
+        else:
+            _pool_put(u.netloc, conn)
+        if resp.status >= 400:
+            raise urllib.error.HTTPError(url, resp.status, resp.reason, resp.headers, io.BytesIO(data))
+        return resp.status, resp.headers, data
+    raise urllib.error.URLError("unreachable")
+
+
 def http_send(url: str, method: str, body: Optional[bytes], headers: Dict[str, str], timeout: float) -> Dict[str, Any]:
-    req = urllib.request.Request(url, data=body, headers=headers, method=method)
-    with urllib.request.urlopen(req, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
+    _, _, data = http_raw(url, method, body, headers, timeout)
+    return json.loads(data.decode("utf-8")) if data else {}
 
 
 def http_json(url: str, method: str = "GET", payload: Optional[Dict[str, Any]] = None,
@@ -148,6 +219,11 @@ def supabase(path: str, method: str = "GET", payload: Any = None,
     if not SUPABASE_URL or not SUPABASE_KEY:
         raise RuntimeError("Supabase environment variables are not configured")
     url = f"{SUPABASE_URL}/rest/v1/{path}{query}"
+    if path == "bot_settings" and method != "GET":
+        if method == "POST" and isinstance(payload, dict) and payload.get("key"):
+            settings_forget(f"key=eq.{urllib.parse.quote(str(payload['key']))}")
+        else:
+            settings_forget(query)
     if _DIAG["dry"] and method != "GET":
         _DIAG["sent"].append({"ms": int((time.monotonic() - _DIAG["t0"]) * 1000), "m": f"db:{method} {path}"})
         return []
@@ -198,16 +274,122 @@ def required_channels() -> List[Dict[str, Any]]:
         return []
 
 
+# Settings cache: every read is remembered for the rest of the update (one Telegram update = one DB read per key), and
+# config keys that change rarely are also kept per warm instance for SETTINGS_TTL seconds. Every write/delete through
+# set_setting()/supabase("bot_settings", ...) updates/drops the cached copy, so this instance never serves its own stale value.
+SETTINGS_TTL = 30.0
+_SET_TTL_KEYS = ("log_chat_id", "backup_chat_id", "ai_naming", "cat_registry", "catmap")
+_SET_CACHE: Dict[str, Any] = {}
+
+
+def _set_memo() -> Dict[str, Any]:
+    m = _REQ.get("_set")
+    if m is None:
+        m = _REQ["_set"] = {}
+    return m
+
+
+def _set_ttl_ok(key: str) -> bool:
+    return key in _SET_TTL_KEYS or key.startswith("aimodels")
+
+
+SETTINGS_MEMO = [True]
+
+
 def get_setting(key: str) -> Optional[str]:
+    if not SETTINGS_MEMO[0]:
+        _REQ.pop("_set", None)
+    memo = _set_memo()
+    if key in memo:
+        return memo[key]
+    hit = _SET_CACHE.get(key)
+    if hit and time.monotonic() - hit[0] < SETTINGS_TTL:
+        memo[key] = hit[1]
+        return hit[1]
     try:
         rows = supabase("bot_settings", "GET", query=f"?key=eq.{urllib.parse.quote(key)}&select=value&limit=1")
-        return rows[0].get("value") if rows else None
+        val = rows[0].get("value") if rows else None
     except Exception:
         return None
+    memo[key] = val
+    if _set_ttl_ok(key):
+        _SET_CACHE[key] = (time.monotonic(), val)
+    return val
+
+
+def prefetch_settings(keys: List[str]) -> None:
+    """One DB read for several settings (instead of one round trip each)."""
+    if not SETTINGS_MEMO[0]:
+        return
+    memo = _set_memo()
+    need = [k for k in dict.fromkeys(keys) if k not in memo and
+            not (_SET_CACHE.get(k) and time.monotonic() - _SET_CACHE[k][0] < SETTINGS_TTL)]
+    if not need:
+        return
+    try:
+        q = ",".join(('"' + k.replace('"', "") + '"') if re.search(r'[,()" .]', k) else k for k in need)
+        rows = supabase("bot_settings", "GET", query=f"?key=in.({urllib.parse.quote(q, safe=',')})&select=key,value")
+    except Exception:
+        log_error("prefetch_settings")
+        return
+    got = {r.get("key"): r.get("value") for r in rows or []}
+    for k in need:
+        memo[k] = got.get(k)
+        if _set_ttl_ok(k):
+            _SET_CACHE[k] = (time.monotonic(), got.get(k))
+
+
+def settings_forget(query: str = "") -> None:
+    """A write/delete on bot_settings: drop the cached copies it may touch."""
+    m = re.search(r"key=eq\.([^&]+)", query or "")
+    memo = _set_memo()
+    if m:
+        k = urllib.parse.unquote(m.group(1))
+        memo.pop(k, None)
+        _SET_CACHE.pop(k, None)
+    else:
+        memo.clear()
+        _SET_CACHE.clear()
 
 
 def set_setting(key: str, value: str) -> None:
     supabase("bot_settings", "POST", {"key": key, "value": value}, "?on_conflict=key")
+    _set_memo()[key] = value
+    if _set_ttl_ok(key):
+        _SET_CACHE[key] = (time.monotonic(), value)
+
+
+_EXEC: List[Any] = []
+
+
+def par(*fns: Any) -> List[Any]:
+    """Run independent lookups at the same time (each DB/Telegram call is a network round trip). Returns results in
+    order; an exception is returned in its slot (callers decide)."""
+    if len(fns) <= 1:
+        out = []
+        for fn in fns:
+            try:
+                out.append(fn())
+            except Exception as exc:
+                out.append(exc)
+        return out
+    if not _EXEC:
+        from concurrent.futures import ThreadPoolExecutor
+        _EXEC.append(ThreadPoolExecutor(max_workers=12))
+    memo = _set_memo()
+    futs = [_EXEC[0].submit(fn) for fn in fns]
+    out = []
+    for f in futs:
+        try:
+            out.append(f.result(timeout=20))
+        except Exception as exc:
+            out.append(exc)
+    _REQ["_set"] = memo
+    return out
+
+
+def _ok(v: Any, default: Any) -> Any:
+    return default if isinstance(v, Exception) else v
 
 
 # ---- per-request buffers: user tracking + log-chat lines are written ONCE at the end of
@@ -641,6 +823,7 @@ def show(chat_id: int, text: str, markup: Optional[Dict[str, Any]] = None, query
          parse_mode: Optional[str] = None) -> None:
     """Edit the button's own message (clean navigation); fall back to a new message."""
     message_id = ((query or {}).get("message") or {}).get("message_id")
+    markup = safe_markup(markup)
     if message_id:
         payload: Dict[str, Any] = {"chat_id": chat_id, "message_id": message_id, "text": text, "disable_web_page_preview": True}
         if markup:
@@ -701,13 +884,17 @@ def count_rows(table: str, query: str = "", col: str = "id") -> int:
     """Exact row count (Supabase returns at most 1000 rows per read, so don't count a list)."""
     if not SUPABASE_URL or not SUPABASE_KEY:
         raise RuntimeError("Supabase environment variables are not configured")
-    req = urllib.request.Request(f"{SUPABASE_URL}/rest/v1/{table}?select={col}{query}&limit=1", method="GET", headers={
-        "apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Prefer": "count=exact"})
+    url = f"{SUPABASE_URL}/rest/v1/{table}?select={col}{query}&limit=1"
+    t_call = time.monotonic()
     try:
-        with urllib.request.urlopen(req, timeout=15) as response:
-            total = (response.headers.get("Content-Range") or "").split("/")[-1]
+        _, hdrs, _ = http_raw(url, "GET", None, {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                                                 "Prefer": "count=exact"}, 15)
+        total = (hdrs.get("Content-Range") or "").split("/")[-1]
     except urllib.error.HTTPError as exc:
         raise RuntimeError(f"HTTP {exc.code} counting {table}") from None
+    finally:
+        if _DIAG["on"]:
+            _DIAG["calls"].append([int((t_call - _DIAG["t0"]) * 1000), int((time.monotonic() - t_call) * 1000), f"db:COUNT {table}"])
     return int(total) if total.isdigit() else 0
 
 
@@ -756,10 +943,18 @@ def source_list_view() -> Any:
     return "\n".join(lines), {"inline_keyboard": kb}
 
 
+_TITLE_CACHE: Dict[str, Any] = {}
+
+
 def chat_title(chat_id: Any) -> str:
+    hit = _TITLE_CACHE.get(str(chat_id))
+    if hit and time.monotonic() - hit[0] < 300:
+        return hit[1]
     try:
         chat = telegram("getChat", {"chat_id": int(chat_id)}).get("result", {}) or {}
-        return chat.get("title") or chat.get("first_name") or str(chat_id)
+        title = chat.get("title") or chat.get("first_name") or str(chat_id)
+        _TITLE_CACHE[str(chat_id)] = (time.monotonic(), title)
+        return title
     except Exception:
         return f"{chat_id} (bot ko access nahi)"
 
@@ -794,12 +989,15 @@ def admins_view(user_id: int) -> Any:
 
 def report_text() -> str:
     try:
-        files = count_rows("books")
-        logs = count_rows("delivery_logs")
         today = time.strftime("%Y-%m-%d", time.gmtime())
-        today_logs = count_rows("delivery_logs", f"&created_at=gte.{today}")
-        req = len(required_channels())
-        src = len(source_channels())
+        prefetch_settings(["backup_chat_id", "log_chat_id", "log_chat_status"])
+        files, logs, today_logs, req, src = par(lambda: count_rows("books"), lambda: count_rows("delivery_logs"),
+                                                lambda: count_rows("delivery_logs", f"&created_at=gte.{today}"),
+                                                required_channels, source_channels)
+        for x in (files, logs, today_logs):
+            if isinstance(x, Exception):
+                raise x
+        req, src = len(_ok(req, [])), len(_ok(src, []))
         return (f"📊 Report\nIndexed files: {files}\nFiles bheji gayi (total): {logs}\nAaj bheji gayi: {today_logs}\n"
                 f"Join channels: {req}\nSource channels: {src}\nSmart AI: {'ON (' + pname(ai_provider()) + ')' if ai_provider() else 'OFF (koi AI key nahi)'}\n"
                 f"Backup: {'ON' if get_setting('backup_chat_id') else 'OFF'}\n{log_chat_line()}")
@@ -811,24 +1009,26 @@ def status_text(user_id: Optional[int]) -> str:
     role = role_of(user_id)
     role_word = {"owner": "✅ Owner (ADMIN_USER_IDS me hai)", "admin": "✅ Sub-admin (admins table)", "user": "❌ Normal user (admin nahi)"}[role]
     lines = [f"🩺 Status", f"Aapka Telegram ID: {user_id}", f"Role: {role_word}", f"Owner IDs set: {len(ADMIN_USER_IDS)}"]
-    try:
-        lines.append(f"Bot: {bot_mention()}")
-    except Exception:
-        pass
-    reqs = required_channels()
+    prefetch_settings(["backup_chat_id", "log_chat_id", "named_by", "understood_by", "log_chat_status"])
+    mention, reqs, srcs = par(bot_mention, required_channels, source_channels)
+    if not isinstance(mention, Exception):
+        lines.append(f"Bot: {mention}")
+    reqs = _ok(reqs, [])
+    # every channel check at the same time (was one Telegram call after another)
+    checks = par(*([(lambda c=r["chat_id"]: chat_check(c)) for r in reqs] +
+                   ([(lambda c=r["chat_id"]: source_check(c)) for r in srcs] if not isinstance(srcs, Exception) else [])))
     lines.append(f"\nJoin gate: {'ON' if reqs else 'OFF (koi join channel nahi)'}")
-    for r in reqs:
-        lines.append(f"• {r.get('title')}: {chat_check(r['chat_id'])}, link {'✅' if (r.get('invite_link') or r.get('username')) else '❌'}")
-    try:
-        srcs = source_channels()
+    for r, ch in zip(reqs, checks[:len(reqs)]):
+        lines.append(f"• {r.get('title')}: {_ok(ch, '❓')}, link {'✅' if (r.get('invite_link') or r.get('username')) else '❌'}")
+    if isinstance(srcs, Exception):
+        lines.append(f"\nSource channels: error {str(srcs)[:80]}")
+    else:
+        schecks = [_ok(c, "❓") for c in checks[len(reqs):]]
         lines.append(f"\nSource channels: {len(srcs)}")
-        checks = [source_check(r["chat_id"]) for r in srcs]
-        for r, ch in zip(srcs, checks):
+        for r, ch in zip(srcs, schecks):
             lines.append(f"• {r.get('title')}: {ch}")
-        if any(ch == AUTO_SAVE_OFF for ch in checks):
+        if any(ch == AUTO_SAVE_OFF for ch in schecks):
             lines.append("ℹ️ Auto-save off wale channels ki files forward karke save karo, ya bot ko admin banao. Purani files chalti rahengi.")
-    except Exception as exc:
-        lines.append(f"\nSource channels: error {str(exc)[:80]}")
     lines.append(f"Backup: {'ON' if get_setting('backup_chat_id') else 'OFF'} | {log_chat_line()}")
     try:
         nb = named_by_counts()
@@ -1021,6 +1221,9 @@ def handle_admin_callback(query: Dict[str, Any], data: str, chat_id: int, user_i
               "admin_add_source": "ad:addsrc", "admin_report": "ad:report"}
     data = legacy.get(data, data)
     cmd = data[3:]
+    # the settings most admin screens read, fetched in ONE round trip (was one DB call each)
+    prefetch_settings([f"admsearch:{user_id}", f"pending:{user_id}", "log_chat_id", "backup_chat_id", "ai_naming",
+                       LOGCHAT_STATUS_KEY] + (["ainame_cursor", "ainame_queue"] if cmd == "ainame" else []))
     _conf = cmd.startswith("y:")
     _rc = cmd[2:] if _conf else cmd
     if _rc.startswith(("rt", "keyadd")) and handle_router_callback(query, _rc, _conf, chat_id, user_id):
@@ -1036,7 +1239,8 @@ def handle_admin_callback(query: Dict[str, Any], data: str, chat_id: int, user_i
     if handle_admin_callback_v6(query, cmd, chat_id, user_id):
         return
     if cmd == "panel":
-        clear_pending(user_id)
+        if get_setting(f"pending:{user_id}"):
+            clear_pending(user_id)
         show(chat_id, ADMIN_PANEL_TEXT, admin_menu(user_id), query, "HTML")
     elif cmd == "usermenu":
         show(chat_id, welcome_text(query.get("from"), admin=True), admin_start_menu(), query, "HTML")
@@ -1070,10 +1274,7 @@ def handle_admin_callback(query: Dict[str, Any], data: str, chat_id: int, user_i
             kb["inline_keyboard"].insert(1, [{"text": "💾 Backup: purani files bhi", "callback_data": "ad:bkold"}])
         show(chat_id, text, kb, query=query)
     elif cmd == "bkold":
-        try:
-            telegram("answerCallbackQuery", {"callback_query_id": query.get("id"), "text": "💾 Backup chal raha hai..."})
-        except Exception:
-            pass
+        cb_answer(query, "💾 Backup chal raha hai...")
         show(chat_id, *backup_old_view(), query=query)
     elif cmd == "users":
         show(chat_id, users_view(), {"inline_keyboard": [[{"text": "🔄 Refresh", "callback_data": "ad:users"}], BACK_ROW]}, query)
@@ -1114,10 +1315,7 @@ def handle_admin_callback(query: Dict[str, Any], data: str, chat_id: int, user_i
     elif cmd == "help":
         show(chat_id, ADMIN_HELP, {"inline_keyboard": [BACK_ROW]}, query)
     elif cmd == "restart":
-        try:
-            telegram("answerCallbackQuery", {"callback_query_id": query.get("id"), "text": "🔄 Restart ho raha hai..."})
-        except Exception:
-            pass
+        cb_answer(query, "🔄 Restart ho raha hai...")
         show(chat_id, restart_text(), status_markup(), query)
     elif cmd == "keys" or cmd.startswith("key"):
         if not is_owner(user_id):
@@ -1126,10 +1324,7 @@ def handle_admin_callback(query: Dict[str, Any], data: str, chat_id: int, user_i
         if cmd == "keyadd":
             ask_input(chat_id, user_id, "addkey")
         elif cmd == "keychk":
-            try:
-                telegram("answerCallbackQuery", {"callback_query_id": query.get("id"), "text": "🔄 Keys check ho rahi hain..."})
-            except Exception:
-                pass
+            cb_answer(query, "🔄 Keys check ho rahi hain...")
             for key in all_ai_keys():
                 st = check_ai_key(key)
                 if st == "ok":
@@ -1203,8 +1398,20 @@ def key_status_word(key: str) -> str:
     return {"": "✅ ok", "limit": "⏳ limit", "invalid": "❌ invalid"}.get(st, "⏳ " + st)
 
 
+def prefetch_ai() -> None:
+    """Everything the 🔑 AI Keys screens read, in two DB round trips instead of one per key/setting."""
+    try:
+        prefetch_settings(["ai_keys", ROUTER_KEY, f"aicalls:{ist_day()}"] +
+                          [f"aikey_cool:{key_id(k)}" for v in ENV_AI_KEYS.values() for k in v] +
+                          [f"aikey_cool:{key_id(x['k'])}" for x in _DBKEYS["v"]])
+        prefetch_settings([f"aikey_cool:{key_id(x['k'])}" for x in db_ai_keys(fresh=True)])
+    except Exception:
+        log_error("prefetch_ai")
+
+
 def keys_view() -> Any:
     """🔑 AI Keys: ⭐ LIVE provider, BACKUP ORDER, each provider's keys (masked), status and today's calls."""
+    prefetch_ai()
     cfg = router_cfg(fresh=True)
     db = db_ai_keys(fresh=True)
     env = env_key_rows()
@@ -1277,6 +1484,7 @@ def _order_from(code: str) -> List[str]:
 
 
 def rt_live_view() -> Any:
+    prefetch_ai()
     cfg = router_cfg(fresh=True)
     live = live_provider()
     rows = []
@@ -2951,11 +3159,19 @@ def user_label(rec: Dict[str, Any]) -> str:
     return f"{name[:40]}{uname}"
 
 
+_USER_SEEN: Dict[int, float] = {}
+
+
 def flush_user() -> None:
     user = _REQ.get("user")
     if not user:
         return
     uid = int(user["id"])
+    # nothing to count and this instance wrote this user < 2 min ago: skip the read + write (2 DB round trips per tap)
+    if not any(_REQ.get(k) for k in ("searches", "files")) and _REQ.get("verified") is None and \
+            time.monotonic() - _USER_SEEN.get(uid, -1e9) < 110:
+        return
+    _USER_SEEN[uid] = time.monotonic()
     rec = get_user_rec(uid)
     new = rec is None
     if new:
@@ -3019,14 +3235,18 @@ def all_user_recs() -> List[Dict[str, Any]]:
 
 def users_view() -> str:
     today_iso = ist_midnight_utc_iso()
-    files_today = count_rows("delivery_logs", f"&created_at=gte.{today_iso}")
     if users_table_ok():
-        total = count_rows("bot_users", col="user_id")
-        active = count_rows("bot_users", f"&last_seen=gte.{today_iso}", col="user_id")
-        new = count_rows("bot_users", f"&first_seen=gte.{today_iso}", col="user_id")
-        recent = supabase("bot_users", "GET", query="?select=*&order=last_seen.desc&limit=10")
+        files_today, total, active, new, recent = par(
+            lambda: count_rows("delivery_logs", f"&created_at=gte.{today_iso}"), lambda: count_rows("bot_users", col="user_id"),
+            lambda: count_rows("bot_users", f"&last_seen=gte.{today_iso}", col="user_id"),
+            lambda: count_rows("bot_users", f"&first_seen=gte.{today_iso}", col="user_id"),
+            lambda: supabase("bot_users", "GET", query="?select=*&order=last_seen.desc&limit=10"))
+        for x in (files_today, total, active, new, recent):
+            if isinstance(x, Exception):
+                raise x
         note = ""
     else:
+        files_today = count_rows("delivery_logs", f"&created_at=gte.{today_iso}")
         recs = all_user_recs()
         total = len(recs)
         active = sum(1 for r in recs if str(r.get("last_seen") or "") >= today_iso)
@@ -3392,8 +3612,23 @@ def upsert_item(record: Dict[str, Any]) -> Any:
     return supabase("books", "POST", clean, "?on_conflict=telegram_file_unique_id")
 
 
+def safe_markup(markup: Any) -> Any:
+    """Telegram refuses the WHOLE message if one button's callback_data is over 64 bytes: such a button becomes a
+    harmless no-op (and is logged) so the screen still opens."""
+    if not isinstance(markup, dict) or not markup.get("inline_keyboard"):
+        return markup
+    for row in markup["inline_keyboard"]:
+        for b in row:
+            cd = b.get("callback_data")
+            if isinstance(cd, str) and len(cd.encode("utf-8")) > 64:
+                print(f"[filesbull] callback_data over 64 bytes dropped: {cd[:30]}...", flush=True)
+                b["callback_data"] = "ad:noop" if cd.startswith("ad:") else "noop"
+    return markup
+
+
 def send_text(chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None,
               parse_mode: Optional[str] = None) -> None:
+    reply_markup = safe_markup(reply_markup)
     payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
     if reply_markup:
         payload["reply_markup"] = reply_markup
@@ -4006,26 +4241,115 @@ def handle_group_file(message: Dict[str, Any]) -> None:
         log_error("group_file")
 
 
-def handle_callback(query: Dict[str, Any]) -> None:
-    data = query.get("data", "")
-    chat_id = query.get("message", {}).get("chat", {}).get("id")
-    user_id = query.get("from", {}).get("id")
-    note_user(query.get("from"))
-    if data != "verify_join":
-        try:
-            telegram("answerCallbackQuery", {"callback_query_id": query.get("id")})
-        except Exception:
-            # An expired callback must not stop the button from working.
+# ---- every inline button the bot makes, as patterns. A tap whose data matches none of these came from an old
+# message (a button that no longer exists) and gets "🔄 Ye button purana hai…" instead of silence.
+CALLBACK_PATTERNS = [
+    r"verify_join", r"noop", r"more", r"user_help", r"user_categories", r"user_list", r"user_search",
+    r"book:\d+", r"cat:[A-Za-z0-9_\-]+(:\d+)?", r"g:[es]:[^:]{0,58}",
+    r"admin_add_required", r"admin_required_list", r"admin_add_source", r"admin_report",
+    r"ad:(panel|usermenu|addreq|addsrc|rename|reqlist|srclist|backup|bkold|users|log|setbackup|setlog|backupoff|logoff|"
+    r"admins|addadm|report|status|help|restart|keys|keyadd|keychk|noop|smode|aitest|ainame|ainame:on|ainame:off|bigfix|"
+    r"fixn|logfill|logfill:go|logtest|rtlive|rtord|rtmod)",
+    r"ad:files(:\d+)?", r"ad:fl:[0-9a-f]{4,16}:\d+", r"ad:f:\d+(:\d+)?(:[0-9a-f]{0,16})?", r"ad:fs:\d+",
+    r"ad:fixn:\d+", r"ad:cmdq:[0-9a-f]{4,16}", r"ad:op:[nyspca]:[0-9a-f]{4,16}(:\d+)?",
+    r"ad:rn:\d+", r"ad:mkreq:-?\d+", r"ad:keyadd:[a-z]+", r"ad:rtl:[a-z]", r"ad:rtord:[a-z]*", r"ad:rtos:[a-z]*",
+    r"ad:rtm:[a-z]", r"ad:rtms:[a-z]:(a|\d+)",
+    r"ad:(y:)?(rmreq:-?\d+|rmsrc:-?\d+|rmadm:\d+|keyrm:[0-9a-f]{4,32}|fdel:\d+|backupoff|logoff)",
+    r"ad:y:(rtl:[a-z]|rtos:[a-z]*|rtms:[a-z]:(a|\d+))",
+]
+_CB_RE = re.compile("(?:" + ")|(?:".join(CALLBACK_PATTERNS) + ")")
+STALE_ADMIN = "🔄 Ye button purana hai, /admin dobara kholo"
+STALE_USER = "🔄 Ye button purana hai, /start dobara karo"
+CONFIRM_TTL = 3600      # an ✅ Accept older than this (message date) asks to start again
+OWNER_ONLY_CMDS = ("keys", "key", "rt", "bigfix", "addadm", "rmadm:", "y:keyrm:", "y:rmadm:", "y:rt")
+# toast shown at once for buttons whose screen needs a few lookups; quick screens just stop the spinner
+CB_TOASTS = [("ad:status", "⏳ Status check ho raha hai..."), ("ad:keychk", "🔄 Keys check ho rahi hain..."),
+             ("ad:aitest", "⏳ AI test ho raha hai..."), ("ad:report", "⏳"), ("ad:users", "⏳"), ("ad:bkold", "💾 Backup chal raha hai..."),
+             ("ad:restart", "🔄 Restart ho raha hai..."), ("ad:fixn", "🤖 AI naam soch raha hai..."),
+             ("ad:bigfix", "🔁 Badi files dekh raha hu..."), ("ad:logfill", "📜 Log Chat me bhej raha hu..."),
+             ("ad:fs:", "📤 File bhej raha hu..."), ("book:", "📤 File bhej raha hu..."), ("ad:y:", "⏳"), ("ad:op:y:", "⏳"),
+             ("ad:keys", "⏳"), ("ad:rtm:", "⏳")]
+
+
+def callback_known(data: str) -> bool:
+    return bool(data) and len(data.encode("utf-8")) <= 64 and bool(_CB_RE.fullmatch(data))
+
+
+def cb_toast(data: str) -> str:
+    for prefix, text in CB_TOASTS:
+        if prefix.endswith(":") and data.startswith(prefix) or data == prefix or data.startswith(prefix + ":"):
+            return text
+    return ""
+
+
+def cb_answer(query: Optional[Dict[str, Any]], text: str = "", alert: bool = False) -> None:
+    """answerCallbackQuery once per tap (Telegram shows only the first). Never raises."""
+    if not query or not query.get("id"):
+        return
+    done = _REQ.setdefault("_cb_done", set())
+    if query["id"] in done:
+        return
+    done.add(query["id"])
+    payload: Dict[str, Any] = {"callback_query_id": query["id"]}
+    if text:
+        payload["text"] = text[:200]
+    if alert:
+        payload["show_alert"] = True
+    try:
+        telegram("answerCallbackQuery", payload)
+    except Exception as exc:
+        if "query is too old" not in str(exc).lower() and "query id is invalid" not in str(exc).lower():
             log_error("answerCallbackQuery")
+
+
+def handle_callback(query: Dict[str, Any]) -> None:
+    """Every tap: answer FIRST (spinner stops at once; old/foreign buttons get an alert), then do the work and edit
+    the message. Any error after that shows a short ❌ line instead of a hanging/silent button."""
+    data = str(query.get("data") or "")
+    user_id = (query.get("from") or {}).get("id")
+    chat_id = ((query.get("message") or {}).get("chat") or {}).get("id")
+    is_adm_btn = data.startswith(("ad:", "admin_"))
+    if not callback_known(data):
+        cb_answer(query, STALE_ADMIN if (is_adm_btn or is_admin(user_id)) else STALE_USER, True)
+        note_user(query.get("from"))
+        return
+    if is_adm_btn:
+        if not is_subadmin(user_id):
+            cb_answer(query, f"⛔ Ye button sirf admin ke liye hai.\nAapka Telegram ID: {user_id}", True)
+            return
+        cmd = data[3:] if data.startswith("ad:") else ""
+        if cmd.startswith(OWNER_ONLY_CMDS) and not is_owner(user_id):
+            cb_answer(query, "🔑 Ye button sirf owner ke liye hai.", True)
+            return
+        msg_date = int((query.get("message") or {}).get("date") or 0)
+        if cmd.startswith(("y:", "op:y:")) and msg_date and time.time() - msg_date > CONFIRM_TTL:
+            cb_answer(query, "⌛ Ye confirm purana ho gaya (1 ghante se zyada). Dobara karo, phir ✅ Accept dabao.", True)
+            return
+    if data != "verify_join":
+        cb_answer(query, cb_toast(data))
+    note_user(query.get("from"))
+    try:
+        _handle_callback_body(query, data, chat_id, user_id)
+    except Exception as exc:
+        log_error(f"callback {data[:30]}")
+        if not chat_id:
+            return
+        back = {"inline_keyboard": [BACK_ROW]} if is_adm_btn else None
+        why = str(exc) if isinstance(exc, InputError) else "kuch gadbad hui"
+        try:
+            show(chat_id, f"❌ Ye button abhi nahi chala ({why[:120]}).\nDobara dabao — phir bhi na chale to /admin kholo."
+                 if is_adm_btn else "❌ Abhi nahi hua, dobara dabao.", back, query)
+        except Exception:
+            log_error("callback error reply")
+
+
+def _handle_callback_body(query: Dict[str, Any], data: str, chat_id: Any, user_id: Any) -> None:
     if data == "verify_join":
         admin = is_subadmin(user_id)
         reqs = [] if admin else required_channels()
         missing = missing_required(user_id, reqs) if reqs else []
         if not missing:
-            try:
-                telegram("answerCallbackQuery", {"callback_query_id": query.get("id"), "text": "✅ Verified!"})
-            except Exception:
-                pass
+            cb_answer(query, "✅ Verified!")
             if reqs:
                 mark_verified(user_id)
                 note_user(None, verified=True)
@@ -4038,10 +4362,7 @@ def handle_callback(query: Dict[str, Any]) -> None:
             names = ", ".join(str(c.get("title") or "Channel") for c in missing)
             alert = "❌ Abhi join nahi kiya! Pehle channel join karo, phir Verify dabao."
             alert += f"\n\nBaaki: {names}"
-            try:
-                telegram("answerCallbackQuery", {"callback_query_id": query.get("id"), "text": alert[:200], "show_alert": True})
-            except Exception:
-                pass
+            cb_answer(query, alert[:200], True)
             # Refresh the same gate message in place (no new message spam on every tap).
             show(chat_id, gate_text(missing, was_verified(user_id), len(reqs)), join_markup(missing, len(reqs)), query, "HTML")
         return
@@ -4086,8 +4407,12 @@ def handle_callback(query: Dict[str, Any]) -> None:
         return
     book_id = data.split(":", 1)[1]
     rows = supabase("books", "GET", query=f"?id=eq.{urllib.parse.quote(book_id)}&select=*&limit=1")
+    if rows and str(rows[0].get("status") or "indexed") == "removed":
+        rows = []
     if rows and chat_id:
         deliver_result(chat_id, rows[0], query.get("from"))
+    elif chat_id:
+        send_text(chat_id, "😕 Ye file ab bot me nahi hai. Naam likhkar dobara search karo 🔍")
 
 
 # ================================================================ v6: admin AI commands, 📂 All Files, 🤖 AI naming
@@ -5340,10 +5665,7 @@ def run_op(query: Dict[str, Any], chat_id: int, user_id: int, op: Dict[str, Any]
         show(chat_id, "\n".join(lines), {"inline_keyboard": kb + [BACK_ROW]}, query)
     elif kind == "backup":
         clear_op(user_id)
-        try:
-            telegram("answerCallbackQuery", {"callback_query_id": query.get("id"), "text": "💾 Backup chal raha hai..."})
-        except Exception:
-            pass
+        cb_answer(query, "💾 Backup chal raha hai...")
         show(chat_id, *backup_old_view(), query=query)
     elif kind == "restart":
         clear_op(user_id)
@@ -5383,11 +5705,19 @@ def run_op(query: Dict[str, Any], chat_id: int, user_id: int, op: Dict[str, Any]
 # ---- 📂 All Files (10 per page, newest first)
 
 def files_view(page: int = 1) -> Any:
-    total = count_rows("books", "&status=eq.indexed")
+    page = max(1, int(page))
+
+    def _rows(p: int) -> Any:
+        return supabase("books", "GET", query="?select=id,title,file_size,language,source_chat_title&status=eq.indexed"
+                                              f"&order=id.desc&offset={(p - 1) * FILES_PAGE}&limit={FILES_PAGE}")
+    total, rows = par(lambda: count_rows("books", "&status=eq.indexed"), lambda: _rows(page))   # both at once
+    if isinstance(total, Exception):
+        raise total
     pages = max(1, -(-total // FILES_PAGE))
-    page = min(max(1, int(page)), pages)
-    rows = supabase("books", "GET", query="?select=id,title,file_size,language,source_chat_title&status=eq.indexed"
-                                          f"&order=id.desc&offset={(page - 1) * FILES_PAGE}&limit={FILES_PAGE}") if total else []
+    if page > pages:              # an old ➡️ button after files were removed: show the last page that exists
+        page = pages
+        rows = _rows(page) if total else []
+    rows = [] if isinstance(rows, Exception) or not total else rows
     lines = [f"📂 Saari Files — {total}", f"Page {page}/{pages} · nayi files upar", ""]
     nums: List[Any] = []
     for n, r in enumerate(rows, (page - 1) * FILES_PAGE + 1):
@@ -5610,8 +5940,9 @@ def handle_admin_callback_v6(query: Dict[str, Any], cmd: str, chat_id: int, user
         parts = cmd.split(":")
         flt = load_filter(parts[1]) if len(parts) > 1 else None
         page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
-        if flt is None:
-            show(chat_id, *files_view(page), query=query)
+        if flt is None:      # the filter behind this button is gone: say so, never fall back to ALL files silently
+            show(chat_id, "🔄 Ye filter wali list purani ho gayi. Dobara bolo (jaise \"polity ki pdf dikhao\") ya saari files dekho:",
+                 {"inline_keyboard": [[{"text": "📂 Saari Files", "callback_data": "ad:files:1"}], BACK_ROW]}, query)
         else:
             show(chat_id, *filtered_files_view(flt, page, parts[1]), query=query)
         return True
@@ -5682,17 +6013,11 @@ def handle_admin_callback_v6(query: Dict[str, Any], cmd: str, chat_id: int, user
         if not is_owner(user_id):
             show(chat_id, "Ye sirf owner kar sakta hai.", {"inline_keyboard": [BACK_ROW]}, query)
             return True
-        try:
-            telegram("answerCallbackQuery", {"callback_query_id": query.get("id"), "text": "🔁 Badi files dekh raha hu..."})
-        except Exception:
-            pass
+        cb_answer(query, "🔁 Badi files dekh raha hu...")
         bigfix_view(chat_id, user_id, query)
         return True
     if cmd == "fixn" or cmd.startswith("fixn:"):
-        try:
-            telegram("answerCallbackQuery", {"callback_query_id": query.get("id"), "text": "🤖 AI naam soch raha hai..."})
-        except Exception:
-            pass
+        cb_answer(query, "🤖 AI naam soch raha hai...")
         arg = cmd.split(":", 1)[1] if ":" in cmd else ""
         fixnames_view(chat_id, user_id, int(arg) if arg.isdigit() else None, query)
         return True
@@ -5716,12 +6041,16 @@ def handle_admin_callback_v6(query: Dict[str, Any], cmd: str, chat_id: int, user
             smart_reply(chat_id, query.get("from") or {"id": user_id}, str(op.get("q") or ""), searched=True)
         elif verb == "p" and op.get("kind") == "rename_pick" and len(parts) > 3 and parts[3].isdigit():
             rows = supabase("books", "GET", query=f"?id=eq.{int(parts[3])}&select=id,title&limit=1")
-            if rows:
+            if not rows:
+                show(chat_id, "😕 Ye file ab nahi hai.", {"inline_keyboard": [BACK_ROW]}, query)
+            else:
                 preview_rename(chat_id, user_id, [(rows[0]["id"], rows[0].get("title"),
                                                    new_name_for(str(rows[0].get("title") or ""), op["find"], op["to"]))], query)
         elif verb == "c" and op.get("kind") == "setcat_pick" and len(parts) > 3 and parts[3].isdigit():
             rows = supabase("books", "GET", query=f"?id=eq.{int(parts[3])}&select=id,title&limit=1")
-            if rows:
+            if not rows:
+                show(chat_id, "😕 Ye file ab nahi hai.", {"inline_keyboard": [BACK_ROW]}, query)
+            else:
                 slug = str(op.get("cat") or "")
                 ask_confirm(chat_id, user_id, f"🗂️ Category badalni hai?\n\n📄 {str(rows[0].get('title') or '')[:70]}\n→ {cat_emoji(slug)} {cat_label(slug)}",
                             {"kind": "setcat", "ids": [int(rows[0]["id"])], "cat": slug}, query)
@@ -5731,6 +6060,8 @@ def handle_admin_callback_v6(query: Dict[str, Any], cmd: str, chat_id: int, user
             items = [(r["id"], r.get("title"), new_name_for(str(r.get("title") or ""), op["find"], op["to"])) for r in rows
                      if str(op["find"]).lower() in str(r.get("title") or "").lower()]
             preview_rename(chat_id, user_id, items, query)
+        else:
+            show(chat_id, "⌛ Ye button purana ho gaya. Dobara bolo / dabao.", {"inline_keyboard": [BACK_ROW]}, query)
         return True
     return False
 
@@ -5819,6 +6150,13 @@ def health() -> Any:
     # it is wrong — safe to call any number of times.
     registered = None
     heal: Dict[str, Any] = {}
+    t_health = time.monotonic()
+    _REQ.clear()
+    try:
+        # the settings the keepalive work below reads, in one round trip
+        prefetch_settings(["webhook_fp", "commands_fp", "ainame_queue", "logfill_state", BIG_QUEUE_KEY, ROUTER_KEY, "ai_keys"])
+    except Exception:
+        pass
     if BOT_TOKEN:
         try:
             heal = ensure_webhook(force=request.args.get("restart") == "1")
@@ -5848,15 +6186,56 @@ def health() -> Any:
     except Exception:
         log_error("logfill keepalive")
     _REQ.clear()
-    status = setup_status()
+    if request.args.get("full") == "1":
+        status = setup_status()     # every table, channel, AI key and diagnostics check (slow: ~15–20 s)
+        try:
+            status["category_column"] = "ok" if has_category_col() else "missing (catmap fallback)"
+        except Exception:
+            pass
+    else:
+        status = light_status()     # quick: keepalive + the essentials; full report at /?full=1
     status["webhook_registered"] = registered
     status["self_heal"] = heal
     status["ai_name_retry"] = names
-    try:
-        status["category_column"] = "ok" if has_category_col() else "missing (catmap fallback)"
-    except Exception:
-        pass
+    status["ms"] = int((time.monotonic() - t_health) * 1000)
     return jsonify({"ok": True, "service": "telegram-book-bot", "status": status})
+
+
+def light_status() -> Dict[str, Any]:
+    """The quick health page (GET /): env names, database reachable, AI on/off, big-file rename, keep-warm.
+    Never secrets. Everything else (tables, channels, per-key checks, counts) is at /?full=1."""
+    st: Dict[str, Any] = {"mode": "light (full report: /?full=1)",
+                          "build": os.environ.get("VERCEL_GIT_COMMIT_SHA", "")[:7] or "local",
+                          "env": {n: bool(v) for n, v in (("BOT_TOKEN", BOT_TOKEN), ("SUPABASE_URL", SUPABASE_URL),
+                                                          ("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_KEY),
+                                                          ("ADMIN_USER_IDS", ADMIN_USER_IDS), ("GROQ_API_KEY", GROQ_API_KEY),
+                                                          ("TG_API_ID", TG_API_ID), ("TG_API_HASH", TG_API_HASH),
+                                                          ("GH_TOKEN", GH_DISPATCH_TOKEN))},
+                          "instance": {"age_s": int(time.time() - _INST["born"]), "requests": _INST["reqs"],
+                                       "boot_ms": _BOOT_MS[0], "http_conns": dict(_POOL_STATS)}}
+    if SUPABASE_URL and SUPABASE_KEY:
+        try:
+            prefetch_settings([ROUTER_KEY, "ai_keys", BIG_QUEUE_KEY, "ai_naming"])
+            supabase("bot_settings", "GET", query="?select=key&limit=1")
+            st["database"] = "ok"
+        except Exception as exc:
+            st["database"] = "error: " + str(exc)[:120]
+    else:
+        st["database"] = "not configured"
+    try:
+        st["ai"] = ("on (" + ai_provider() + ")") if ai_provider() else "off"
+        st["ai_naming"] = "on" if ai_naming_on() else "off"
+    except Exception:
+        log_error("light ai")
+    try:
+        if bigfile_ready():
+            bigfile_sweep()
+        bst = bigfile_status()
+        st["bigfile_rename"] = bst["state"]
+        st["bigfile"] = bst
+    except Exception:
+        log_error("bigfile status")
+    return st
 
 
 def diagnostics() -> Dict[str, Any]:
@@ -7340,6 +7719,7 @@ _INST: Dict[str, Any] = {"born": time.time(), "reqs": 0}
 @app.before_request
 def _count_request() -> None:
     _INST["reqs"] += 1
+    _REQ.pop("_set", None)      # the settings memo never outlives one HTTP request
 
 
 def run_cb_diag(data: str, uid: int, msg_text: str = "") -> Dict[str, Any]:
@@ -7371,7 +7751,7 @@ def run_cb_diag(data: str, uid: int, msg_text: str = "") -> Dict[str, Any]:
             "buttons": (view or {}).get("cb", [])[:40], "handler_ms": t_view, "total_ms": total, "error": err,
             "db_calls": sum(1 for c in calls if c[2].startswith("db:")), "tg_calls": sum(1 for c in calls if c[2].startswith("tg:")),
             "ext_calls": [c for c in calls if c[2].startswith("ext:")], "slow": sorted(calls, key=lambda c: -c[1])[:6],
-            "sent": [s["m"] for s in sent]}
+            "sent": [s["m"] for s in sent], "calls": calls if _DIAG.get("full") else None}
 
 
 @app.get("/api/cbdiag")
@@ -7384,7 +7764,30 @@ def cbdiag() -> Any:
     uid = 1 if request.args.get("as") == "user" else (min(ADMIN_USER_IDS) if ADMIN_USER_IDS else 1)
     inst = {"first_request_on_instance": _INST["reqs"] <= 1, "instance_age_s": int(time.time() - _INST["born"]),
             "boot_ms": _BOOT_MS[0], "requests_on_instance": _INST["reqs"]}
+    _DIAG["full"] = request.args.get("full") == "1"
     out = [run_cb_diag(cb[:64], uid, request.args.get("msg", "")) for cb in request.args.getlist("cb")[:25]]
+    if request.args.get("net") == "1":       # raw round trips: first call opens the connection, the rest reuse it
+        net: Dict[str, Any] = {"region": os.environ.get("VERCEL_REGION", ""), "db_ms": [], "tg_ms": []}
+        for _ in range(3):
+            t = time.monotonic()
+            try:
+                supabase("bot_settings", "GET", query="?select=key&limit=1")
+            except Exception:
+                pass
+            net["db_ms"].append(int((time.monotonic() - t) * 1000))
+            t = time.monotonic()
+            try:
+                telegram("getMe", {})
+            except Exception:
+                pass
+            net["tg_ms"].append(int((time.monotonic() - t) * 1000))
+        try:
+            import socket
+            net["db_ip"] = socket.gethostbyname(urllib.parse.urlsplit(SUPABASE_URL).hostname or "")
+        except Exception:
+            pass
+        net["pool"] = dict(_POOL_STATS)
+        inst["net"] = net
     return jsonify({"ok": True, "build": os.environ.get("VERCEL_GIT_COMMIT_SHA", "")[:7], "instance": inst, "taps": out,
                     "request_ms": int((time.monotonic() - t_req) * 1000)})
 
@@ -8257,6 +8660,9 @@ def logfill_kick_key() -> str:
 
 def logfill_kick() -> None:
     """Start the next run in a fresh function call (the cursor is saved, so a lost kick only waits for keepalive)."""
+    if _DIAG["dry"]:
+        _DIAG["sent"].append({"ms": 0, "m": "logfill_kick"})
+        return
     try:
         urllib.request.urlopen(urllib.request.Request(PUBLIC_HOME + "api/logfill?k=" + logfill_kick_key(),
                                                       headers={"User-Agent": "filesbull-bot/1.0"}), timeout=1.5).read()
@@ -8297,10 +8703,7 @@ def logfill_endpoint() -> Any:
 
 
 def logfill_run_from_button(query: Optional[Dict[str, Any]], chat_id: int) -> None:
-    try:
-        telegram("answerCallbackQuery", {"callback_query_id": (query or {}).get("id"), "text": "📜 Log Chat me bhej raha hu..."})
-    except Exception:
-        pass
+    cb_answer(query, "📜 Log Chat me bhej raha hu...")
     st = logfill_step(max(2.5, LOGFILL_BUDGET - req_elapsed()))
     show(chat_id, logfill_status_text(st), logfill_markup(st), query)
     if st.get("done"):
@@ -8461,6 +8864,9 @@ def bigfile_dispatch(job_id: str = "") -> str:
     """Start the workflow now. 'dispatched' | 'no_token' | 'error: …'. Never raises."""
     if not GH_DISPATCH_TOKEN:
         return "no_token"
+    if _DIAG["dry"]:
+        _DIAG["sent"].append({"ms": 0, "m": "bigfile_dispatch"})
+        return "dispatched"
     url = f"https://api.github.com/repos/{GH_REPO}/actions/workflows/{BIG_WORKFLOW}/dispatches"
     body = json.dumps({"ref": "main", "inputs": {"job": str(job_id or "queue")}}).encode()
     req = urllib.request.Request(url, data=body, method="POST", headers={
