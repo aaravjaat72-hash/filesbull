@@ -391,13 +391,6 @@ async def main_async(job):
                     run.inbox = await client.get_entity(inbox_id)
                 except Exception:
                     run.inbox = None
-            if not inbox_id:
-                summary["stop"] = "Inbox channel set nahi — koi file forward nahi hui (Backup me sirf settled files)"
-                print("no Inbox channel: nothing is forwarded")
-                return summary
-            if run.inbox is None:
-                summary["fatal"] = "aapka account Inbox channel me nahi hai (ya post ka haq nahi)"
-                return summary
             # 2) join new source channels (max 3 per run)
             want = {int(s["id"]): s for s in job["sources"]}
             joins = int(job.get("joins") or 3)
@@ -429,6 +422,13 @@ async def main_async(job):
                 await asyncio.sleep(random.uniform(float(run.gap[0]), float(run.gap[1])))
             if jr["joined"] or jr["need"] or jr["failed"]:
                 bot.post("/api/userbot-done", jr)
+            if not inbox_id:
+                summary["stop"] = "Inbox channel set nahi — koi file forward nahi hui (Backup me sirf settled files)"
+                print("no Inbox channel: nothing is forwarded")
+                return summary
+            if run.inbox is None:
+                summary["fatal"] = "aapka account Inbox channel me nahi hai (ya post ka haq nahi)"
+                return summary
             # 3) live posts first (all channels), then history with what is left of the shared cap
             order = []
             for cid, src in want.items():
