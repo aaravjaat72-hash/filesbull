@@ -286,6 +286,14 @@ def handle_callback(query: Dict[str, Any]) -> None:
 
 @app.get("/")
 def health() -> Any:
+    # Visiting the deployed URL once is enough to register the webhook.
+    # This keeps first-time setup simple for non-technical admins.
+    if BOT_TOKEN:
+        try:
+            public_url = request.url_root.rstrip("/") + "/api/webhook"
+            telegram("setWebhook", {"url": public_url})
+        except Exception:
+            pass
     return jsonify({"ok": True, "service": "telegram-book-bot"})
 
 
