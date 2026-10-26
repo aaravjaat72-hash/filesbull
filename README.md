@@ -11,6 +11,10 @@ A GitHub/Vercel-ready Telegram bot for authorized book/file catalogs. It indexes
 - Search by title, caption, filename, source channel, and keywords.
 - Direct `copyMessage` delivery with link fallback.
 - Admin commands: `/addchannel @channelusername`, `/channels`, `/stats`.
+- Owner-controlled sub-admins: `/addadmin`, `/removeadmin`.
+- Required join gate: `/requirechannel @channelusername` and `/requiredchannels`.
+- Optional AI ranking with `OPENAI_API_KEY`; AI only ranks indexed database records.
+- Delivery logs in `delivery_logs` for admin reporting.
 - Vercel webhook endpoint: `/api/webhook`.
 
 The bot must only be used for files you own or are authorized to distribute. Telegram protected content may prevent both copying and linking.
@@ -18,6 +22,7 @@ The bot must only be used for files you own or are authorized to distribute. Tel
 ## Setup
 
 1. Create a Supabase project and run `schema.sql` in its SQL Editor.
+   If the original tables already exist, also run `alter table public.books add column if not exists content_text text;` and create the new tables from the latest schema.
 2. Create a bot through BotFather. Do not put the token in the repository.
 3. Find your Telegram numeric user ID and put it in `ADMIN_USER_IDS`.
 4. Deploy this repository to Vercel.
@@ -27,6 +32,7 @@ The bot must only be used for files you own or are authorized to distribute. Tel
    - `SUPABASE_URL`
    - `SUPABASE_SERVICE_ROLE_KEY`
    - `ADMIN_USER_IDS`
+   - Optional: `OPENAI_API_KEY`, `OPENAI_MODEL=gpt-5-mini`
 
 6. After deployment, set the Telegram webhook once in a browser or shell:
 
@@ -37,6 +43,13 @@ The bot must only be used for files you own or are authorized to distribute. Tel
    `/addchannel @yourchannel`
 
 8. Forward authorized files into a configured indexing channel, or send files directly to the bot from an admin account.
+
+## Advanced setup
+
+- Add a mandatory user channel with `/requirechannel @channelusername`; the bot must be able to check membership there.
+- Add a sub-admin with `/addadmin TELEGRAM_NUMERIC_ID`. Only IDs in `ADMIN_USER_IDS` (the owner list) can add or remove sub-admins.
+- The AI key is optional. Without it, deterministic keyword/content search still works. With it, the AI ranks only database results and cannot invent a file or source.
+- Backup channels and audit-log groups should be added as a later controlled feature; never place their IDs or secrets in public code.
 
 ## Recommended captions
 

@@ -14,6 +14,8 @@ app = Flask(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5-mini")
 ADMIN_USER_IDS = {
     int(x.strip()) for x in os.environ.get("ADMIN_USER_IDS", "").split(",") if x.strip().isdigit()
 }
@@ -57,6 +59,76 @@ def supabase(path: str, method: str = "GET", payload: Any = None,
 
 def is_admin(user_id: Optional[int]) -> bool:
     return bool(user_id and user_id in ADMIN_USER_IDS)
+
+
+def is_owner(user_id: Optional[int]) -> bool:
+    return is_admin(user_id)
+
+
+def is_subadmin(user_id: Optional[int]) -> bool:
+    if is_admin(user_id):
+        return True
+    if not user_id:
+        return False
+    try:
+        return bool(supabase("admins", "GET", query=f"?user_id=eq.{user_id}&select=user_id&limit=1"))
+    except Exception:
+        return False
+
+
+def required_channels() -> List[Dict[str, Any]]:
+    try:
+        return supabase("required_channels", "GET", query="?active=eq.true&select=*&order=title")
+    except Exception:
+        return []
+
+
+def user_has_required_access(user_id: Optional[int]) -> bool:
+    if is_subadmin(user_id):
+        return True
+    channels = required_channels()
+    if not channels or not user_id:
+        return True
+    for channel in channels:
+        try:
+            member = telegram("getChatMember", {"chat_id": channel["chat_id"], "user_id": user_id}).get("result", {})
+            if member.get("status") in {"left", "kicked"}:
+                return False
+        except Exception:
+            return False
+    return True
+
+
+def join_markup() -> Dict[str, Any]:
+    rows = []
+    for channel in required_channels():
+        url = channel.get("invite_link") or (f"https://t.me/{channel['username']}" if channel.get("username") else None)
+        if url:
+            rows.append([{"text": f"Join: {channel.get('title', 'Channel')[:30]}", "url": url}])
+    rows.append([{"text": "I Joined - Verify", "callback_data": "verify_join"}])
+    return {"inline_keyboard": rows}
+
+
+def ai_rank(query: str, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not OPENAI_API_KEY or len(rows) < 2:
+        return rows
+    compact = [{"id": r.get("id"), "title": r.get("title"), "keywords": r.get("keywords", "")[:500], "content": r.get("content_text", "")[:700]} for r in rows[:10]]
+    prompt = "Select only the IDs of files that best satisfy the user's request. Return JSON {\\"ids\\":[number]}. Never invent IDs. User: " + query + "\\nFiles: " + json.dumps(compact, ensure_ascii=False)
+    try:
+        result = http_json("https://api.openai.com/v1/chat/completions", "POST", {
+            "model": OPENAI_MODEL,
+            "messages": [{"role": "system", "content": "You rank a private PDF catalog. Output valid JSON only."}, {"role": "user", "content": prompt}],
+            "response_format": {"type": "json_object"},
+            "temperature": 0,
+            "max_completion_tokens": 300,
+        }, {"Authorization": f"Bearer {OPENAI_API_KEY}"})
+        content = result["choices"][0]["message"]["content"]
+        ids = json.loads(content).get("ids", [])
+        by_id = {str(r.get("id")): r for r in rows}
+        ranked = [by_id[str(i)] for i in ids if str(i) in by_id]
+        return ranked or rows
+    except Exception:
+        return rows
 
 
 def clean_text(value: str) -> str:
@@ -185,7 +257,7 @@ def search_books(query: str) -> List[Dict[str, Any]]:
         if score:
             scored.append((score, row))
     scored.sort(key=lambda x: (-x[0], x[1].get("title", "")))
-    return [row for _, row in scored[:10]]
+    return ai_rank(query, [row for _, row in scored[:10]])
 
 
 def send_text(chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None) -> None:
@@ -204,6 +276,10 @@ def set_command_menu() -> None:
         {"command": "channels", "description": "Admin: active channels"},
         {"command": "removechannel", "description": "Admin: channel disable karein"},
         {"command": "stats", "description": "Admin: indexed files count"},
+        {"command": "addadmin", "description": "Owner: sub-admin add karein"},
+        {"command": "removeadmin", "description": "Owner: sub-admin remove karein"},
+        {"command": "requirechannel", "description": "Admin: join channel set karein"},
+        {"command": "requiredchannels", "description": "Admin: join channels list"},
     ]})
 
 
@@ -237,6 +313,10 @@ def deliver_result(chat_id: int, row: Dict[str, Any]) -> None:
             "from_chat_id": row["source_chat_id"],
             "message_id": row["source_message_id"],
         })
+        try:
+            supabase("delivery_logs", "POST", {"user_id": chat_id, "book_id": row.get("id"), "book_title": row.get("title")})
+        except Exception:
+            pass
         return
     except Exception:
         pass
@@ -252,6 +332,10 @@ def handle_private_message(message: Dict[str, Any]) -> None:
     chat_id = message.get("chat", {}).get("id")
     text = (message.get("text") or "").strip()
     if not chat_id:
+        return
+
+    if not user_has_required_access(user.get("id")):
+        send_text(chat_id, "Bot use karne ke liye pehle required channel join karein, phir Verify dabayein.", join_markup())
         return
 
     info = file_info(message)
@@ -283,10 +367,11 @@ def handle_private_message(message: Dict[str, Any]) -> None:
         return
 
     if text.startswith("/start"):
-        send_text(chat_id, "Namaste! Book ka naam, subject ya exam likhkar search karein.\n\nExample: SSC English grammar")
+        menu = {"inline_keyboard": [[{"text": "Search PDF", "callback_data": "user_search"}], [{"text": "Categories", "callback_data": "user_categories"}, {"text": "PDF List", "callback_data": "user_list"}], [{"text": "Help", "callback_data": "user_help"}]]}
+        send_text(chat_id, "Namaste! Book/file ka naam, subject ya exam likhkar search karein.", menu)
         return
     if text.startswith("/help"):
-        send_text(chat_id, "/start - bot start\n/search <keywords> - book search\nAdmin: /addchannel @channelusername")
+        send_text(chat_id, "/search <keywords> - book search\nCategories - category list\nPDF List - available files\nAdmin commands menu se alag dikhengi.")
         return
     if text.startswith("/search"):
         query = text[len("/search"):].strip()
@@ -315,8 +400,42 @@ def handle_admin_command(message: Dict[str, Any]) -> None:
     text = (message.get("text") or "").strip()
     chat_id = message.get("chat", {}).get("id")
     user_id = message.get("from", {}).get("id")
-    if not is_admin(user_id):
+    if not is_subadmin(user_id):
         send_text(chat_id, "Ye admin command hai.")
+        return
+    if text.startswith("/addadmin"):
+        if not is_owner(user_id):
+            send_text(chat_id, "Sirf primary owner sub-admin add kar sakta hai.")
+            return
+        target = text[len("/addadmin"):].strip()
+        if not target.isdigit():
+            send_text(chat_id, "Use: /addadmin TELEGRAM_NUMERIC_ID")
+            return
+        supabase("admins", "POST", {"user_id": int(target), "role": "subadmin"}, "?on_conflict=user_id")
+        send_text(chat_id, "Sub-admin add ho gaya.")
+        return
+    if text.startswith("/removeadmin"):
+        if not is_owner(user_id):
+            send_text(chat_id, "Sirf primary owner sub-admin remove kar sakta hai.")
+            return
+        target = text[len("/removeadmin"):].strip()
+        if target.isdigit():
+            supabase("admins", "DELETE", query=f"?user_id=eq.{target}")
+            send_text(chat_id, "Sub-admin remove ho gaya.")
+        return
+    if text.startswith("/requirechannel"):
+        target = text[len("/requirechannel"):].strip()
+        try:
+            channel = telegram("getChat", {"chat_id": target}).get("result", {})
+            link = f"https://t.me/{channel['username']}" if channel.get("username") else None
+            supabase("required_channels", "POST", {"chat_id": channel["id"], "title": channel.get("title", target), "username": channel.get("username"), "invite_link": link, "active": True}, "?on_conflict=chat_id")
+            send_text(chat_id, "Required join channel save ho gaya.")
+        except Exception as exc:
+            send_text(chat_id, f"Required channel add nahi hua: {str(exc)[:250]}")
+        return
+    if text.startswith("/requiredchannels"):
+        rows = required_channels()
+        send_text(chat_id, "Required channels:\n" + ("\n".join(f"- {r.get('title')}" for r in rows) if rows else "Koi required channel nahi hai."))
         return
     if text.startswith("/addchannel"):
         target = text[len("/addchannel"):].strip()
@@ -392,6 +511,31 @@ def handle_callback(query: Dict[str, Any]) -> None:
     data = query.get("data", "")
     chat_id = query.get("message", {}).get("chat", {}).get("id")
     telegram("answerCallbackQuery", {"callback_query_id": query.get("id")})
+    user_id = query.get("from", {}).get("id")
+    if not is_subadmin(user_id) and not user_has_required_access(user_id):
+        send_text(chat_id, "Pehle required channel join karein.", join_markup())
+        return
+    if data == "verify_join":
+        if user_has_required_access(user_id):
+            send_text(chat_id, "Verified. Ab aap bot use kar sakte hain. /start dabayein.")
+        else:
+            send_text(chat_id, "Abhi required channel join nahi mila. Pehle Join button dabayein, phir Verify karein.", join_markup())
+        return
+    if data == "user_help":
+        send_text(chat_id, "Book, subject, exam ya keyword bhejiye. Bot available indexed files me se result dega.")
+        return
+    if data == "user_categories":
+        rows = supabase("books", "GET", query="?select=title,language&status=eq.indexed&limit=500")
+        langs = sorted({r.get("language") for r in rows if r.get("language")})
+        send_text(chat_id, "Available language/categories metadata:\n" + ("\n".join(f"- {x}" for x in langs) if langs else "Abhi categories indexed nahi hain."))
+        return
+    if data == "user_list":
+        rows = supabase("books", "GET", query="?select=id,title,source_chat_title&status=eq.indexed&order=title&limit=30")
+        send_text(chat_id, "Available PDFs:\n" + ("\n".join(f"- {r.get('title')} ({r.get('source_chat_title', 'source')})" for r in rows) if rows else "Abhi koi file indexed nahi hai."))
+        return
+    if data == "user_search":
+        send_text(chat_id, "Search ke liye book, subject ya exam ka naam bhejiye.")
+        return
     if not data.startswith("book:"):
         return
     book_id = data.split(":", 1)[1]
@@ -428,7 +572,7 @@ def webhook() -> Any:
             handle_group_file(message)
             if file_info(message) and message.get("chat", {}).get("type") in {"group", "supergroup"}:
                 return jsonify({"ok": True})
-            if text.startswith("/") and is_admin(message.get("from", {}).get("id")):
+            if text.startswith("/") and is_subadmin(message.get("from", {}).get("id")):
                 handle_admin_command(message)
             else:
                 handle_private_message(message)
