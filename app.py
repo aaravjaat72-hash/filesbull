@@ -555,7 +555,39 @@ def health() -> Any:
             set_command_menu()
         except Exception:
             pass
-    return jsonify({"ok": True, "service": "telegram-book-bot"})
+    return jsonify({"ok": True, "service": "telegram-book-bot", "status": setup_status()})
+
+
+def setup_status() -> Dict[str, Any]:
+    """Names-only setup check, so a missing Vercel variable or a broken webhook is
+    visible without opening logs. Never returns secret values."""
+    status: Dict[str, Any] = {
+        "env": {
+            "BOT_TOKEN": bool(BOT_TOKEN),
+            "SUPABASE_URL": bool(SUPABASE_URL),
+            "SUPABASE_SERVICE_ROLE_KEY": bool(SUPABASE_KEY),
+            "ADMIN_USER_IDS": bool(ADMIN_USER_IDS),
+            "OPENAI_API_KEY": bool(OPENAI_API_KEY),
+        }
+    }
+    if BOT_TOKEN:
+        try:
+            info = telegram("getWebhookInfo", {}).get("result", {})
+            status["webhook"] = {
+                "url": info.get("url"),
+                "pending_updates": info.get("pending_update_count"),
+                "last_error": info.get("last_error_message"),
+                "last_error_date": info.get("last_error_date"),
+            }
+        except Exception as exc:
+            status["webhook"] = {"error": type(exc).__name__ + ": " + str(exc)[:120].replace(BOT_TOKEN, "***")}
+    if SUPABASE_URL and SUPABASE_KEY:
+        try:
+            supabase("books", "GET", query="?select=id&limit=1")
+            status["database"] = "ok"
+        except Exception as exc:
+            status["database"] = type(exc).__name__ + ": " + str(exc)[:120]
+    return status
 
 
 @app.post("/api/webhook")
