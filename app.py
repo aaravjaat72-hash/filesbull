@@ -4356,6 +4356,8 @@ def userbot_post_in_backup(message: Dict[str, Any]) -> bool:
         if origin.get("type") == "channel" or message.get("forward_from_chat"):
             return True
         st = json.loads(get_setting("ub:state") or "{}")
+        if int(message.get("message_id") or 0) in (st.get("recent_backup") or []):
+            return True      # protected-content re-upload delivered after its report
         return bool(st.get("run")) and time.time() - float(st.get("run_t") or 0) < 1800
     except Exception:
         return False
@@ -10027,7 +10029,11 @@ def ub_done_api() -> Any:
             st["run_saved"] = int(st.get("run_saved") or 0) + 1
             rs = st.setdefault("run_by", {})
             rs[str(src.get("title") or "?")[:40]] = int(rs.get(str(src.get("title") or "?")[:40]) or 0) + 1
-        c["last"] = max(int(c.get("last") or 0), int(src.get("msg") or 0))
+        if res in ("saved", "dup"):
+            c["last"] = max(int(c.get("last") or 0), int(src.get("msg") or 0))
+            recent = st.setdefault("recent_backup", [])
+            recent.append(int(body["backup_msg"]))
+            st["recent_backup"] = recent[-100:]
         c["title"] = str(src.get("title") or c.get("title") or "")[:60]
         c["n"] = int(c.get("n") or 0) + (1 if res == "saved" else 0)
         out["result"] = res

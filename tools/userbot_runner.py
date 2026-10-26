@@ -211,9 +211,16 @@ async def main_async(job):
                         n_new += 1
                         summary["sent"] += 1
                         print(f"sent 1 file ({mode})")
-                        bot.post("/api/userbot-done", {"kind": "file", "backup_msg": bid, "mode": mode,
-                                                       "src": {"id": cid, "title": summary["titles"][str(cid)],
-                                                               "username": getattr(ent, "username", "") or "", "msg": m.id}})
+                        reported = bot.post("/api/userbot-done", {"kind": "file", "backup_msg": bid, "mode": mode,
+                                                              "src": {"id": cid, "title": summary["titles"][str(cid)],
+                                                                      "username": getattr(ent, "username", "") or "", "msg": m.id}})
+                        if reported.get("result") not in ("saved", "dup"):
+                            # Never checkpoint an unindexed file. The forwarded post remains in Backup; next run
+                            # tries this source post again. If the callback was accepted but the reply was lost,
+                            # the DB's file_unique_id catches it as a duplicate.
+                            stop = "Backup post ka bot me save confirm nahi hua, agli baar phir check"
+                            summary["error"] = "Backup me file aayi par bot me save confirm nahi hua; agle run me dobara check"
+                            break
                         await asyncio.sleep(random.uniform(float(gap[0]), float(gap[1])))
                     done_to = max(done_to, m.id)
                 else:
