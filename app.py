@@ -912,10 +912,55 @@ def clear_pending(user_id: int) -> None:
         log_error("clear_pending")
 
 
+PICK_ACTIONS = {"ubinbox": 71, "ubalert": 73, "addsrc": 75, "addreq": 77, "setbackup": 79, "setlog": 81}
+
+
 def ask_input(chat_id: int, user_id: int, action: str, extra: Any = None, prefix: str = "") -> None:
     text, placeholder = PROMPTS[action]
     set_pending(user_id, action, extra)
+    if action in PICK_ACTIONS:
+        ask_pick(chat_id, user_id, action, prefix)
+        return
     send_text(chat_id, prefix + text, {"force_reply": True, "input_field_placeholder": placeholder})
+
+
+def ask_pick(chat_id: int, user_id: int, action: str, prefix: str = "") -> None:
+    """A chat-pick step (📥 Inbox / 🔔 Alert storage ➕, Source / Join channel, Backup, Log): the 👥 Group chuno /
+    📢 Channel chuno keyboard shows ONLY during this step and is removed right after the pick, on cancel/back or on
+    any other message (Aarav 11:17 PM Oct 26: it must never stay stuck under the input box)."""
+    rid = PICK_ACTIONS[action]
+    text, placeholder = PROMPTS[action]
+    send_text(chat_id, prefix + text + "\n\n👇 Niche se group/channel chuno (ya post forward karo)",
+              {"keyboard": [[{"text": "👥 Group chuno", "request_chat": {"request_id": rid, "chat_is_channel": False}}],
+                            [{"text": "📢 Channel chuno", "request_chat": {"request_id": rid + 1, "chat_is_channel": True}}]],
+               "resize_keyboard": True, "one_time_keyboard": True, "input_field_placeholder": placeholder})
+    try:
+        set_setting(f"kb:{user_id}", "1")
+    except Exception:
+        log_error("kb flag")
+
+
+def kb_clear(chat_id: Any, user_id: Any, force: bool = False) -> None:
+    """Remove the bottom reply keyboard (send a ReplyKeyboardRemove and delete that helper message at once).
+    kb:<uid> = "1" while a picker is up; never set before (None) = clear once (the keyboard stuck since 10:2x PM)."""
+    try:
+        v = get_setting(f"kb:{user_id}")
+    except Exception:
+        v = "0"
+    if v == "0" and not force:
+        return
+    try:
+        r = telegram("sendMessage", {"chat_id": chat_id, "text": "⌨️", "reply_markup": {"remove_keyboard": True},
+                                     "disable_notification": True})
+        mid = ((r or {}).get("result") or {}).get("message_id")
+        if mid:
+            telegram("deleteMessage", {"chat_id": chat_id, "message_id": mid})
+    except Exception:
+        log_error("kb_clear")
+    try:
+        set_setting(f"kb:{user_id}", "0")
+    except Exception:
+        pass
 
 
 def prompt_action(message: Dict[str, Any]) -> Optional[str]:
@@ -1337,6 +1382,8 @@ def handle_admin_callback(query: Dict[str, Any], data: str, chat_id: int, user_i
         show(chat_id, ADMIN_PANEL_TEXT, admin_menu(user_id), query, "HTML")
         if get_setting(f"pending:{user_id}"):      # after the screen is up
             clear_pending(user_id)
+        if get_setting(f"kb:{user_id}") == "1":
+            kb_clear(chat_id, user_id, force=True)
     elif cmd == "usermenu":
         show(chat_id, welcome_text(query.get("from"), admin=True), admin_start_menu(), query, "HTML")
     elif cmd in {"addreq", "addsrc", "rename"}:
@@ -4176,6 +4223,8 @@ def handle_private_message(message: Dict[str, Any]) -> None:
         send_text(chat_id, "🔒 API key chat me mat bhejo — maine message hata diya.")
         return
 
+    if is_subadmin(user_id) and message.get("chat", {}).get("type") == "private" and not message.get("chat_shared"):
+        kb_clear(chat_id, user_id)          # the 👥/📢 pick keyboard never stays under the input box
     if is_subadmin(user_id) and message.get("chat", {}).get("type") == "private" and not command:
         # Answer to an admin-panel prompt (reply to the prompt, or the next message after a button).
         action = prompt_action(message)
@@ -4184,8 +4233,18 @@ def handle_private_message(message: Dict[str, Any]) -> None:
         if pending and (action is None or action == pending.get("a")):
             action, extra = pending.get("a"), pending.get("x")
         if action in PROMPTS:
-            handle_admin_input(message, action, extra)
+            shared = message.get("chat_shared") or {}
+            if shared and action not in ("ubinbox", "ubalert") and shared.get("chat_id"):
+                message = dict(message, text=str(shared["chat_id"]))      # 👥/📢 pick = the chat's -100 ID
+            try:
+                handle_admin_input(message, action, extra)
+            finally:
+                if shared:
+                    kb_clear(chat_id, user_id, force=True)
             return
+    if message.get("chat_shared") and is_subadmin(user_id):
+        kb_clear(chat_id, user_id, force=True)   # a pick with no open step: just take the keyboard away
+        return
 
     if gate_blocks(user_id, chat_id):
         return
@@ -7960,6 +8019,9 @@ def aidiag() -> Any:
             oid = min(ADMIN_USER_IDS) if ADMIN_USER_IDS else 0
             q = explicit_search(txt_g)
             loc = None if q else local_admin_intent(txt_g)
+            if loc and loc.get("action") in ("list_files", "users", "report", "status", "categories", "list_channels") and \
+                    re.search(r"\b(skip|roko|rok|pause|resume|chalu|band|hatao|hata|delete|remove|jodo|add|set|badlo|unhide|wapas)\b", txt_g.lower()):
+                loc = None
             out_g: Dict[str, Any] = {"text": txt_g, "search": q, "local": (loc or {}).get("action"), "agent_on": agent_on()}
             if not q and request.args.get("noai") != "1":
                 g = agent_ask_ai(oid, txt_g)
@@ -11479,12 +11541,7 @@ def handle_ub_callback(query: Dict[str, Any], cmd: str, chat_id: int, user_id: i
                   prefix=f"📄 {str(r.get('file_name') or '')[:80]} ({human_size(r.get('file_size'))}, {str(r.get('source_chat_title') or '')[:30]})\n"
                          + (f"Caption: {str(r.get('caption') or '')[:150]}\n" if r.get("caption") else "") + "\n")
     elif cmd in ("ubsetin", "ubsetal"):
-        action = "ubinbox" if cmd == "ubsetin" else "ubalert"
-        set_pending(user_id, action, None)
-        rid = 71 if cmd == "ubsetin" else 73
-        send_text(chat_id, PROMPTS[action][0], {"keyboard": [[{"text": "👥 Group chuno", "request_chat": {"request_id": rid, "chat_is_channel": False}}],
-                                                              [{"text": "📢 Channel chuno", "request_chat": {"request_id": rid + 1, "chat_is_channel": True}}]],
-                                                 "resize_keyboard": True, "one_time_keyboard": True, "input_field_placeholder": PROMPTS[action][1]})
+        ask_input(chat_id, user_id, "ubinbox" if cmd == "ubsetin" else "ubalert")
     elif cmd.startswith("ubst:") or cmd.startswith("ubdl:"):
         kind = "inbox" if cmd.endswith(":in") else "alert"
         show(chat_id, *ub_store_view(kind, delete=cmd.startswith("ubdl:")), query=query, parse_mode="HTML")
@@ -11791,6 +11848,8 @@ def webhook() -> Any:
             command = command_name(text)
             is_private = message.get("chat", {}).get("type") == "private"
             if command and command not in USER_COMMANDS and is_subadmin(message.get("from", {}).get("id")):
+                if is_private:
+                    kb_clear(message["chat"]["id"], message.get("from", {}).get("id"))   # /cancel, /admin … take the pick keyboard away
                 handle_admin_command(message)
             elif is_private or command in USER_COMMANDS:
                 # In groups only answer explicit commands, not every chat message.
@@ -11892,7 +11951,7 @@ AGENT_TOOLS: Dict[str, Dict[str, Any]] = {
     "userbot_resume": {"k": "change", "fn": "ub_toggle", "x": {"what": "live", "on": True}, "own": True, "d": "userbot forward chalu"},
     "backfill_pause": {"k": "change", "fn": "ub_toggle", "x": {"what": "bf", "on": False}, "own": True, "d": "purani files (history) roko"},
     "backfill_resume": {"k": "change", "fn": "ub_toggle", "x": {"what": "bf", "on": True}, "own": True, "d": "purani files chalu"},
-    "backfill_skip": {"k": "change", "fn": "bf_skip", "own": True, "d": "ek channel ki purani files skip / wapas; args.find = channel"},
+    "backfill_skip": {"k": "change", "fn": "bf_skip", "own": True, "d": "ek channel ki purani files skip; args.find = channel; args.on=false = wapas chalu"},
     "unhide_file": {"k": "change", "fn": "unhide", "d": "chhupi file wapas lao; args.find"},
     "search_mode_on": {"k": "change", "act": "search_mode", "x": {"on": True}, "d": "Search Mode ON (har msg search)"},
     "search_mode_off": {"k": "change", "act": "search_mode", "x": {"on": False}, "d": "Search Mode OFF"},
@@ -12091,6 +12150,9 @@ def agent_text(chat_id: int, user: Dict[str, Any], text: str) -> Optional[str]:
     if BIGFIX_RE.search(low) and is_owner(user_id):
         bigfix_view(chat_id, user_id)
         return None
+    if intent and intent.get("action") in ("list_files", "users", "report", "status", "categories", "list_channels") and \
+            re.search(r"\b(skip|roko|rok|pause|resume|chalu|band|hatao|hata|delete|remove|jodo|add|set|badlo|unhide|wapas)\b", low):
+        intent = None                                    # "TOPPER PARTH ki purani files skip kar do" is a job, not a list → AI
     if intent and intent.get("action") in ("delete_file", "rename", "move_category") and intent.get("find") and \
             not has_filters(intent.get("filters") or {}):
         try:
@@ -12241,8 +12303,9 @@ def agent_exec(chat_id: int, user: Dict[str, Any], name: str, args: Dict[str, An
 
 
 def agent_bf_channels() -> List[Dict[str, Any]]:
-    return [{"chat_id": int(cid), "title": str(c.get("title") or cid)} for cid, c in (ub_state().get("ch") or {}).items()
-            if str(cid).lstrip("-").isdigit()]
+    settings_forget("key=eq." + urllib.parse.quote(UB_STATE_KEY))   # fresh read: the toggle below must see the truth
+    return [{"chat_id": int(cid), "title": str(c.get("title") or cid), "skip": bool((c.get("bf") or {}).get("skip"))}
+            for cid, c in (ub_state().get("ch") or {}).items() if str(cid).lstrip("-").isdigit()]
 
 
 def agent_run(chat_id: int, user: Dict[str, Any], name: str, t: Dict[str, Any], x: Dict[str, Any], args: Dict[str, Any],
@@ -12325,6 +12388,10 @@ def agent_run(chat_id: int, user: Dict[str, Any], name: str, t: Dict[str, Any], 
         r = _agent_pick(agent_bf_channels(), find)
         if not r:
             raise InputError(f"\"{find}\" channel nahi mila")
+        want = args.get("on") is not False                   # skip (default) / False = wapas chalu
+        if bool(r.get("skip")) == want:
+            agent_press(chat_id, user_id, "ad:ubbf")
+            return "pehle se waisa hi"
         agent_press(chat_id, user_id, f"ad:ubbfs:{int(r['chat_id'])}")
         return "ho gaya"
     if fn == "unhide":
