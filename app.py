@@ -293,10 +293,25 @@ def add_required_channel(target: str, message: Optional[Dict[str, Any]] = None) 
     return save_required_channel(resolve_chat(message, target))["title"]
 
 
+AUTO_SAVE_OFF = "⚠️ auto-save off (bot admin nahi)"
+AUTO_SAVE_OFF_NOTE = "ℹ️ Bot admin nahi hai — purani/forward ki gayi files chalengi, nayi post apne-aap save nahi hongi"
+
+
+def bot_admin_in(chat_id: Any) -> bool:
+    try:
+        return bot_member(chat_id).get("status") in {"administrator", "creator"}
+    except Exception:
+        return False
+
+
 def add_source_channel(target: str, message: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Save a source channel. Never refused because the bot is not admin: files forwarded from it
+    (and already indexed ones) keep working; only auto-save of NEW posts needs bot admin,
+    because Telegram sends channel posts only to a bot that is admin there."""
     chat = resolve_chat(message, target)
-    ensure_bot_admin(chat)  # Telegram only sends channel posts to a bot that is admin there.
     register_channel(chat)
+    chat = dict(chat)
+    chat["_bot_admin"] = bot_admin_in(chat["id"])
     return chat
 
 
@@ -576,6 +591,11 @@ def chat_check(chat_id: Any) -> str:
         return "❌ " + friendly_tg_error(exc)[:60]
 
 
+def source_check(chat_id: Any) -> str:
+    """Source channels work without bot admin (forwarded/indexed files); only auto-save needs it."""
+    return "✅ auto-save on" if bot_admin_in(chat_id) else AUTO_SAVE_OFF
+
+
 def source_channels() -> List[Dict[str, Any]]:
     return supabase("channels", "GET", query="?select=*&active=eq.true&order=title")
 
@@ -599,7 +619,7 @@ def source_list_view() -> Any:
     lines = ["📋 Source Channels (inki nayi files index hoti hain):"]
     kb = []
     for i, r in enumerate(rows, 1):
-        lines.append(f"{i}. {r.get('title')} ({'@' + r['username'] if r.get('username') else r.get('chat_id')}) — {chat_check(r['chat_id'])}")
+        lines.append(f"{i}. {r.get('title')} ({'@' + r['username'] if r.get('username') else r.get('chat_id')}) — {source_check(r['chat_id'])}")
         kb.append([{"text": f"❌ Hatao: {str(r.get('title'))[:28]}", "callback_data": f"ad:rmsrc:{r['chat_id']}"}])
     if not rows:
         lines.append("Koi source channel nahi hai.")
@@ -674,10 +694,11 @@ def status_text(user_id: Optional[int]) -> str:
     try:
         srcs = source_channels()
         lines.append(f"\nSource channels: {len(srcs)}")
-        for r in srcs:
-            lines.append(f"• {r.get('title')}: {chat_check(r['chat_id'])}")
-        if any(not chat_check(r["chat_id"]).startswith("✅") for r in srcs):
-            lines.append("⚠️ Jahan bot admin nahi hai, us channel ki nayi files index nahi hongi.")
+        checks = [source_check(r["chat_id"]) for r in srcs]
+        for r, ch in zip(srcs, checks):
+            lines.append(f"• {r.get('title')}: {ch}")
+        if any(ch == AUTO_SAVE_OFF for ch in checks):
+            lines.append("ℹ️ Auto-save off wale channels ki files forward karke save karo, ya bot ko admin banao. Purani files chalti rahengi.")
     except Exception as exc:
         lines.append(f"\nSource channels: error {str(exc)[:80]}")
     lines.append(f"Backup: {'ON' if get_setting('backup_chat_id') else 'OFF'} | Log chat: {'ON' if get_setting('log_chat_id') else 'OFF'}")
@@ -731,8 +752,21 @@ def handle_admin_input(message: Dict[str, Any], action: str, extra: Any) -> None
         elif action == "addsrc":
             chat = add_source_channel(text, message)
             clear_pending(user_id)
-            send_text(chat_id, f"✅ Source channel jud gaya: {chat.get('title')}\nAb is channel me aane wali nayi files index hongi.\n"
-                               "Purani files ke liye unhe bot ko forward karo.",
+            if chat.get("_bot_admin"):
+                note = "Ab is channel me aane wali nayi files apne-aap save hongi.\nPurani files ke liye unhe bot ko forward karo."
+            else:
+                note = AUTO_SAVE_OFF_NOTE + ".\nNayi files bhi bot ko forward kar doge to save ho jayengi."
+            info = file_info(message)
+            src = forwarded_source(message)
+            if info and src:
+                # The admin forwarded a file post as the answer: index that file too.
+                record = build_metadata(message, src)
+                if src.get("message_id"):
+                    record["source_message_id"] = src["message_id"]
+                    record["source_link"] = message_link(src, src["message_id"])
+                upsert_item(record)
+                note += f"\n📄 Ye file bhi save ho gayi: {clean_text(info.get('file_name', 'file'))}"
+            send_text(chat_id, f"✅ Source channel jud gaya: {chat.get('title')}\n{note}",
                       {"inline_keyboard": [[{"text": "📋 Source Channels", "callback_data": "ad:srclist"}], BACK_ROW]})
         elif action == "setbackup":
             chat = resolve_chat(message, text)
@@ -1171,6 +1205,15 @@ def deliver_result(chat_id: int, row: Dict[str, Any]) -> None:
     except Exception:
         log_error("copyMessage")
     try:
+        # Public source channel the bot is not a member of: a plain forward can still work.
+        if row.get("source_chat_id") and row.get("source_message_id"):
+            telegram("forwardMessage", {"chat_id": chat_id, "from_chat_id": row["source_chat_id"],
+                                        "message_id": row["source_message_id"]})
+            log_delivery(chat_id, row)
+            return
+    except Exception:
+        log_error("forwardMessage")
+    try:
         if row.get("backup_chat_id") and row.get("backup_message_id"):
             telegram("copyMessage", {"chat_id": chat_id, "from_chat_id": row["backup_chat_id"], "message_id": row["backup_message_id"]})
             log_delivery(chat_id, row)
@@ -1573,10 +1616,14 @@ def diagnostics() -> Dict[str, Any]:
     try:
         srcs = source_channels()
         d["source_channels"] = len(srcs)
-        not_admin = [r.get("title") for r in srcs if not chat_check(r["chat_id"]).startswith("✅")]
+        not_admin = [r.get("title") for r in srcs if not bot_admin_in(r["chat_id"])]
         d["source_channels_bot_admin"] = len(srcs) - len(not_admin)
-        # New posts are only delivered to the bot (and indexed) where it is admin.
+        # Not an error: these work for forwarded/already-indexed files; only auto-save of new
+        # posts needs the bot to be admin (Telegram sends channel posts only to admins).
         d["source_channels_bot_not_admin"] = not_admin
+        d["source_channels_status"] = [{"title": r.get("title"),
+                                        "auto_save": "on" if r.get("title") not in not_admin else AUTO_SAVE_OFF}
+                                       for r in srcs]
     except Exception as exc:
         d["source_channels"] = "error: " + str(exc)[:60]
     d["backup_channel_set"] = bool(get_setting("backup_chat_id"))
