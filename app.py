@@ -380,6 +380,25 @@ def forwarded_source(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return message.get("forward_from_chat") or None
 
 
+def log_delivery(chat_id: int, row: Dict[str, Any]) -> None:
+    try:
+        supabase("delivery_logs", "POST", {"user_id": chat_id, "book_id": row.get("id"), "book_title": row.get("title")})
+    except Exception:
+        log_error("delivery_log")
+    audit_log(f"PDF sent\nUser: {chat_id}\nFile: {row.get('title')}\nSource: {row.get('source_chat_title', 'unknown')}")
+
+
+def send_by_file_id(chat_id: int, row: Dict[str, Any]) -> None:
+    # Works even if the source post was deleted or the bot lost access to the channel.
+    mime = (row.get("mime_type") or "").lower()
+    method, field = "sendDocument", "document"
+    if mime.startswith("video/"):
+        method, field = "sendVideo", "video"
+    elif mime.startswith("audio/"):
+        method, field = "sendAudio", "audio"
+    telegram(method, {"chat_id": chat_id, field: row["telegram_file_id"], "caption": (row.get("title") or "")[:1000]})
+
+
 def deliver_result(chat_id: int, row: Dict[str, Any]) -> None:
     try:
         # copyMessage works for both public and private source channels when permitted.
@@ -388,20 +407,24 @@ def deliver_result(chat_id: int, row: Dict[str, Any]) -> None:
             "from_chat_id": row["source_chat_id"],
             "message_id": row["source_message_id"],
         })
-        try:
-            supabase("delivery_logs", "POST", {"user_id": chat_id, "book_id": row.get("id"), "book_title": row.get("title")})
-            audit_log(f"PDF sent\nUser: {chat_id}\nFile: {row.get('title')}\nSource: {row.get('source_chat_title', 'unknown')}")
-        except Exception:
-            pass
+        log_delivery(chat_id, row)
         return
     except Exception:
-        pass
+        log_error("copyMessage")
     try:
         if row.get("backup_chat_id") and row.get("backup_message_id"):
             telegram("copyMessage", {"chat_id": chat_id, "from_chat_id": row["backup_chat_id"], "message_id": row["backup_message_id"]})
+            log_delivery(chat_id, row)
             return
     except Exception:
-        pass
+        log_error("backup copyMessage")
+    try:
+        if row.get("telegram_file_id"):
+            send_by_file_id(chat_id, row)
+            log_delivery(chat_id, row)
+            return
+    except Exception:
+        log_error("send by file_id")
     link = row.get("source_link")
     if link:
         send_text(chat_id, f"File direct send nahi ho payi. Source channel link:\n{link}")
@@ -644,7 +667,11 @@ def handle_group_file(message: Dict[str, Any]) -> None:
 def handle_callback(query: Dict[str, Any]) -> None:
     data = query.get("data", "")
     chat_id = query.get("message", {}).get("chat", {}).get("id")
-    telegram("answerCallbackQuery", {"callback_query_id": query.get("id")})
+    try:
+        telegram("answerCallbackQuery", {"callback_query_id": query.get("id")})
+    except Exception:
+        # An expired callback must not stop the button from working.
+        log_error("answerCallbackQuery")
     user_id = query.get("from", {}).get("id")
     if not is_subadmin(user_id) and not user_has_required_access(user_id):
         send_text(chat_id, "Pehle required channel join karein.", join_markup())
