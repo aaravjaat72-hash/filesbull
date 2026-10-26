@@ -1554,16 +1554,74 @@ def fail_reason(exc: Exception) -> str:
     return "invalid" if ("http 401" in low or "http 403" in low or "invalid api key" in low) else "limit"
 
 
+# Which chat models a Groq key may use. Groq retires / gates models over time (Oct 26 2026 live: the
+# llama-3.1-8b-instant and llama-3.3-70b-versatile ids answered 404 model_not_found for Aarav's key
+# while /models said the key is fine), so the list comes from the key's own free /models answer.
+GROQ_PREFER = ["llama-3.1-8b-instant", "openai/gpt-oss-20b", "meta-llama/llama-4-scout-17b-16e-instruct",
+               "llama-3.3-70b-versatile", "openai/gpt-oss-120b", "qwen/qwen3-32b",
+               "meta-llama/llama-4-maverick-17b-128e-instruct", "moonshotai/kimi-k2-instruct", "gemma2-9b-it"]
+_GMODELS: Dict[str, Any] = {}
+NON_CHAT = ("whisper", "tts", "guard", "embed", "playai", "orpheus", "distil", "compound", "allam", "prompt", "safeguard")
+
+
+def _model_rank(mid: str) -> tuple:
+    low = mid.lower()
+    if mid in GROQ_PREFER:
+        return (0, GROQ_PREFER.index(mid))
+    size = re.search(r"(\d+)b", low)
+    return (1, int(size.group(1)) if size else 999, low)
+
+
+def groq_models(key: str) -> List[str]:
+    """Usable chat model ids for this key, best first (GROQ_MODEL env first). Cached 6 h in memory + bot_settings."""
+    kid = key_id(key)
+    hit = _GMODELS.get(kid)
+    if hit and time.time() - hit[0] < 6 * 3600:
+        ids = hit[1]
+    else:
+        ids = []
+        raw = get_setting(f"aimodels:{kid}") or ""
+        ts, _, lst = raw.partition("|")
+        if lst and ts.isdigit() and time.time() - int(ts) < 6 * 3600:
+            ids = [x for x in lst.split(",") if x]
+        else:
+            try:
+                res = http_json("https://api.groq.com/openai/v1/models", "GET", None,
+                                {"Authorization": f"Bearer {key}"}, timeout=4)
+                ids = [str(m.get("id")) for m in (res.get("data") or [])
+                       if m.get("id") and m.get("active", True) is not False
+                       and not any(x in str(m.get("id")).lower() for x in NON_CHAT)]
+                ids = sorted(dict.fromkeys(ids), key=_model_rank)[:6]
+                if ids:
+                    set_setting(f"aimodels:{kid}", f"{int(time.time())}|{','.join(ids)}")
+            except Exception:
+                ids = []
+        if not ids:
+            ids = list(GROQ_PREFER[:3])
+        _GMODELS[kid] = (time.time(), ids)
+    return [m for m in dict.fromkeys([GROQ_MODEL] + ids) if m][:4]
+
+
+def drop_groq_model(key: str, model: str) -> None:
+    """A model id this key cannot use: forget it so the next call goes straight to a working one."""
+    kid = key_id(key)
+    ids = [m for m in groq_models(key) if m != model and m != GROQ_MODEL]
+    _GMODELS[kid] = (time.time(), ids or [m for m in GROQ_PREFER if m != model][:3])
+    try:
+        set_setting(f"aimodels:{kid}", f"{int(time.time())}|{','.join(_GMODELS[kid][1])}")
+    except Exception:
+        log_error("drop_groq_model")
+
+
 def ai_complete(system: str, user_text: str, max_tokens: int = 150, cap: float = 9.0) -> Optional[str]:
     messages = [{"role": "system", "content": system}, {"role": "user", "content": user_text}]
-    models = [m for m in dict.fromkeys([GROQ_MODEL, "llama-3.1-8b-instant", "llama-3.3-70b-versatile"]) if m]
     pool = groq_pool()
     usable = [k for k in pool if not key_cooling(k)] or pool
     # One overall time cap, however many keys there are: the webhook must answer Telegram fast,
     # or Telegram retries with growing pauses and the bot looks dead.
     deadline = time.time() + max(2.0, min(9.0, cap))
     for n, key in enumerate(usable):
-        for model in models:
+        for model in groq_models(key):
             if time.time() > deadline - 1:
                 return None
             try:
@@ -1574,8 +1632,11 @@ def ai_complete(system: str, user_text: str, max_tokens: int = 150, cap: float =
                 return res["choices"][0]["message"]["content"]
             except Exception as exc:
                 low = str(exc).lower()
-                if "model" in low and any(x in low for x in ("not found", "decommission", "does not exist", "not supported")):
+                if "model" in low and any(x in low for x in ("not found", "decommission", "does not exist", "not supported", "no access")):
+                    drop_groq_model(key, model)
                     continue   # same key, next model
+                if "json_validate_failed" in low or "failed_generation" in low or "response_format" in low:
+                    continue   # the model's JSON came out broken: try the next model, the key is fine
                 print(f"[filesbull] groq key {n + 1} ({mask_key(key)}) error: {str(exc)[:160].replace(key, '***')}", flush=True)
                 # 429 limit / 401-403 bad key / 5xx / timeout: skip this key for a while, try the next one now.
                 m = re.search(r"try again in (\d+)m", low)
@@ -3934,10 +3995,16 @@ def _err_class(exc: Exception, key: str = "") -> str:
 def ai_probe(json_mode: bool = True) -> Dict[str, Any]:
     """One tiny real AI call per key (first working model). Status codes / model names only."""
     out: Dict[str, Any] = {"provider": ai_provider() or "none", "keys": []}
-    models = [m for m in dict.fromkeys([GROQ_MODEL, "llama-3.1-8b-instant", "llama-3.3-70b-versatile"]) if m]
     for n, key in enumerate(groq_pool(), 1):
         row: Dict[str, Any] = {"key": f"groq #{n}", "cooling": key_state(key) or "no", "tries": []}
-        for model in models:
+        try:
+            lst = http_json("https://api.groq.com/openai/v1/models", "GET", None, {"Authorization": f"Bearer {key}"}, timeout=5)
+            row["models_listed"] = sorted(str(m.get("id")) for m in (lst.get("data") or []))
+        except Exception as exc:
+            row["models_listed"] = _err_class(exc, key)
+        _GMODELS.pop(key_id(key), None)
+        row["models_picked"] = groq_models(key)
+        for model in row["models_picked"]:
             t0 = time.monotonic()
             body: Dict[str, Any] = {"model": model, "max_tokens": 20, "temperature": 0,
                                     "messages": [{"role": "system", "content": "Reply ONLY with JSON {\"ok\":true}."},
