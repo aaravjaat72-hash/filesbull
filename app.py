@@ -4370,6 +4370,9 @@ def title_supported2(title: str, source: str) -> bool:
     return True
 
 
+_LAST_NAME_RAW = [""]
+
+
 def ai_name_items(items: List[Dict[str, Any]], cap: float = 9.0, excerpt_chars: int = 1500) -> Optional[Dict[int, Dict[str, str]]]:
     """items [{"i","caption","file","text"}] -> {i: {"title","subject"}} (guarded). None = the AI call itself failed."""
     payload = [{"i": x["i"], "file": str(x.get("file") or "")[:150],
@@ -4377,6 +4380,7 @@ def ai_name_items(items: List[Dict[str, Any]], cap: float = 9.0, excerpt_chars: 
                 "text": re.sub(r"\s+", " ", str(x.get("text") or ""))[:excerpt_chars]} for x in items]
     content = ai_complete(AI_NAME2_SYSTEM, json.dumps(payload, ensure_ascii=False),
                           max_tokens=min(2000, 80 + 60 * len(items)), cap=cap)
+    _LAST_NAME_RAW[0] = (content or "")[:1500]
     if not content:
         return None
     try:
@@ -4736,6 +4740,7 @@ def naming_diag(ids: str = "") -> Dict[str, Any]:
     t0 = time.monotonic()
     got = ai_name_items(samples, cap=9)
     return {"ms": int((time.monotonic() - t0) * 1000), "result": got if got is not None else "AI call failed",
+            "raw": _LAST_NAME_RAW[0],
             "files": [s["file"] for s in samples]}
 
 
