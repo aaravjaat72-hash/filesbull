@@ -630,6 +630,7 @@ def add_source_channel(target: str, message: Optional[Dict[str, Any]] = None) ->
             return {"id": None, "title": "Private channel (link)", "_bot_admin": False, "_pending": True,
                     "_ub": "👤 Bot is link ko khud nahi khol sakta. Userbot 1–2 min me is link se join karke channel jod dega, phir nayi + purani files Inbox me aayengi."}
         raise
+    role_guard(chat, "source")          # never a Backup / Log / Inbox / Alert chat as a source
     register_channel(chat)
     chat = dict(chat)
     chat["_bot_admin"] = bot_admin_in(chat["id"])
@@ -1229,6 +1230,7 @@ def handle_admin_input(message: Dict[str, Any], action: str, extra: Any) -> None
                                "Accept karte hi file Backup me settle ho jayegi.", accept_kb(token))
         elif action == "setbackup":
             chat = resolve_chat(message, text)
+            role_guard(chat, "backup")
             member = ensure_bot_admin(chat)
             if chat.get("type") == "channel" and member.get("status") == "administrator" and member.get("can_post_messages") is False:
                 raise InputError(f"Bot \"{chat.get('title', 'channel')}\" me admin hai par \"Post Messages\" permission off hai. Use on karke dobara bhejo.")
@@ -1252,6 +1254,7 @@ def handle_admin_input(message: Dict[str, Any], action: str, extra: Any) -> None
                 chat = {"id": chat_id, "title": "Ye chat"}
             else:
                 chat = resolve_chat(message, text)
+            role_guard(chat, "log")
             try:
                 telegram("sendMessage", {"chat_id": chat["id"], "text": "✅ filesbull log chat set ho gaya. Yahan logs aayenge."})
             except Exception as exc:
@@ -9712,9 +9715,60 @@ def ub_dispatch(why: str = "") -> str:
         return _scrub(f"error: {type(exc).__name__}")[:160]
 
 
+CHAT_ROLE_NAMES = {"backup": "💾 Backup channel", "log": "📜 Log Chat", "inbox": "📥 Userbot Inbox storage",
+                   "alert": "🔔 Userbot Alert storage", "source": "📡 Source channel"}
+
+
+def chat_roles(cid: Any) -> List[str]:
+    """Every role this chat has today (Aarav 10:46 PM: Inbox / Alert / Backup / Log / Source must never mix)."""
+    s = str(cid)
+    out = []
+    if s == str(get_setting("backup_chat_id") or ""):
+        out.append("backup")
+    if s == str(get_setting("log_chat_id") or ""):
+        out.append("log")
+    try:
+        if int(cid) in ub_chat_ids("inbox"):
+            out.append("inbox")
+        if int(cid) in ub_chat_ids("alert"):
+            out.append("alert")
+    except (TypeError, ValueError):
+        pass
+    try:
+        if any(str(r.get("chat_id")) == s for r in source_channels()):
+            out.append("source")
+    except Exception:
+        log_error("chat roles")
+    return out
+
+
+def role_guard(chat: Dict[str, Any], role: str) -> None:
+    """One chat = one job. Refuse to give a chat a second role, with a clear message."""
+    other = [r for r in chat_roles(chat.get("id")) if r != role and not (role in ("backup", "log") and r == "source")]
+    if other:
+        title = str(chat.get("title") or chat.get("id"))[:50]
+        raise InputError(f"\"{title}\" pehle se {CHAT_ROLE_NAMES[other[0]]} hai. Ek chat ka ek hi kaam hota hai "
+                         f"({CHAT_ROLE_NAMES[role]} ke liye alag chat chuno, ya pehle use wahan se hatao).")
+
+
+def role_overlaps() -> Dict[str, List[str]]:
+    """{chat: [roles]} for every chat that has more than one role right now (health / diag)."""
+    ids = {str(get_setting("backup_chat_id") or ""), str(get_setting("log_chat_id") or "")}
+    ids |= {str(v) for v in ub_chat_ids("inbox") + ub_chat_ids("alert")}
+    ids.discard("")
+    out = {}
+    for cid in ids:
+        rs_ = chat_roles(cid)
+        if len(rs_) > 1:
+            out[cid] = rs_
+    return out
+
+
 def ub_sources() -> List[Dict[str, Any]]:
-    """Active source channels where the bot is NOT admin (those the bot can't read itself). Never the Backup/Log chat."""
+    """Active source channels where the bot is NOT admin (those the bot can't read itself). Never the Backup / Log chat,
+    nor a userbot Inbox / Alert chat."""
     skip = {str(get_setting("backup_chat_id") or ""), str(get_setting("log_chat_id") or "")}
+    skip |= {str(v) for v in ub_chat_ids("inbox") + ub_chat_ids("alert")}
     rows = [r for r in source_channels() if str(r.get("chat_id")) not in skip]
     admin = par(*[(lambda cid=r["chat_id"]: bot_admin_in(cid)) for r in rows]) if rows else []
     return [r for r, a in zip(rows, admin) if a is not True]
@@ -10901,6 +10955,7 @@ def _ub_done(body: Dict[str, Any], st: Dict[str, Any]) -> Any:
                 (st.get("ibchk") or {}).pop(str(cid), None)
         for cid in (body.get("ibok") or []):
             ibad.pop(str(cid), None)
+            (st.get("ibfix") or {}).pop(str(cid), None)
         for cid in (body.get("ibjoined") or [])[:4]:      # joined through the invite link → make it admin in a channel now
             if ub_is_inbox(cid):
                 try:
@@ -11114,7 +11169,8 @@ def ub_store_view(kind: str, note: str = "", delete: bool = False) -> Any:
     ibad = st.get("ibad") or {}
     for i, c in enumerate(lst[:20], 1):
         hl = ub_chat_health(c["id"], me_id, kind == "inbox") if i <= 8 else ""
-        extra = f" · ⚠️ {esc(ibad[str(c['id'])])}" if kind == "inbox" and str(c["id"]) in ibad else ""
+        fix = (st.get("ibfix") or {}).get(str(c["id"])) if kind == "inbox" else None
+        extra = (f"\n   ⚠️ {esc(fix)}" if fix else (f" · ⚠️ {esc(ibad[str(c['id'])])}" if kind == "inbox" and str(c["id"]) in ibad else ""))
         first = " · ⭐ abhi yahi use ho raha" if kind == "inbox" and i == 1 and len(lst) > 1 else ""
         lines.append(f"{i}. {esc(c['title'])} {hl}{extra}{first}".rstrip())
     if not lst:
@@ -11403,9 +11459,7 @@ def ub_pick_chat(message: Dict[str, Any], kind: str) -> Dict[str, Any]:
     member = ensure_bot_admin(chat)
     if chat.get("type") == "channel" and member.get("status") == "administrator" and member.get("can_post_messages") is False:
         raise InputError(f"Bot \"{chat.get('title', 'channel')}\" me admin hai par \"Post Messages\" permission off hai.")
-    if str(chat["id"]) in (str(get_setting("backup_chat_id") or ""), str(get_setting("log_chat_id") or "")) or \
-            int(chat["id"]) in ub_chat_ids("inbox" if kind == "alert" else "alert"):
-        raise InputError("Ye Backup / Log / dusra userbot group hai — iske liye alag group chahiye.")
+    role_guard(chat, kind)
     if int(chat["id"]) in ub_chat_ids(kind):
         raise InputError(f"\"{chat.get('title') or chat['id']}\" pehle se {'📥 Inbox storage' if kind == 'inbox' else '🔔 Alert storage'} me hai.")
     ub_member = None
@@ -11445,6 +11499,11 @@ def ub_apply_chat(kind: str, cid: int, title: str) -> str:
     return note
 
 
+def ub_who(st: Dict[str, Any]) -> str:
+    me = st.get("me") or {}
+    return ("@" + me["username"]) if me.get("username") else (me.get("name") or "dusra account")
+
+
 def ub_inbox_access(st: Dict[str, Any], cid: int, title: str = "") -> str:
     """Make sure the userbot account can post in an Inbox chat: not a member → the bot's invite link (the runner joins);
     a channel member without post rights → the bot promotes it (needs 'Add admins'). Returns a note ('' = fine)."""
@@ -11459,12 +11518,16 @@ def ub_inbox_access(st: Dict[str, Any], cid: int, title: str = "") -> str:
     status = res.get("status")
     if status == "creator" or (status == "administrator" and res.get("can_post_messages") is not False):
         links.pop(str(cid), None)
+        (st.get("ibfix") or {}).pop(str(cid), None)
         return ""
     ctype = ""
     try:
         ctype = str(telegram("getChat", {"chat_id": int(cid)}).get("result", {}).get("type") or "")
     except Exception:
         ctype = ""
+    who = ub_who(st)
+    fixes = st.setdefault("ibfix", {})
+    fixes.pop(str(cid), None)
     if status in ("member", "restricted", "administrator"):
         links.pop(str(cid), None)
         if ctype != "channel":
@@ -11472,9 +11535,10 @@ def ub_inbox_access(st: Dict[str, Any], cid: int, title: str = "") -> str:
         try:
             telegram("promoteChatMember", {"chat_id": int(cid), "user_id": me_id, "can_post_messages": True,
                                            "can_edit_messages": True, "can_delete_messages": False})
-            return "👤 Userbot account ko is channel me admin (post) bana diya."
+            return f"👤 Userbot account ({who}) ko is channel me admin (post) bana diya."
         except Exception:
-            return "⚠️ Userbot account ko is channel me ADMIN banao (Post Messages on) — tabhi wo files daal payega."
+            fixes[str(cid)] = f"userbot account ({who}) ko is channel me admin banao, post ka haq do"
+            return "⚠️ " + fixes[str(cid)]
     link = None
     try:
         link = make_join_link({"id": int(cid)})
@@ -11484,7 +11548,8 @@ def ub_inbox_access(st: Dict[str, Any], cid: int, title: str = "") -> str:
         links[str(cid)] = link
         return ("👤 Userbot account abhi yahan nahi hai — agle run me invite link se khud join karega"
                 + (", phir bot use admin banayega." if ctype == "channel" else "."))
-    return "⚠️ Userbot account ko bhi yahan add karo" + (" aur ADMIN banao (post)." if ctype == "channel" else ".")
+    fixes[str(cid)] = f"userbot account ({who}) ko yahan add karo" + (", admin banao, post ka haq do" if ctype == "channel" else "")
+    return "⚠️ " + fixes[str(cid)]
 
 
 def ub_remove_chat(kind: str, cid: int) -> bool:
@@ -11505,6 +11570,20 @@ def ub_remove_chat(kind: str, cid: int) -> bool:
     ub_save_state(st)
     audit_log(f"🗑️ Userbot {'Inbox storage' if kind == 'inbox' else 'Alert storage'} se hataya: {title[:60]} · {ist_now()}")
     return True
+
+
+def ub_overlap_titles() -> Dict[str, List[str]]:
+    try:
+        ov = role_overlaps()
+    except Exception:
+        log_error("role overlaps")
+        return {}
+    names: Dict[str, str] = {}
+    st = ub_state()
+    for kind in ("inbox", "alert"):
+        for c in ub_chat_list(kind, st):
+            names[str(c["id"])] = c["title"]
+    return {names.get(cid, "chat " + cid[-4:]): v for cid, v in ov.items()}
 
 
 def ub_health_info() -> Dict[str, Any]:
@@ -11537,6 +11616,7 @@ def ub_health_info() -> Dict[str, Any]:
                             for c in ub_chat_list("inbox", st)],
             "alert_chats": [c["title"] for c in ub_chat_list("alert", st)],
             "inbox_count": len(ub_chat_ids("inbox")), "alert_count": len(ub_chat_ids("alert")),
+            "role_overlaps": ub_overlap_titles(),
             "counts": {"inbox": sc["inbox"], "review": sc["review"], "settled": int(cnt.get("settled") or 0),
                        "dupes_skipped": int(cnt.get("dup") or 0)},
             "cap": ub_cap(), "backfill": {"paused": ub_bf_paused(), "channels": bfo},
