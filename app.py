@@ -295,7 +295,6 @@ def upsert_item(record: Dict[str, Any]) -> None:
 
 
 def search_books(query: str) -> List[Dict[str, Any]]:
-    rows = supabase("books", "GET", query="?select=*&status=eq.indexed&limit=500")
     raw_terms = [normalize(x) for x in re.findall(r"[\w\u0900-\u097F]+", query) if len(x) > 1]
     aliases = {
         "eco": {"eco", "economy", "economic", "economics"},
@@ -306,15 +305,29 @@ def search_books(query: str) -> List[Dict[str, Any]]:
     terms = set(raw_terms)
     for term in raw_terms:
         terms.update(aliases.get(term, set()))
+    if not terms:
+        return []
+    # Let Supabase pre-filter matching rows instead of downloading the first 500 full rows
+    # (with up to 120 KB of PDF text each) on every search. Books past the first 500 were
+    # never searchable before.
+    words = sorted({w for term in terms for w in term.split() if len(w) > 1})[:12]
+    if not words:
+        return []
+    filters = ",".join(f"{col}.ilike.*{word}*" for word in words
+                       for col in ("title", "caption", "keywords", "content_text", "source_chat_title"))
+    rows = supabase("books", "GET", query=(
+        "?select=id,title,caption,keywords,content_text,source_chat_title"
+        "&status=eq.indexed&limit=200&or=" + urllib.parse.quote(f"({filters})", safe="(),.*")
+    ))
     scored = []
     for row in rows:
-        haystack = normalize(" ".join(str(row.get(k, "")) for k in ("title", "caption", "keywords", "content_text", "source_chat_title")))
+        haystack = normalize(" ".join(str(row.get(k) or "") for k in ("title", "caption", "keywords", "content_text", "source_chat_title")))
         score = sum(1 for term in terms if term in haystack)
         if row.get("content_text") and any(term in normalize(row["content_text"]) for term in raw_terms):
             score += 3
         if score:
             scored.append((score, row))
-    scored.sort(key=lambda x: (-x[0], x[1].get("title", "")))
+    scored.sort(key=lambda x: (-x[0], x[1].get("title") or ""))
     return ai_rank(query, [row for _, row in scored[:10]])
 
 
