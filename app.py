@@ -5,6 +5,7 @@ import io
 import os
 import re
 import traceback
+import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional
@@ -49,8 +50,18 @@ def http_json(url: str, method: str = "GET", payload: Optional[Dict[str, Any]] =
     if payload is not None:
         body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=body, headers=final_headers, method=method)
-    with urllib.request.urlopen(req, timeout=20) as response:
-        return json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=20) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        # Surface the API's own reason (e.g. Telegram "Bad Request: chat not found",
+        # Supabase "column ... does not exist") instead of a bare "HTTP Error 400".
+        try:
+            detail = json.loads(exc.read().decode("utf-8", "replace"))
+            reason = detail.get("description") or detail.get("message") or detail.get("error") or str(detail)
+        except Exception:
+            reason = exc.reason
+        raise RuntimeError(f"HTTP {exc.code}: {str(reason)[:300]}") from None
 
 
 def telegram(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -160,22 +171,32 @@ def join_markup() -> Dict[str, Any]:
 def ai_rank(query: str, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not OPENAI_API_KEY or len(rows) < 2:
         return rows
-    compact = [{"id": r.get("id"), "title": r.get("title"), "keywords": r.get("keywords", "")[:500], "content": r.get("content_text", "")[:700]} for r in rows[:10]]
+    # Old rows can have NULL keywords/content_text; `or ""` avoids a crash that made every
+    # search reply "Database abhi available nahi hai" once OPENAI_API_KEY is set.
+    compact = [{"id": r.get("id"), "title": r.get("title"), "keywords": (r.get("keywords") or "")[:500], "content": (r.get("content_text") or "")[:700]} for r in rows[:10]]
     prompt = "Select only the IDs of files that best satisfy the user's request. Return JSON with an ids array of numbers. Never invent IDs. User: " + query + "\nFiles: " + json.dumps(compact, ensure_ascii=False)
+    body: Dict[str, Any] = {
+        "model": OPENAI_MODEL,
+        "messages": [{"role": "system", "content": "You rank a private PDF catalog. Output valid JSON only."}, {"role": "user", "content": prompt}],
+        "response_format": {"type": "json_object"},
+        "max_completion_tokens": 300,
+    }
+    if OPENAI_MODEL.startswith(("gpt-5", "o1", "o3", "o4")):
+        # Reasoning models reject temperature=0 and spend tokens on reasoning first.
+        body["reasoning_effort"] = "minimal" if OPENAI_MODEL.startswith("gpt-5") else "low"
+        body["max_completion_tokens"] = 2000
+    else:
+        body["temperature"] = 0
     try:
-        result = http_json("https://api.openai.com/v1/chat/completions", "POST", {
-            "model": OPENAI_MODEL,
-            "messages": [{"role": "system", "content": "You rank a private PDF catalog. Output valid JSON only."}, {"role": "user", "content": prompt}],
-            "response_format": {"type": "json_object"},
-            "temperature": 0,
-            "max_completion_tokens": 300,
-        }, {"Authorization": f"Bearer {OPENAI_API_KEY}"})
+        result = http_json("https://api.openai.com/v1/chat/completions", "POST", body,
+                           {"Authorization": f"Bearer {OPENAI_API_KEY}"})
         content = result["choices"][0]["message"]["content"]
         ids = json.loads(content).get("ids", [])
         by_id = {str(r.get("id")): r for r in rows}
         ranked = [by_id[str(i)] for i in ids if str(i) in by_id]
         return ranked or rows
     except Exception:
+        log_error("ai_rank")
         return rows
 
 
@@ -285,7 +306,6 @@ def upsert_item(record: Dict[str, Any]) -> None:
 
 
 def search_books(query: str) -> List[Dict[str, Any]]:
-    rows = supabase("books", "GET", query="?select=*&status=eq.indexed&limit=500")
     raw_terms = [normalize(x) for x in re.findall(r"[\w\u0900-\u097F]+", query) if len(x) > 1]
     aliases = {
         "eco": {"eco", "economy", "economic", "economics"},
@@ -296,15 +316,29 @@ def search_books(query: str) -> List[Dict[str, Any]]:
     terms = set(raw_terms)
     for term in raw_terms:
         terms.update(aliases.get(term, set()))
+    if not terms:
+        return []
+    # Let Supabase pre-filter matching rows instead of downloading the first 500 full rows
+    # (with up to 120 KB of PDF text each) on every search. Books past the first 500 were
+    # never searchable before.
+    words = sorted({w for term in terms for w in term.split() if len(w) > 1})[:12]
+    if not words:
+        return []
+    filters = ",".join(f"{col}.ilike.*{word}*" for word in words
+                       for col in ("title", "caption", "keywords", "content_text", "source_chat_title"))
+    rows = supabase("books", "GET", query=(
+        "?select=id,title,caption,keywords,content_text,source_chat_title"
+        "&status=eq.indexed&limit=200&or=" + urllib.parse.quote(f"({filters})", safe="(),.*")
+    ))
     scored = []
     for row in rows:
-        haystack = normalize(" ".join(str(row.get(k, "")) for k in ("title", "caption", "keywords", "content_text", "source_chat_title")))
+        haystack = normalize(" ".join(str(row.get(k) or "") for k in ("title", "caption", "keywords", "content_text", "source_chat_title")))
         score = sum(1 for term in terms if term in haystack)
         if row.get("content_text") and any(term in normalize(row["content_text"]) for term in raw_terms):
             score += 3
         if score:
             scored.append((score, row))
-    scored.sort(key=lambda x: (-x[0], x[1].get("title", "")))
+    scored.sort(key=lambda x: (-x[0], x[1].get("title") or ""))
     return ai_rank(query, [row for _, row in scored[:10]])
 
 
@@ -315,24 +349,46 @@ def send_text(chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = 
     telegram("sendMessage", payload)
 
 
+USER_MENU = [
+    {"command": "start", "description": "Bot start karein"},
+    {"command": "search", "description": "Book/file search karein"},
+    {"command": "help", "description": "Help aur instructions"},
+]
+ADMIN_MENU = USER_MENU + [
+    {"command": "addchannel", "description": "Admin: channel add karein"},
+    {"command": "channels", "description": "Admin: active channels"},
+    {"command": "removechannel", "description": "Admin: channel disable karein"},
+    {"command": "stats", "description": "Admin: indexed files count"},
+    {"command": "addadmin", "description": "Owner: sub-admin add karein"},
+    {"command": "removeadmin", "description": "Owner: sub-admin remove karein"},
+    {"command": "requirechannel", "description": "Admin: join channel set karein"},
+    {"command": "requiredchannels", "description": "Admin: join channels list"},
+    {"command": "setbackupchannel", "description": "Admin: backup chat set karein"},
+    {"command": "setlogchat", "description": "Admin: audit log chat set karein"},
+    {"command": "report", "description": "Admin: usage report"},
+    {"command": "rename", "description": "Admin: indexed file rename"},
+]
+
+
+def set_admin_menu(user_id: int) -> None:
+    try:
+        telegram("setMyCommands", {"commands": ADMIN_MENU, "scope": {"type": "chat", "chat_id": user_id}})
+    except Exception:
+        # Fails with "chat not found" until that admin has pressed Start once.
+        log_error(f"admin menu for {user_id}")
+
+
 def set_command_menu() -> None:
-    telegram("setMyCommands", {"commands": [
-        {"command": "start", "description": "Bot start karein"},
-        {"command": "search", "description": "Book/file search karein"},
-        {"command": "help", "description": "Help aur instructions"},
-        {"command": "addchannel", "description": "Admin: channel add karein"},
-        {"command": "channels", "description": "Admin: active channels"},
-        {"command": "removechannel", "description": "Admin: channel disable karein"},
-        {"command": "stats", "description": "Admin: indexed files count"},
-        {"command": "addadmin", "description": "Owner: sub-admin add karein"},
-        {"command": "removeadmin", "description": "Owner: sub-admin remove karein"},
-        {"command": "requirechannel", "description": "Admin: join channel set karein"},
-        {"command": "requiredchannels", "description": "Admin: join channels list"},
-        {"command": "setbackupchannel", "description": "Admin: backup chat set karein"},
-        {"command": "setlogchat", "description": "Admin: audit log chat set karein"},
-        {"command": "report", "description": "Admin: usage report"},
-        {"command": "rename", "description": "Admin: indexed file rename"},
-    ]})
+    # Normal users only see their own commands; admin commands are shown to admins only
+    # (as /help promises: "Admin commands menu se alag dikhengi").
+    telegram("setMyCommands", {"commands": USER_MENU})
+    admin_ids = set(ADMIN_USER_IDS)
+    try:
+        admin_ids.update(int(r["user_id"]) for r in supabase("admins", "GET", query="?select=user_id&limit=100"))
+    except Exception:
+        log_error("load sub-admins for menu")
+    for user_id in admin_ids:
+        set_admin_menu(user_id)
 
 
 def register_channel(channel: Dict[str, Any]) -> Dict[str, Any]:
@@ -357,6 +413,25 @@ def forwarded_source(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return message.get("forward_from_chat") or None
 
 
+def log_delivery(chat_id: int, row: Dict[str, Any]) -> None:
+    try:
+        supabase("delivery_logs", "POST", {"user_id": chat_id, "book_id": row.get("id"), "book_title": row.get("title")})
+    except Exception:
+        log_error("delivery_log")
+    audit_log(f"PDF sent\nUser: {chat_id}\nFile: {row.get('title')}\nSource: {row.get('source_chat_title', 'unknown')}")
+
+
+def send_by_file_id(chat_id: int, row: Dict[str, Any]) -> None:
+    # Works even if the source post was deleted or the bot lost access to the channel.
+    mime = (row.get("mime_type") or "").lower()
+    method, field = "sendDocument", "document"
+    if mime.startswith("video/"):
+        method, field = "sendVideo", "video"
+    elif mime.startswith("audio/"):
+        method, field = "sendAudio", "audio"
+    telegram(method, {"chat_id": chat_id, field: row["telegram_file_id"], "caption": (row.get("title") or "")[:1000]})
+
+
 def deliver_result(chat_id: int, row: Dict[str, Any]) -> None:
     try:
         # copyMessage works for both public and private source channels when permitted.
@@ -365,20 +440,24 @@ def deliver_result(chat_id: int, row: Dict[str, Any]) -> None:
             "from_chat_id": row["source_chat_id"],
             "message_id": row["source_message_id"],
         })
-        try:
-            supabase("delivery_logs", "POST", {"user_id": chat_id, "book_id": row.get("id"), "book_title": row.get("title")})
-            audit_log(f"PDF sent\nUser: {chat_id}\nFile: {row.get('title')}\nSource: {row.get('source_chat_title', 'unknown')}")
-        except Exception:
-            pass
+        log_delivery(chat_id, row)
         return
     except Exception:
-        pass
+        log_error("copyMessage")
     try:
         if row.get("backup_chat_id") and row.get("backup_message_id"):
             telegram("copyMessage", {"chat_id": chat_id, "from_chat_id": row["backup_chat_id"], "message_id": row["backup_message_id"]})
+            log_delivery(chat_id, row)
             return
     except Exception:
-        pass
+        log_error("backup copyMessage")
+    try:
+        if row.get("telegram_file_id"):
+            send_by_file_id(chat_id, row)
+            log_delivery(chat_id, row)
+            return
+    except Exception:
+        log_error("send by file_id")
     link = row.get("source_link")
     if link:
         send_text(chat_id, f"File direct send nahi ho payi. Source channel link:\n{link}")
@@ -437,8 +516,8 @@ def handle_private_message(message: Dict[str, Any]) -> None:
     if text.startswith("/help"):
         send_text(chat_id, "/search <keywords> - book search\nCategories - category list\nPDF List - available files\nAdmin commands menu se alag dikhengi.")
         return
-    if text.startswith("/search"):
-        query = text[len("/search"):].strip()
+    if command_name(text) == "/search":
+        query = text.split(None, 1)[1].strip() if len(text.split(None, 1)) > 1 else ""
     else:
         query = text
     if not query:
@@ -461,6 +540,16 @@ def handle_private_message(message: Dict[str, Any]) -> None:
     send_text(chat_id, f"{len(results)} result mile. File select karein:", {"inline_keyboard": buttons})
 
 
+USER_COMMANDS = {"/start", "/help", "/search"}
+
+
+def command_name(text: str) -> str:
+    # "/search@FilesBullBot lucent" -> "/search"
+    if not text.startswith("/"):
+        return ""
+    return text.split()[0].split("@")[0].lower()
+
+
 def handle_admin_command(message: Dict[str, Any]) -> None:
     text = (message.get("text") or "").strip()
     chat_id = message.get("chat", {}).get("id")
@@ -477,6 +566,7 @@ def handle_admin_command(message: Dict[str, Any]) -> None:
             send_text(chat_id, "Use: /addadmin TELEGRAM_NUMERIC_ID")
             return
         supabase("admins", "POST", {"user_id": int(target), "role": "subadmin"}, "?on_conflict=user_id")
+        set_admin_menu(int(target))
         send_text(chat_id, "Sub-admin add ho gaya.")
         return
     if text.startswith("/removeadmin"):
@@ -486,6 +576,10 @@ def handle_admin_command(message: Dict[str, Any]) -> None:
         target = text[len("/removeadmin"):].strip()
         if target.isdigit():
             supabase("admins", "DELETE", query=f"?user_id=eq.{target}")
+            try:
+                telegram("deleteMyCommands", {"scope": {"type": "chat", "chat_id": int(target)}})
+            except Exception:
+                log_error("remove admin menu")
             send_text(chat_id, "Sub-admin remove ho gaya.")
         return
     if text.startswith("/requirechannel"):
@@ -619,7 +713,11 @@ def handle_group_file(message: Dict[str, Any]) -> None:
 def handle_callback(query: Dict[str, Any]) -> None:
     data = query.get("data", "")
     chat_id = query.get("message", {}).get("chat", {}).get("id")
-    telegram("answerCallbackQuery", {"callback_query_id": query.get("id")})
+    try:
+        telegram("answerCallbackQuery", {"callback_query_id": query.get("id")})
+    except Exception:
+        # An expired callback must not stop the button from working.
+        log_error("answerCallbackQuery")
     user_id = query.get("from", {}).get("id")
     if not is_subadmin(user_id) and not user_has_required_access(user_id):
         send_text(chat_id, "Pehle required channel join karein.", join_markup())
@@ -702,11 +800,28 @@ def setup_status() -> Dict[str, Any]:
         except Exception as exc:
             status["webhook"] = {"error": type(exc).__name__ + ": " + str(exc)[:120].replace(BOT_TOKEN, "***")}
     if SUPABASE_URL and SUPABASE_KEY:
-        try:
-            supabase("books", "GET", query="?select=id&limit=1")
-            status["database"] = "ok"
-        except Exception as exc:
-            status["database"] = type(exc).__name__ + ": " + str(exc)[:120]
+        # One cheap read per table/column the code uses; "missing" means schema.sql /
+        # migrate_advanced.sql has not been run in the Supabase SQL Editor yet.
+        checks = {
+            "books": "id,content_text",
+            "books.backup_columns": "backup_chat_id,backup_message_id",
+            "channels": "chat_id",
+            "required_channels": "chat_id",
+            "admins": "user_id",
+            "bot_settings": "key",
+            "delivery_logs": "id",
+        }
+        tables: Dict[str, str] = {}
+        for name, cols in checks.items():
+            try:
+                supabase(name.split(".")[0], "GET", query=f"?select={cols}&limit=1")
+                tables[name] = "ok"
+            except Exception as exc:
+                tables[name] = "missing/error: " + str(exc)[:80]
+        status["database"] = "ok" if all(v == "ok" for v in tables.values()) else "incomplete"
+        status["tables"] = tables
+    else:
+        status["database"] = "not configured (set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)"
     return status
 
 
@@ -718,6 +833,8 @@ def webhook() -> Any:
         # open the site's home URL once and it re-registers itself.
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     update = request.get_json(silent=True) or {}
+    reply_chat = ((update.get("message") or {}).get("chat") or {}).get("id") or \
+        (((update.get("callback_query") or {}).get("message") or {}).get("chat") or {}).get("id")
     try:
         if update.get("callback_query"):
             handle_callback(update["callback_query"])
@@ -729,14 +846,23 @@ def webhook() -> Any:
             handle_group_file(message)
             if file_info(message) and message.get("chat", {}).get("type") in {"group", "supergroup"}:
                 return jsonify({"ok": True})
-            if text.startswith("/") and is_subadmin(message.get("from", {}).get("id")):
+            command = command_name(text)
+            is_private = message.get("chat", {}).get("type") == "private"
+            if command and command not in USER_COMMANDS and is_subadmin(message.get("from", {}).get("id")):
                 handle_admin_command(message)
-            else:
+            elif is_private or command in USER_COMMANDS:
+                # In groups only answer explicit commands, not every chat message.
                 handle_private_message(message)
     except Exception:
         # Always return 200 so Telegram does not retry a malformed/duplicate update forever,
         # but log the traceback so the error is visible in Vercel logs.
         log_error("webhook")
+        if reply_chat and not update.get("channel_post"):
+            try:
+                hint = "" if (SUPABASE_URL and SUPABASE_KEY) else " (database setup missing)"
+                send_text(reply_chat, "Abhi kuch gadbad hui" + hint + ", thodi der baad dobara try karein.")
+            except Exception:
+                pass
     return jsonify({"ok": True})
 
 
