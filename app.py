@@ -2182,7 +2182,22 @@ def flush_user() -> None:
         audit_log(f"🆕 Naya user: {user_label(rec)} ({uid})")
 
 
+def defer(fn: Any) -> None:
+    """Bookkeeping that the user's reply does not need (counters, caches): run after the reply, at the end of
+    the update (flush_request)."""
+    _REQ.setdefault("_defer", []).append(fn)
+
+
+def run_deferred() -> None:
+    for fn in _REQ.pop("_defer", []) or []:
+        try:
+            fn()
+        except Exception:
+            log_error("deferred")
+
+
 def flush_request() -> None:
+    run_deferred()
     try:
         flush_user()
     except Exception:
@@ -5497,7 +5512,9 @@ def aidiag() -> Any:
             txt_u = request.args.get("u", "")[:200]
             t_u = time.time()
             d_u, src_u = ai_understand(txt_u, None, use_cache=request.args.get("nocache") != "1")
+            run_deferred()
             res["understand"] = {"text": txt_u, "source": src_u, "json": d_u, "ms": int((time.time() - t_u) * 1000),
+                                 "ai_call_ms": _AI_LAST.get("ms") if src_u == "ai" else None,
                                  "exact_skip": exact_name_hit(txt_u),
                                  "model": _AI_LAST.get("model") if src_u == "ai" else None,
                                  "usage": _AI_LAST.get("usage") if src_u == "ai" else None}
@@ -5811,8 +5828,11 @@ def understand_key(text: str) -> str:
 
 
 def count_understood(src: str) -> None:
-    if src not in UNDERSTOOD_BY:
-        return
+    if src in UNDERSTOOD_BY:
+        defer(lambda: _count_understood(src))
+
+
+def _count_understood(src: str) -> None:
     try:
         d = json.loads(get_setting("understood_by") or "{}")
     except Exception:
@@ -5882,7 +5902,8 @@ def understanding_label(d: Dict[str, Any]) -> str:
 
 
 def ai_understand(text: str, user_id: Optional[int], use_cache: bool = True) -> tuple:
-    """(understanding, "ai" | "cache") or (None, reason). Never raises, never shows anything."""
+    """(understanding, "ai" | "cache") or (None, reason). Never raises, never shows anything.
+    One DB read before the AI call (cache + both daily counters together); every write happens after the reply."""
     key = understand_key(text)
     if not key:
         return None, "empty"
@@ -5891,35 +5912,43 @@ def ai_understand(text: str, user_id: Optional[int], use_cache: bool = True) -> 
         hit = _UCACHE.get(ck)
         if hit and time.time() - hit[0] < UNDERSTAND_CACHE_TTL:
             return dict(hit[1]), "cache"
-        try:
-            raw = get_setting(ck)
-            if raw:
-                c = json.loads(raw)
-                if time.time() - float(c.get("t") or 0) < UNDERSTAND_CACHE_TTL and isinstance(c.get("d"), dict):
-                    _UCACHE[ck] = (float(c["t"]), c["d"])
-                    return dict(c["d"]), "cache"
-        except Exception:
-            log_error("aiu cache read")
     if not ai_provider():
         return None, "no_key"
+    ukey = f"aiuday:{int(user_id)}" if user_id else ""
+    vals: Dict[str, str] = {}
+    try:
+        keys = [k for k in (ck, ukey, "aiday:all") if k]
+        rows = supabase("bot_settings", "GET", query=f"?key=in.({','.join(keys)})&select=key,value")
+        vals = {str(r.get("key")): str(r.get("value") or "") for r in rows or []}
+    except Exception:
+        log_error("aiu read")
+    if use_cache and vals.get(ck):
+        try:
+            c = json.loads(vals[ck])
+            if time.time() - float(c.get("t") or 0) < UNDERSTAND_CACHE_TTL and isinstance(c.get("d"), dict):
+                _UCACHE[ck] = (float(c["t"]), c["d"])
+                return dict(c["d"]), "cache"
+        except Exception:
+            pass
     pool = groq_pool() + openai_pool()
     if pool and all(key_cooling(k) for k in pool):
         return None, "keys_cooling"           # every key is resting after a limit/error: answer locally, at once
     today = ist_day()
-    for k, cap in ((f"aiuday:{user_id}", AI_UNDERSTAND_PER_USER), ("aiday:all", AI_DAILY_TOTAL)):
-        if k.endswith(":None"):
+    counts: Dict[str, int] = {}
+    for k, cap in ((ukey, AI_UNDERSTAND_PER_USER), ("aiday:all", AI_DAILY_TOTAL)):
+        if not k:
             continue
-        day, _, n = (get_setting(k) or "").partition(":")
-        if day == today and n.isdigit() and int(n) >= cap:
+        day, _, n = vals.get(k, "").partition(":")
+        counts[k] = int(n) if day == today and n.isdigit() else 0
+        if counts[k] >= cap:
             return None, "daily_limit"
     content = ai_complete(UNDERSTAND_SYSTEM, "Message: " + text.strip()[:200], max_tokens=150,
                           cap=AI_UNDERSTAND_CAP, fast=True)
-    for k in ([f"aiuday:{user_id}"] if user_id else []) + ["aiday:all"]:
-        try:
-            day, _, n = (get_setting(k) or "").partition(":")
-            set_setting(k, f"{today}:{int(n) + 1 if day == today and n.isdigit() else 1}")
-        except Exception:
-            log_error("aiu spend")
+
+    def spend() -> None:
+        for k, n in counts.items():
+            set_setting(k, f"{today}:{n + 1}")
+    defer(spend)
     if not content:
         return None, "ai_failed"
     try:
@@ -5933,11 +5962,11 @@ def ai_understand(text: str, user_id: Optional[int], use_cache: bool = True) -> 
     if len(_UCACHE) > 500:
         for old in sorted(_UCACHE, key=lambda x: _UCACHE[x][0])[:100]:
             _UCACHE.pop(old, None)
-    try:
+
+    def save() -> None:
         supabase("bot_settings", "POST", {"key": ck, "updated_at": now_iso(), "value": json.dumps(
             {"t": int(now), "q": key[:80], "d": d}, ensure_ascii=False, separators=(",", ":"))}, "?on_conflict=key")
-    except Exception:
-        log_error("aiu cache write")
+    defer(save)
     return dict(d), "ai"
 
 
