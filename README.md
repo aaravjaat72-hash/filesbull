@@ -15,6 +15,9 @@ A GitHub/Vercel-ready Telegram bot for authorized book/file catalogs. It indexes
 - Required join gate: `/requirechannel @channelusername` and `/requiredchannels`.
 - Optional AI ranking with `OPENAI_API_KEY`; AI only ranks indexed database records.
 - Delivery logs in `delivery_logs` for admin reporting.
+- Private backup fallback with `/setbackupchannel CHAT_ID`.
+- Private audit log chat with `/setlogchat CHAT_ID`.
+- Reports with `/report` and metadata correction with `/rename BOOK_ID New title`.
 - Vercel webhook endpoint: `/api/webhook`.
 
 The bot must only be used for files you own or are authorized to distribute. Telegram protected content may prevent both copying and linking.

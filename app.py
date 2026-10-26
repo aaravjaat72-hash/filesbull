@@ -83,6 +83,37 @@ def required_channels() -> List[Dict[str, Any]]:
         return []
 
 
+def get_setting(key: str) -> Optional[str]:
+    try:
+        rows = supabase("bot_settings", "GET", query=f"?key=eq.{urllib.parse.quote(key)}&select=value&limit=1")
+        return rows[0].get("value") if rows else None
+    except Exception:
+        return None
+
+
+def set_setting(key: str, value: str) -> None:
+    supabase("bot_settings", "POST", {"key": key, "value": value}, "?on_conflict=key")
+
+
+def audit_log(text: str) -> None:
+    target = get_setting("log_chat_id")
+    if target:
+        try:
+            telegram("sendMessage", {"chat_id": int(target), "text": text})
+        except Exception:
+            pass
+
+
+def backup_message(source_chat_id: int, source_message_id: int) -> Optional[Dict[str, Any]]:
+    target = get_setting("backup_chat_id")
+    if not target:
+        return None
+    try:
+        return telegram("copyMessage", {"chat_id": int(target), "from_chat_id": source_chat_id, "message_id": source_message_id}).get("result")
+    except Exception:
+        return None
+
+
 def user_has_required_access(user_id: Optional[int]) -> bool:
     if is_subadmin(user_id):
         return True
@@ -280,6 +311,10 @@ def set_command_menu() -> None:
         {"command": "removeadmin", "description": "Owner: sub-admin remove karein"},
         {"command": "requirechannel", "description": "Admin: join channel set karein"},
         {"command": "requiredchannels", "description": "Admin: join channels list"},
+        {"command": "setbackupchannel", "description": "Admin: backup chat set karein"},
+        {"command": "setlogchat", "description": "Admin: audit log chat set karein"},
+        {"command": "report", "description": "Admin: usage report"},
+        {"command": "rename", "description": "Admin: indexed file rename"},
     ]})
 
 
@@ -315,9 +350,16 @@ def deliver_result(chat_id: int, row: Dict[str, Any]) -> None:
         })
         try:
             supabase("delivery_logs", "POST", {"user_id": chat_id, "book_id": row.get("id"), "book_title": row.get("title")})
+            audit_log(f"PDF sent\nUser: {chat_id}\nFile: {row.get('title')}\nSource: {row.get('source_chat_title', 'unknown')}")
         except Exception:
             pass
         return
+    except Exception:
+        pass
+    try:
+        if row.get("backup_chat_id") and row.get("backup_message_id"):
+            telegram("copyMessage", {"chat_id": chat_id, "from_chat_id": row["backup_chat_id"], "message_id": row["backup_message_id"]})
+            return
     except Exception:
         pass
     link = row.get("source_link")
@@ -437,6 +479,42 @@ def handle_admin_command(message: Dict[str, Any]) -> None:
         rows = required_channels()
         send_text(chat_id, "Required channels:\n" + ("\n".join(f"- {r.get('title')}" for r in rows) if rows else "Koi required channel nahi hai."))
         return
+    if text.startswith("/setbackupchannel"):
+        target = text[len("/setbackupchannel"):].strip()
+        if not target:
+            send_text(chat_id, "Use: /setbackupchannel CHAT_ID ya @publicgroup")
+            return
+        try:
+            chat = telegram("getChat", {"chat_id": target}).get("result", {})
+            set_setting("backup_chat_id", str(chat["id"]))
+            send_text(chat_id, f"Backup chat set: {chat.get('title', chat['id'])}")
+        except Exception as exc:
+            send_text(chat_id, f"Backup chat set nahi hua: {str(exc)[:250]}")
+        return
+    if text.startswith("/setlogchat"):
+        target = text[len("/setlogchat"):].strip()
+        if target:
+            set_setting("log_chat_id", target)
+            send_text(chat_id, "Private audit log chat set ho gaya.")
+        else:
+            send_text(chat_id, "Use: /setlogchat CHAT_ID")
+        return
+    if text.startswith("/report"):
+        try:
+            files = supabase("books", "GET", query="?select=id&limit=1000")
+            logs = supabase("delivery_logs", "GET", query="?select=id&limit=1000")
+            send_text(chat_id, f"Professional report\nIndexed files: {len(files)}\nDelivery logs: {len(logs)}\nAI ranking: {'ON' if OPENAI_API_KEY else 'OFF'}\nBackup: {'ON' if get_setting('backup_chat_id') else 'OFF'}")
+        except Exception as exc:
+            send_text(chat_id, f"Report nahi ban payi: {str(exc)[:250]}")
+        return
+    if text.startswith("/rename"):
+        parts = text.split(maxsplit=2)
+        if len(parts) < 3 or not parts[1].isdigit():
+            send_text(chat_id, "Use: /rename BOOK_ID New professional title")
+            return
+        supabase("books", "PATCH", {"title": parts[2][:500], "keywords": parts[2][:4000]}, f"?id=eq.{parts[1]}")
+        send_text(chat_id, "File ka title aur search keywords update ho gaye.")
+        return
     if text.startswith("/addchannel"):
         target = text[len("/addchannel"):].strip()
         if not target:
@@ -489,7 +567,12 @@ def handle_channel_post(message: Dict[str, Any]) -> None:
         if not allowed:
             return
         if file_info(message):
-            upsert_item(build_metadata(message, channel))
+            record = build_metadata(message, channel)
+            upsert_item(record)
+            backup = backup_message(channel.get("id"), message.get("message_id"))
+            if backup and record.get("telegram_file_unique_id"):
+                supabase("books", "PATCH", {"backup_chat_id": get_setting("backup_chat_id"), "backup_message_id": backup.get("message_id")}, f"?telegram_file_unique_id=eq.{urllib.parse.quote(record['telegram_file_unique_id'])}")
+            audit_log(f"File indexed\nSource: {channel.get('title')}\nFile: {record.get('title')}")
     except Exception:
         return
 
