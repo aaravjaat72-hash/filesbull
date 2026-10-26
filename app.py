@@ -828,7 +828,9 @@ ADMIN_HELP = (
     "🔍 Search Mode — ON pe aapka har msg search hoga; OFF pe bot samjhega kaam hai ya search\n\n"
     "🤖 Bolke kaam (sirf admin): \"polity ka naam politics kr do\", \"sab files me Hindi ko हिंदी kr do\", "
     "\"lucent wali file hatao\", \"sari ek baar me upload kro\" (backup), \"users dikhao\", \"report\", "
-    "\"bot restart kro\", \"sari files dikhao\", \"ai naming band kro\", \"purane naam theek kro\". "
+    "\"bot restart kro\", \"sari files dikhao\", \"only polity ki sari pdf dikhao\", \"aaj ki files\", \"last 5 files\", "
+    "\"10 MB se badi files\", \"GK channel ki files\", \"X file ko history category me daal do\", \"search mode off\", "
+    "\"ai test kro\", \"ai naming band kro\", \"purane naam theek kro\". "
     "Har badlav se pehle dikhega kya badlega + ✅ Accept / ❌ Deny. Search karna ho to shuru me ? lagao (?polity)\n"
     "Hatane wale har button pe pehle ✅ Accept / ❌ Deny aayega\n\n"
     "Commands bhi chalti hain: /admin, /requirechannel @ch, /removerequired @ch, /addchannel @ch, /removechannel @ch, "
@@ -3480,33 +3482,104 @@ def send_by_file_id(chat_id: int, row: Dict[str, Any]) -> None:
         method, field = "sendVideo", "video"
     elif mime.startswith("audio/"):
         method, field = "sendAudio", "audio"
-    telegram(method, {"chat_id": chat_id, field: row["telegram_file_id"], "caption": (row.get("title") or "")[:1000]})
+    telegram(method, {"chat_id": chat_id, field: row["telegram_file_id"], "caption": delivery_caption(row)})
+
+
+# ---- delivery under the CURRENT name (Aarav 7:32 PM Oct 26: "list me to name change h lekin jbb file received hoti h
+# to purana name hi rhta"). Caption is always the display name; files ≤20 MB are re-uploaded once under the clean
+# file name and that copy's file_id is reused (bot_settings "dlf:<id>" = {f: file_id, n: name}); a rename makes a new copy.
+
+def delivery_caption(row: Dict[str, Any]) -> str:
+    slug = ""
+    try:
+        slug = book_category(row, {} if has_category_col() else catmap())
+    except Exception:
+        slug = ""
+    cat = f"\n🗂️ {cat_label(slug)}" if slug and slug != "other" and known_category(slug) else ""
+    return (f"📄 {str(row.get('title') or row.get('file_name') or 'File')}{cat}")[:1000]
+
+
+def renamed_copy(row: Dict[str, Any]) -> Optional[str]:
+    try:
+        v = json.loads(get_setting(f"dlf:{row.get('id')}") or "null")
+    except Exception:
+        return None
+    if isinstance(v, dict) and v.get("f") and v.get("n") == str(row.get("title") or ""):
+        return str(v["f"])
+    return None
+
+
+def can_rename_file(row: Dict[str, Any]) -> bool:
+    mime = str(row.get("mime_type") or "").lower()
+    try:
+        size = int(row.get("file_size") or 0)
+    except (TypeError, ValueError):
+        size = 0
+    return bool(row.get("telegram_file_id")) and not mime.startswith(("video/", "audio/")) and 0 < size <= TG_FILE_LIMIT
+
+
+def deliver_renamed(chat_id: int, row: Dict[str, Any], caption: str) -> bool:
+    """Send the file with its clean FILE NAME (≤20 MB documents). False → caller sends a copy with the clean caption."""
+    if not row.get("id") or not can_rename_file(row):
+        return False
+    title = str(row.get("title") or "").strip()
+    if not title:
+        return False
+    name = safe_filename(title, str(row.get("file_name") or ""))
+    cached = renamed_copy(row)
+    if cached:
+        try:
+            telegram("sendDocument", {"chat_id": chat_id, "document": cached, "caption": caption})
+            return True
+        except Exception:
+            log_error("renamed copy send")
+    elif str(row.get("file_name") or "") == name:
+        return False                       # the file already carries this name: a copy is enough
+    if req_elapsed() > 8.0:
+        return False
+    data = download_file(row.get("telegram_file_id"), row.get("file_size"))
+    if not data:
+        return False
+    try:
+        res = telegram_upload("sendDocument", {"chat_id": chat_id, "caption": caption}, "document", name, data)
+        doc = ((res or {}).get("result") or {}).get("document") or {}
+        if not (res or {}).get("ok", True) or not ((res or {}).get("result") or {}).get("message_id"):
+            return False
+        if doc.get("file_id"):
+            try:
+                set_setting(f"dlf:{row['id']}", json.dumps({"f": doc["file_id"], "n": title}, ensure_ascii=False))
+            except Exception:
+                log_error("renamed copy save")
+        return True
+    except Exception:
+        log_error("renamed upload")
+        return False
 
 
 def deliver_result(chat_id: int, row: Dict[str, Any], user: Optional[Dict[str, Any]] = None) -> None:
+    caption = delivery_caption(row)
     try:
-        # copyMessage works for both public and private source channels when permitted.
+        if deliver_renamed(chat_id, row, caption):
+            log_delivery(chat_id, row, user)
+            return
+    except Exception:
+        log_error("deliver_renamed")
+    try:
+        # copyMessage works for both public and private source channels when permitted; caption = current name.
         telegram("copyMessage", {
             "chat_id": chat_id,
             "from_chat_id": row["source_chat_id"],
             "message_id": row["source_message_id"],
+            "caption": caption,
         })
         log_delivery(chat_id, row, user)
         return
     except Exception:
         log_error("copyMessage")
     try:
-        # Public source channel the bot is not a member of: a plain forward can still work.
-        if row.get("source_chat_id") and row.get("source_message_id"):
-            telegram("forwardMessage", {"chat_id": chat_id, "from_chat_id": row["source_chat_id"],
-                                        "message_id": row["source_message_id"]})
-            log_delivery(chat_id, row, user)
-            return
-    except Exception:
-        log_error("forwardMessage")
-    try:
         if row.get("backup_chat_id") and row.get("backup_message_id"):
-            telegram("copyMessage", {"chat_id": chat_id, "from_chat_id": row["backup_chat_id"], "message_id": row["backup_message_id"]})
+            telegram("copyMessage", {"chat_id": chat_id, "from_chat_id": row["backup_chat_id"], "message_id": row["backup_message_id"],
+                                     "caption": caption})
             log_delivery(chat_id, row, user)
             return
     except Exception:
@@ -3518,6 +3591,15 @@ def deliver_result(chat_id: int, row: Dict[str, Any], user: Optional[Dict[str, A
             return
     except Exception:
         log_error("send by file_id")
+    try:
+        # Public source channel the bot is not a member of: a plain forward (old caption) is the last way.
+        if row.get("source_chat_id") and row.get("source_message_id"):
+            telegram("forwardMessage", {"chat_id": chat_id, "from_chat_id": row["source_chat_id"],
+                                        "message_id": row["source_message_id"]})
+            log_delivery(chat_id, row, user)
+            return
+    except Exception:
+        log_error("forwardMessage")
     link = row.get("source_link")
     if link:
         send_text(chat_id, f"File direct send nahi ho payi. Source channel link:\n{link}")
@@ -3959,8 +4041,9 @@ _REQ_T0 = [time.monotonic()]
 
 ADMIN_ACTIONS = {"search", "rename", "bulk_rename", "delete_file", "backup_old", "list_files", "users", "report",
                  "status", "restart", "add_channel", "remove_channel", "list_channels", "add_admin", "ai_keys",
-                 "ai_naming", "fix_names", "panel", "help", "log_backfill", "unknown"}
-OWNER_ONLY_ACTIONS = {"add_admin", "ai_keys"}
+                 "ai_naming", "fix_names", "panel", "help", "log_backfill", "categories", "move_category", "search_mode",
+                 "ai_test", "log_test", "logs", "unknown"}
+OWNER_ONLY_ACTIONS = {"add_admin", "ai_keys", "logs"}
 SEARCH_PREFIXES = ("?", "？", "🔍", "search ", "dhoondo ", "dhundo ", "khojo ", "find ")
 CMD_VERBS = {"kr", "kro", "krdo", "krde", "krna", "krne", "krke", "karo", "kardo", "karde", "kar", "karna", "karne",
              "karke", "kijiye", "kijie", "badlo", "badal", "badl", "badalna", "change", "rename", "hatao", "hata",
@@ -4056,7 +4139,8 @@ def _find_clean(s: str) -> str:
 
 
 def local_admin_intent(text: str) -> Optional[Dict[str, Any]]:
-    """Free rules for the common admin commands. None = not sure (maybe search, maybe AI)."""
+    """Free rules for the common admin commands. None = not sure (maybe search, maybe AI).
+    List / delete carry "filters" (subject, type, source, size, date, count, words) — parse_filters()."""
     t = _strip_q(text)
     low = t.lower()
     words = set(re.findall(r"[a-z0-9]+|[\u0900-\u097F]+", low))
@@ -4065,6 +4149,14 @@ def local_admin_intent(text: str) -> Optional[Dict[str, Any]]:
                  r"(?P<find>.+?)\s+(?:ko|ki\s+jagah|ke\s+badle|se)\s+(?P<to>.+?)\s+" + DO_TAIL + r"\s*$", t, re.I)
     if m:
         return {"action": "bulk_rename", "find": _strip_q(m.group("find")), "to": _strip_q(m.group("to"))}
+    # move category: "Parmar sir polity pdf ko history category me daal do", "physics wali file ki category science kr do"
+    m = re.match(r"^(?P<find>.+?)\s+(?:ki|ka|ke)\s+(?:category|catagory|catgory|categry|cat|section|folder)\s+(?P<to>.+?)\s+"
+                 r"(?:kr|kar|kro|karo|krdo|kardo|rakh|rakho|rkh|rkho|bana|banao|set|badal|badlo|change)\w*\s*(?:do|de|dena|dijiye|dijie)?\s*$", t, re.I) or \
+        re.match(r"^(?P<find>.+?)\s+(?:ko|kô)\s+(?P<to>[^\s]+(?:\s+[^\s]+)?)\s+(?:category|catagory|catgory|categry|section|folder)\s*(?:me|mein|mai|m)?\s+"
+                 r"(?:daal|dal|dalo|daalo|daldo|daaldo|bhej|bhejo|bhejdo|move|shift|rakh|rakho|rkh|rkho|kr|kro|kar|karo|krdo|kardo|daal\s+do|dal\s+do)\w*(?:\s*(?:do|de|dena|dijiye))?\s*$", t, re.I) or \
+        re.match(r"^(?:move|shift)\s+(?P<find>.+?)\s+(?:to|in|into|me|mein)\s+(?P<to>.+?)(?:\s+(?:category|section|folder))?\s*$", t, re.I)
+    if m:
+        return {"action": "move_category", "find": _find_clean(m.group("find")), "to": _strip_q(m.group("to"))}
     # rename: "polity ka name politics kr do", "polity ka name change krne politics kr do", "rename polity to politics"
     m = re.match(r"^(?:rename\s+)?(?P<find>.+?)\s+(?:ka|ki|ke|kaa)\s+" + NAME_WORDS + r"\s+"
                  r"(?:(?:change|badal|badl|chng|chnge)\w*\s+(?:(?:kr|kar|krke|karke|krne|karne|ke)\w*\s+)?)?"
@@ -4084,51 +4176,99 @@ def local_admin_intent(text: str) -> Optional[Dict[str, Any]]:
     # 📜 old updates → Log Chat ("Abhi tkk ki sari updates log chat me dal do", "purani updates bhejo")
     if is_log_backfill(low, words):
         return {"action": "log_backfill"}
+    # 🔑 AI keys / live provider / backup order (before "backup" — "backup ai ka order badlo" is about AI keys)
+    provs = [p for p in ("groq", "gemini", "mistral", "openrouter", "nvidia") if p in words or (p == "openrouter" and "open router" in low)]
+    if (words & {"key", "keys", "api", "apikey"} and (provs or words & {"ai", "add", "jodo", "dikhao", "list", "backup", "live", "nayi", "new"})) or \
+            (provs and words & {"live", "backup", "order", "key", "keys", "model", "switch"}) or \
+            ("ai" in words and words & {"live", "provider", "providers", "backup"} and
+             words & {"order", "badlo", "change", "kr", "kro", "karo", "set", "dikhao", "switch", "bdlo"}):
+        intent = {"action": "ai_keys"}
+        if provs and words & {"live"} and not words & {"backup", "order"}:
+            intent["live"] = provs[0]
+        return intent
+    # 🤖 AI test ("ai test kro", "ai chal raha hai kya")
+    if "aitest" in words or ("ai" in words and (words & {"test", "check", "tst", "chek"} or re.search(r"\bai\s+(?:chal|kaam|work)", low))):
+        return {"action": "ai_test"}
+    # 📝 Log Chat test ("log test kro", "log chat check kro", "log channel chal raha hai?")
+    if words & {"log", "logs", "logchat"} and (words & {"test", "check", "chek", "tst"} or re.search(r"\blog\s+(?:chat|channel)\s+(?:chal|kaam)", low)) \
+            and not words & {"set", "lagao", "badlo"}:
+        return {"action": "log_test"}
+    # 🔍 Search Mode on / off
+    if words & {"search", "serch", "sarch", "seach", "srch", "searh"} and words & {"mode", "mod", "moad", "mood"}:
+        on = True if words & {"on", "chalu", "start", "kholo"} else (False if words & {"off", "band", "bnd", "stop"} else None)
+        return {"action": "search_mode", "on": on}
     # backup of old files ("Sari ek baar me upload kro", "sab files backup kro")
     if words & {"backup", "bkp", "upload", "uplod", "uplode"}:
         if words & {"channel", "chat"} and words & {"set", "badlo", "change", "lagao", "jodo"}:
             return {"action": "panel_button", "button": "setbackup"}
         return {"action": "backup_old"}
+    # 📂 file lists with filters / delete with filters ("Mujhe only polity ki sari pdf files dikhao", "aaj ki files", "last 5 files")
+    del_words = {"delete", "hatao", "hata", "hatado", "remove", "mitao", "mita", "nikalo", "hide", "chupao", "chhupao", "chupa",
+                 "chhupa", "chupado", "chhupado", "hatana", "deleet", "dlt", "htao", "hta"}
+    job_words = {"rename", "badlo", "change", "upload", "backup", "admin", "key", "keys", "restart"}
+    has_noun = bool(words & FILE_NOUNS) or bool(re.search(r"फाइल|पीडीएफ|किताब", low))
+    if words & del_words and not words & {"channel", "channels", "chanel", "admin", "key", "keys", "group"}:
+        f = parse_filters(t, known_sources() if has_noun else None)
+        find = re.sub(r"\b(?:delete|hatao|hata|hatado|htao|hta|remove|mitao|mita|nikalo|hide|chupao|chhupao|chupa|chhupa|chupado|chhupado|"
+                      r"hatana|dlt|kr|kro|karo|kar|do|de|dena|file|files|wali|wala|vali|ko|ki|ka|ye|yeh|is|please|plz|bhai|sari|saari|"
+                      r"sab|sabhi|all|only|sirf|bas)\b", " ", t, flags=re.I)
+        intent = {"action": "delete_file", "find": _strip_q(find)}
+        sel = {k: v for k, v in f.items() if k in ("subject", "type", "source", "min_size", "max_size", "date_from", "date_to",
+                                                   "date_label", "limit")}
+        if sel:
+            intent["filters"] = dict(sel, **({"query": f["query"]} if f.get("query") else {}))
+        return intent
+    if words & {"category", "categories", "catagory", "catgory", "categry", "catagories", "श्रेणी"} and \
+            (words & SHOW_VERBS or len(words) <= 3) and not has_noun and not parse_filters(t).get("subject"):
+        return {"action": "categories"}
+    if has_noun and not words & job_words:
+        f = parse_filters(t, known_sources())
+        listy = bool(words & SHOW_VERBS) or bool(words & ALL_WORDS) or \
+            any(f.get(k) for k in ("source", "min_size", "max_size", "date_from", "limit")) or \
+            (f.get("subject") and words & {"category", "categories", "catagory", "section"})
+        if listy:
+            f.pop("only", None)
+            return {"action": "list_files", "filters": f}
     # channels
     chat_ref = re.search(r"(@[A-Za-z0-9_]{4,}|https?://t\.me/\S+|t\.me/\S+|-100\d{6,})", t)
     if words & {"channel", "channels", "chanel", "group"}:
         kind = "join" if words & {"join", "required", "zaroori", "jaruri"} else ("source" if words & {"source", "src"} else None)
         if words & {"hatao", "hata", "remove", "delete", "hatado", "nikalo", "mitao"}:
             return {"action": "remove_channel", "kind": kind}
-        if words & {"add", "jodo", "jod", "lagao", "dalo", "daalo", "joro"}:
+        if words & {"add", "jodo", "jod", "lagao", "dalo", "daalo", "joro", "bana", "banao", "bnao"}:
             return {"action": "add_channel", "kind": kind, "target": chat_ref.group(1) if chat_ref else None}
-        if words & {"list", "dikhao", "dikha", "batao", "show", "kitne"}:
+        if words & {"list", "dikhao", "dikha", "batao", "show", "kitne", "btao"}:
             return {"action": "list_channels", "kind": kind}
-    if "admin" in words and words & {"add", "jodo", "bana", "banao", "jod"}:
+    if "admin" in words and words & {"add", "jodo", "bana", "banao", "jod", "bnao", "bnado"}:
         return {"action": "add_admin"}
-    if words & {"key", "keys"} and words & {"ai", "api", "groq", "openai", "add", "jodo", "dikhao", "list", "gemini",
-                                            "mistral", "openrouter", "nvidia", "backup", "live"}:
-        return {"action": "ai_keys"}
-    # delete one file
-    if words & {"delete", "hatao", "hata", "hatado", "remove", "mitao", "mita", "nikalo"} and \
-            not words & {"channel", "admin", "key", "keys"}:
-        find = re.sub(r"\b(?:delete|hatao|hata|hatado|remove|mitao|mita|nikalo|kr|kro|karo|kar|do|de|dena|file|files|"
-                      r"wali|wala|vali|ko|ki|ka|ye|yeh|is|please|plz|bhai)\b", " ", t, flags=re.I)
-        return {"action": "delete_file", "find": _strip_q(find)}
     if words & {"restart", "reboot", "reset"} or re.search(r"\bbot\s+(?:ko\s+)?(?:chalu|start)\b", low):
         return {"action": "restart"}
     if re.search(r"\b(?:all|sari|saari|sab|sabhi|puri|poori)\s+(?:ki\s+)?(?:files?|pdfs?|books?)\b", low) and \
             (len(words) <= 3 or words & {"list", "dikhao", "dikha", "batao", "show"}) or \
             re.search(r"\b(?:files?|pdfs?)\s+(?:ki\s+)?list\b|\ball\s+files\b", low):
-        return {"action": "list_files"}
+        return {"action": "list_files", "filters": {}}
     if words & {"log"} and words & {"chat", "channel"} and words & {"set", "lagao", "jodo", "badlo"}:
         return {"action": "panel_button", "button": "setlog"}
-    if words & {"user", "users", "yuzar"} and (len(words) <= 5 or words & {"dikhao", "batao", "kitne", "list"}) \
+    # 📜 recent log lines (/logs): "logs dikhao", "last 20 logs", "aaj ki updates dikhao"
+    if "logs" in words or (words & {"updates", "update", "log"} and words & (SHOW_VERBS | {"last", "recent", "latest"}) and
+                           not words & {"user", "users", "kitne"}):
+        m = re.search(r"\b(\d{1,3})\b", low)
+        return {"action": "logs", "n": int(m.group(1)) if m and 0 < int(m.group(1)) <= 100 else None}
+    if words & {"user", "users", "yuzar", "yuzer", "usr", "members"} and (len(words) <= 5 or words & {"dikhao", "batao", "kitne", "list", "btao"}) \
             or "kitne log" in low:
         return {"action": "users"}
-    if words & {"report", "stats", "statistics", "hisab", "hisaab"} and len(words) <= 5:
+    if words & {"report", "stats", "statistics", "hisab", "hisaab", "riport", "stat"} and len(words) <= 6:
         return {"action": "report"}
-    if words & {"status", "debug"} and len(words) <= 5:
+    if words & {"status", "debug", "health"} and len(words) <= 6 or \
+            re.search(r"\bbot\s+(?:theek|thik|sahi|shi)?\s*(?:se\s+)?(?:chal|kaam)\s*(?:raha|rha|rhi|kr)", low):
         return {"action": "status"}
     if low in {"admin", "admin panel", "panel", "menu"}:
         return {"action": "panel"}
-    if low in {"help", "admin help", "madad"}:
+    if low in {"help", "admin help", "madad"} or (words & {"help", "madad"} and len(words) <= 3):
         return {"action": "help"}
+    if words & {"rename", "naam", "name", "nam"} and words & {"badlo", "badalna", "badalni", "change", "rename", "badal", "chng", "badlna",
+                                                          "badlni", "bdlo", "bdlna", "bdalna", "badalwana"} and len(words) <= 6:
+        return {"action": "rename"}          # no file / new name given → ask which file
     return None
 
 
@@ -4141,14 +4281,25 @@ def looks_like_command(text: str) -> bool:
 ADMIN_AI_SYSTEM = (
     "You route a message from the ADMIN of a Telegram bot that stores study PDF files. "
     "Decide if it is an admin command or a file search. Reply ONLY with JSON: "
-    '{"action":"...","find":null,"to":null,"kind":null,"target":null,"on":null,"query":null,"ask":null}. '
-    "action is one of: search (admin is looking for a file; query = search words), rename (change ONE file's name: "
-    "find = words of the current name, to = new name), bulk_rename (replace text in MANY file names: find, to), "
-    "delete_file (find), backup_old (copy/upload all old files to the backup channel), list_files, users, report, "
-    "status, restart, add_channel (kind join|source, target @name/link or null), remove_channel (kind), "
-    "list_channels (kind), add_admin, ai_keys, ai_naming (on true/false), fix_names (let AI clean old file names), "
-    "log_backfill (send details of ALL files added so far — old updates / records — to the log chat / log channel), "
-    "panel, help, unknown. Message may be Hindi/Hinglish. If unclear, action unknown and ask = ONE short Hinglish question. "
+    '{"action":"...","find":null,"to":null,"kind":null,"target":null,"on":null,"query":null,"ask":null,'
+    '"filters":{"subject":null,"type":null,"source":null,"min_size":null,"max_size":null,"date_from":null,"date_to":null,'
+    '"limit":null,"query":null}}. '
+    "action is one of: search (admin is looking for a file to get it; query = search words), "
+    "list_files (SHOW / LIST files, optionally filtered — 'X ki sari files dikhao', 'aaj ki files', 'last 5 files'), "
+    "rename (change ONE file's name: find = words of the current name, to = new name), bulk_rename (replace text in MANY "
+    "file names: find, to), delete_file (remove/hide a file: find = its name words; or filters), move_category (put a file "
+    "in another category: find = file name words, to = category), categories (show the category list), backup_old "
+    "(copy/upload all old files to the backup channel), users, report, status, restart, add_channel (kind join|source, "
+    "target @name/link or null), remove_channel (kind), list_channels (kind), add_admin, ai_keys (AI API keys, live/backup "
+    "AI provider), ai_test (test if AI works), ai_naming (on true/false), fix_names (let AI clean old file names), "
+    "log_backfill (send details of ALL files added so far to the log chat), log_test (test the log chat), logs (show recent "
+    "log lines), search_mode (on true/false), panel, help, unknown. "
+    "filters (for list_files / delete_file): subject = study subject in English (polity, history, geography, economics, "
+    "science, gk, current affairs, maths, reasoning, hindi, english, computer, pyq, mock — राजव्यवस्था/samvidhan/constitution "
+    "= polity, itihas = history, bhugol = geography, ganit = maths), type = pdf|video|audio|image|doc, source = source channel "
+    "name, min_size/max_size in MB (number), date_from/date_to as YYYY-MM-DD (today is {today}, IST), limit = how many newest "
+    "files, query = other title words. Words like only/sirf/bas/sari/saari mean 'just these'. Unused filters = null. "
+    "Message may be Hindi/Hinglish with typos. If unclear, action unknown and ask = ONE short Hinglish question. "
     "Never invent file names; copy find/to from the message.")
 
 
@@ -4173,23 +4324,48 @@ def ai_admin_intent(user_id: int, text: str) -> Optional[Dict[str, Any]]:
     if not admin_ai_budget_ok(user_id):
         return None
     _count_day(f"aiday_admin:{user_id}")
-    content = ai_complete(ADMIN_AI_SYSTEM, text[:400], max_tokens=160, cap=8)
+    system = ADMIN_AI_SYSTEM.replace("{today}", time.strftime("%Y-%m-%d", time.gmtime(time.time() + IST_OFFSET)))
+    content = ai_complete(system, text[:400], max_tokens=220, cap=8)
     if not content:
         return None
+    return validate_admin_ai(content, text)
+
+
+def validate_admin_ai(content: str, text: str) -> Optional[Dict[str, Any]]:
+    """Parse + whitelist the AI's JSON; the locally read filters fill every gap (Aarav 7:25 PM: a subject /
+    type / source word in the text is applied even if the AI said "list everything")."""
     try:
         data = json.loads(content[content.find("{"): content.rfind("}") + 1])
     except Exception:
         return None
-    if not isinstance(data, dict) or str(data.get("action") or "") not in ADMIN_ACTIONS:
+    if not isinstance(data, dict):
+        return None
+    action = str(data.get("action") or "")
+    action = {"list_all": "list_files", "list": "list_files", "show_files": "list_files", "files": "list_files",
+              "hide_file": "delete_file", "hide": "delete_file", "delete": "delete_file", "category": "move_category",
+              "set_category": "move_category", "aitest": "ai_test", "keys": "ai_keys"}.get(action, action)
+    if action not in ADMIN_ACTIONS:
         return None   # anything outside the whitelist is ignored
 
     def s(v: Any) -> Optional[str]:
-        return _strip_q(str(v))[:200] if isinstance(v, (str, int)) and str(v).strip() else None
+        return _strip_q(str(v))[:200] if isinstance(v, (str, int)) and not isinstance(v, bool) and str(v).strip() and \
+            str(v).strip().lower() not in {"null", "none"} else None
     on = data.get("on")
-    return {"action": data["action"], "find": s(data.get("find")), "to": s(data.get("to")),
-            "kind": s(data.get("kind")) if s(data.get("kind")) in {"join", "source"} else None,
-            "target": s(data.get("target")), "on": on if isinstance(on, bool) else None,
-            "query": s(data.get("query")), "ask": s(data.get("ask")), "ai": True}
+    out = {"action": action, "find": s(data.get("find")), "to": s(data.get("to")),
+           "kind": s(data.get("kind")) if s(data.get("kind")) in {"join", "source"} else None,
+           "target": s(data.get("target")), "on": on if isinstance(on, bool) else None,
+           "query": s(data.get("query")), "ask": s(data.get("ask")), "ai": True}
+    if action in {"list_files", "delete_file", "search"}:
+        local_f = parse_filters(text, known_sources())
+        ai_f = clean_ai_filters(data.get("filters"))
+        f = merge_filters(ai_f, local_f)
+        if action == "search" and any(f.get(k) for k in ("subject", "source", "min_size", "max_size", "date_from", "limit")) and \
+                re.search(r"\b(?:dikhao|dikha|list|show|batao|btao|sari|saari|sab|all|only|sirf)\b", text.lower()):
+            action = out["action"] = "list_files"     # "polity ki sari files dikhao" is a list, not a single search
+        if action != "search":
+            f.pop("only", None)
+            out["filters"] = f
+    return out
 
 
 def admin_text(chat_id: int, user: Dict[str, Any], text: str) -> Optional[str]:
@@ -4197,6 +4373,10 @@ def admin_text(chat_id: int, user: Dict[str, Any], text: str) -> Optional[str]:
     user_id = int(user.get("id"))
     raw = (text or "").strip()
     low = raw.lower()
+    intent = local_admin_intent(raw)
+    if intent and intent.get("action") == "search_mode":      # "search mode on/off" — never itself a search
+        run_admin_action(chat_id, user, intent, raw)
+        return None
     for p in SEARCH_PREFIXES:
         if low.startswith(p):
             rest = raw[len(p):].strip()
@@ -4205,8 +4385,7 @@ def admin_text(chat_id: int, user: Dict[str, Any], text: str) -> Optional[str]:
                 return None
             return rest
     if get_setting(f"admsearch:{user_id}") == "1":
-        return raw
-    intent = local_admin_intent(raw)
+        return raw                           # Search Mode ON: everything is a search, except "search mode off"
     if intent is None:
         if not looks_like_command(raw):
             return raw                       # plain words ("lucent", "ssc gd gk hindi") → search, no AI
@@ -4242,11 +4421,43 @@ def run_admin_action(chat_id: int, user: Dict[str, Any], intent: Dict[str, Any],
             return
         bulk_rename_flow(chat_id, user_id, find, to)
     elif a == "delete_file":
-        delete_flow(chat_id, user_id, find)
+        flt = intent.get("filters") or {}
+        if has_filters(flt) and (not find or not find_books(find, 2) or any(flt.get(k) for k in ("subject", "type", "date_from", "source", "min_size", "max_size", "limit"))):
+            delete_filtered_flow(chat_id, user_id, flt, find)
+        else:
+            delete_flow(chat_id, user_id, find)
     elif a == "backup_old":
         backup_flow(chat_id, user_id)
     elif a == "list_files":
-        send_text(chat_id, *files_view(1))
+        send_text(chat_id, *filtered_files_view(intent.get("filters") or {}, 1))
+    elif a == "categories":
+        text, kb = categories_view()
+        send_text(chat_id, text, kb or {"inline_keyboard": [BACK_ROW]}, "HTML")
+    elif a == "move_category":
+        if not to:
+            send_text(chat_id, "🗂️ Kis category me daalni hai? Aise likho: \"Parmar sir polity pdf ko polity category me daal do\"",
+                      {"inline_keyboard": [[{"text": "🗂️ Categories", "callback_data": "user_categories"}], BACK_ROW]})
+            return
+        move_category_flow(chat_id, user_id, find, to)
+    elif a == "search_mode":
+        on = intent.get("on")
+        cur = get_setting(f"admsearch:{user_id}") == "1"
+        if on is None:
+            send_text(chat_id, ("🔍 Search Mode abhi ON hai — har msg seedha search hota hai." if cur else
+                                "🔍 Search Mode abhi OFF hai — bot samajhta hai msg kaam hai ya search."),
+                      {"inline_keyboard": [[{"text": "🔍 Search Mode OFF karo" if cur else "🔍 Search Mode ON karo", "callback_data": "ad:smode"}], BACK_ROW]})
+            return
+        set_setting(f"admsearch:{user_id}", "1" if on else "0")
+        send_text(chat_id, "🔍 Search Mode ON — ab aapka har msg seedha search hoga.\n(Bolke kaam ke liye ise OFF karo: \"search mode off\")"
+                  if on else "🔍 Search Mode OFF — ab bot samjhega aapka msg kaam hai ya search 🤖", {"inline_keyboard": [BACK_ROW]})
+    elif a == "ai_test":
+        send_text(chat_id, ai_test_text(), {"inline_keyboard": [[{"text": "🔁 Dobara test", "callback_data": "ad:aitest"}], BACK_ROW]}, "HTML")
+    elif a == "log_test":
+        send_text(chat_id, log_test_text(log_test()), {"inline_keyboard": [[{"text": "📜 Purani updates Log me bhejo", "callback_data": "ad:logfill"}], BACK_ROW]})
+    elif a == "logs":
+        n = intent.get("n") if isinstance(intent.get("n"), int) else 15
+        for part in logs_text(n):
+            send_text(chat_id, part)
     elif a == "users":
         send_text(chat_id, users_view(), {"inline_keyboard": [[{"text": "🔄 Refresh", "callback_data": "ad:users"}], BACK_ROW]})
     elif a == "report":
@@ -4284,6 +4495,10 @@ def run_admin_action(chat_id: int, user: Dict[str, Any], intent: Dict[str, Any],
     elif a == "add_admin":
         ask_input(chat_id, user_id, "addadmin")
     elif a == "ai_keys":
+        live = intent.get("live")
+        if live in PROVIDERS and is_owner(user_id):
+            handle_router_callback({}, f"rtl:{PROVIDERS[live]['c']}", False, chat_id, user_id)   # one ✅ Accept / ❌ Deny
+            return
         send_text(chat_id, *keys_view())
     elif a == "ai_naming":
         on = intent.get("on")
@@ -4305,6 +4520,564 @@ def run_admin_action(chat_id: int, user: Dict[str, Any], intent: Dict[str, Any],
         logfill_preview(chat_id, user_id, query)
     else:   # unknown
         ask_cmd_or_search(chat_id, user_id, raw, intent.get("ask"))
+
+
+# ================================================================ v12: admin filters (Aarav 7:25 PM Oct 26)
+# "Mujhe only polity ki sari pdf files dikhao" showed all 27 files: the list action dropped every filter.
+# parse_filters() reads subject / type / source / size / date / count / words from the admin's text (no AI needed);
+# the AI router returns the same {action, filters{...}} and is validated + merged with the local reading.
+
+FILTER_SUBJECTS = {
+    "polity": ["polity", "polty", "pality", "politics", "rajniti", "rajneeti", "rajvyavastha", "rajvyavstha", "rajvyavasta",
+               "राजव्यवस्था", "राजनीति", "constitution", "samvidhan", "sanvidhan", "samvidhaan", "संविधान", "civics",
+               "laxmikanth", "indian polity"],
+    "history": ["history", "histroy", "histry", "itihas", "itihaas", "इतिहास", "indian history"],
+    "geography": ["geography", "geo", "bhugol", "bhoogol", "भूगोल", "geogrphy"],
+    "economics": ["economics", "economy", "arthvyavastha", "arthshastra", "अर्थव्यवस्था", "अर्थशास्त्र"],
+    "science": ["science", "vigyan", "विज्ञान", "general science"],
+    "static_gk": ["gk", "gs", "g.k", "g.s", "static gk", "general knowledge", "general studies", "samanya gyan",
+                  "सामान्य ज्ञान", "सामान्य अध्ययन", "gk gs"],
+    "current_affairs": ["ca", "current affairs", "current affair", "currentaffairs", "करंट अफेयर्स", "samsamayiki",
+                        "सामयिकी", "karent affairs"],
+    "maths": ["maths", "math", "mathematics", "ganit", "गणित", "quant", "arithmetic"],
+    "reasoning": ["reasoning", "resoning", "reasning", "tark", "तर्कशक्ति", "रीजनिंग"],
+    "hindi": ["hindi", "हिंदी", "हिन्दी", "hindi vyakaran"],
+    "english": ["english", "angrezi", "angreji", "अंग्रेजी", "english grammar"],
+    "computer": ["computer", "कंप्यूटर", "computer awareness"],
+    "pyq": ["pyq", "previous year", "previous year paper", "purane paper", "solved paper"],
+    "mock": ["mock", "mock test", "practice set", "test series"],
+}
+_FSUB_WORD = {w: s for s, ws in FILTER_SUBJECTS.items() for w in ws}
+FILE_TYPES = {
+    "pdf": ["pdf", "pdfs", "पीडीएफ"], "video": ["video", "videos", "vdo", "vedio", "वीडियो", "lecture", "lectures"],
+    "audio": ["audio", "audios", "mp3", "ऑडियो"], "image": ["image", "images", "photo", "photos", "pic", "pics", "jpg", "png", "फोटो"],
+    "doc": ["doc", "docx", "word", "ppt", "pptx", "excel"],
+}
+_FTYPE_WORD = {w: t for t, ws in FILE_TYPES.items() for w in ws}
+TYPE_LABEL = {"pdf": "PDF", "video": "Video", "audio": "Audio", "image": "Photo", "doc": "Doc"}
+FILE_NOUNS = {"file", "files", "fil", "fils", "filez", "fiels", "pdf", "pdfs", "book", "books", "kitab", "kitabe", "kitaben",
+              "notes", "video", "videos", "audio", "audios", "image", "images", "photo", "photos", "documents", "docs",
+              "फाइल", "फाइलें", "पीडीएफ", "किताब", "किताबें"}
+SHOW_VERBS = {"dikhao", "dikha", "dikhado", "dikhaao", "dikhana", "dikhaye", "dikhaiye", "dikhayo", "dikhau", "dekhni",
+              "dekhna", "dekhao", "dekhe", "batao", "bata", "btao", "bta", "btado", "list", "show", "display", "kitni",
+              "kitne", "count", "dikhai", "dikhaa", "dikao", "dikho", "दिखाओ", "बताओ"}
+ALL_WORDS = {"sari", "saari", "sare", "saare", "sab", "sabhi", "all", "only", "sirf", "bas", "puri", "poori", "total", "srf", "sirif"}
+_FILTER_STOP = set("""mujhe muje mujhko mereko mere meri mera hame hume humko hamko please plz pls bhai bro yaar sir ji
+    ki ka ke ko kya me mein mai m se sy aur or bhi wali wala wale vali vala vale jo jisme jinme jiska hai hain h he ho hoga
+    the thi tha karo kro kr kar krdo kardo krde karde do de dena dijiye dijie chahiye chaiye chahie lao la laao bhejo bhej
+    send ab abhi tak tk tkk naya nayi naye new latest recent last pichli pichle akhri aakhri first pehli top hi to bhai
+    category categories catagory catgory section folder subject topic type size mb kb gb din days day hafte week mahine
+    month ghante hours se badi bade bada chhoti choti chhote kam zyada jyada upar niche neeche above below more less than
+    channel chanel group source src aayi aai aaye aye hui hue added add upload uploaded the a an of in for from is are
+    in wo vo ye yeh is us un unki uski iski inki apni apne apna mere sirf only sari saari sare saare sab sabhi all bas puri
+    poori total list show display dikhao dikha dikhado batao btao kitni kitne count aaj aj kal parso today yesterday this
+    hafte की का के को से में मे और भी वाली वाला वाले सारी सारे सब सभी सिर्फ केवल मुझे मेरे दिखाओ दिखा बताओ दो दे भेजो
+    फाइल फाइलें फ़ाइल फ़ाइलें पीडीएफ है हैं""".split()) | FILE_NOUNS | SHOW_VERBS | ALL_WORDS
+_DATE_UNITS = {"din": 1, "dino": 1, "dinon": 1, "day": 1, "days": 1, "d": 1, "hafte": 7, "hafta": 7, "hafton": 7, "week": 7,
+               "weeks": 7, "mahine": 30, "mahina": 30, "mahino": 30, "month": 30, "months": 30}
+
+
+def _iso(ts: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
+
+def _ist_midnight(days_ago: int = 0) -> float:
+    now = time.time() + IST_OFFSET
+    return (now - now % 86400) - IST_OFFSET - days_ago * 86400
+
+
+def _size_bytes(num: str, unit: str) -> int:
+    return int(float(num) * {"kb": 1024, "mb": 1048576, "gb": 1073741824}[unit.lower()])
+
+
+def subject_from_word(w: str, fuzzy: bool = True) -> str:
+    w = (w or "").strip().lower()
+    if not w:
+        return ""
+    if w in _FSUB_WORD:
+        return _FSUB_WORD[w]
+    if " " in w or len(w) >= 4:
+        s = norm_category(w)
+        if s and s != "other" and known_category(s) and (w in CAT_SYNONYMS or w == cat_label(s).lower() or
+                                                          w == s.replace("_", " ")):
+            return s
+    if fuzzy and len(w) >= 5 and re.fullmatch(r"[a-z]+", w):
+        import difflib
+        close = difflib.get_close_matches(w, [k for k in _FSUB_WORD if len(k) >= 5 and " " not in k], n=1, cutoff=0.8)
+        if close and not difflib.get_close_matches(w, list(_FILTER_STOP), n=1, cutoff=0.86):
+            return _FSUB_WORD[close[0]]
+    return ""
+
+
+def parse_filters(text: str, sources: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Filters in an admin's words. Returns only the keys found (subject, type, source, min_size, max_size,
+    date_from, date_to, date_label, limit, query, only)."""
+    low = " " + re.sub(r"\s+", " ", (text or "").lower()) + " "
+    f: Dict[str, Any] = {}
+    used: List[str] = []
+
+    def cut(m: Any) -> None:
+        used.append(m.group(0))
+
+    # size: "10 MB se badi", "5mb se chhoti", "above 10 mb", "> 2mb"
+    big = r"(?:jyada|zyada|jada|zada|jiyada|badi|bade|bada|bdi|bde|upar|uper|above|more|bigger|greater|large|larger|plus|\+)"
+    small = r"(?:kam|chhoti|choti|chhote|chote|chhota|chota|niche|neeche|nichay|below|less|smaller|under)"
+    for m in re.finditer(r"(\d+(?:\.\d+)?)\s*(kb|mb|gb)\s*(?:se|than|sy|ke|ki|ka)?\s*(" + big + "|" + small + r")\b", low):
+        key = "min_size" if re.fullmatch(big, m.group(3)) else "max_size"
+        f[key] = _size_bytes(m.group(1), m.group(2)); cut(m)
+    for m in re.finditer(r"(above|over|more than|greater than|bigger than|>=?|below|under|less than|smaller than|<=?)\s*"
+                         r"(\d+(?:\.\d+)?)\s*(kb|mb|gb)\b", low):
+        key = "min_size" if re.match(r"above|over|more|greater|bigger|>", m.group(1)) else "max_size"
+        f[key] = _size_bytes(m.group(2), m.group(3)); cut(m)
+    # date: aaj / kal / parso / last 7 din / is hafte / is mahine
+    m = re.search(r"\b(?:last|pichle|pichhle|picchle|pichhe|past|previous|purane|pichli)?\s*(\d{1,3})\s*"
+                  r"(din|dino|dinon|days?|d|hafte|hafta|hafton|weeks?|mahine|mahina|mahino|months?)\b", low)
+    if m and (re.search(r"last|pichl|pichhl|picchl|past|previous|purane", m.group(0)) or
+              re.search(re.escape(m.group(0).strip()) + r"\s*(?:ki|ke|ka|me|mein|se|wali|wale|purani)?\b", low)):
+        days = int(m.group(1)) * _DATE_UNITS.get(m.group(2), 1)
+        if 0 < days <= 3650:
+            f["date_from"] = _iso(time.time() - days * 86400)
+            f["date_label"] = f"last {m.group(1)} {'din' if _DATE_UNITS.get(m.group(2), 1) == 1 else ('hafte' if _DATE_UNITS.get(m.group(2)) == 7 else 'mahine')}"
+            cut(m)
+    if "date_from" not in f:
+        if re.search(r"(?:\b(?:aaj|aj|aajki|today|todays)\b|आज)(?!\s*(?:tak|tk|tkk|takk|तक))", low):
+            f["date_from"], f["date_label"] = _iso(_ist_midnight(0)), "aaj"
+        elif re.search(r"\b(?:kal|kall|yesterday)\b|कल", low):
+            f["date_from"], f["date_to"], f["date_label"] = _iso(_ist_midnight(1)), _iso(_ist_midnight(0)), "kal"
+        elif re.search(r"\b(?:parso|parson|परसों)\b", low):
+            f["date_from"], f["date_to"], f["date_label"] = _iso(_ist_midnight(2)), _iso(_ist_midnight(1)), "parso"
+        elif re.search(r"\b(?:is|iss|this)\s+(?:hafte|hafta|week)\b", low):
+            f["date_from"], f["date_label"] = _iso(time.time() - 7 * 86400), "is hafte"
+        elif re.search(r"\b(?:is|iss|this)\s+(?:mahine|mahina|month)\b", low):
+            f["date_from"], f["date_label"] = _iso(time.time() - 30 * 86400), "is mahine"
+    # count: "last 5", "latest 10 files", "5 nayi files"
+    m = re.search(r"\b(?:last|latest|recent|nayi|naye|nai|new|top|pichli|pichhli|akhri|aakhri|aakhiri|akhiri)\s+(\d{1,3})\b"
+                  r"(?!\s*(?:din|dino|days?|d\b|hafte|weeks?|mahine|months?|mb|kb|gb))", low) or \
+        re.search(r"\b(\d{1,3})\s+(?:nayi|naye|nai|latest|new|recent|last|aakhri|akhri)?\s*(?:files?|pdfs?|books?|videos?)\b", low)
+    if m and 0 < int(m.group(1)) <= 500:
+        f["limit"] = int(m.group(1)); cut(m)
+    toks = re.findall(r"[a-z0-9.]+|[\u0900-\u097F]+", low)
+    # source: "GK channel ki files", "channel Test se", "@mychannel", or a known source title in the text
+    src = ""
+    m = re.search(r"(@[a-z0-9_]{4,})", low)
+    if m:
+        src = m.group(1)
+    if not src:
+        m = re.search(r"(?:^|\s)((?:[\w\u0900-\u097F.&-]+\s+){0,3}?[\w\u0900-\u097F.&-]+)\s+(?:channel|chanel|chnl|group)\s+"
+                      r"(?:ki|ke|ka|se|wali|wale|vali|vale|me|mein|mai|m)\b", low)
+        if m:
+            words = [w for w in m.group(1).split() if w not in _FILTER_STOP and not w.isdigit()]
+            src = " ".join(words[-3:])
+    if not src:
+        m = re.search(r"\b(?:source|channel|chanel)\s+[\"“']?([\w\u0900-\u097F .&-]{2,40}?)[\"”']?\s+(?:ki|ke|ka|se|wali|wale|me)\b", low)
+        if m:
+            words = [w for w in m.group(1).split() if w not in _FILTER_STOP]
+            src = " ".join(words[:3])
+    if not src and sources:
+        for title in sorted((s for s in sources if s), key=len, reverse=True):
+            tl = title.lower().strip()
+            if len(tl) >= 4 and not subject_from_word(tl, fuzzy=False) and re.search(r"(?<![\w])" + re.escape(tl) + r"(?![\w])", low):
+                src = tl
+                break
+    if src:
+        f["source"] = src[:60]
+    src_words = set(src.lstrip("@").split()) if src else set()
+    # subject: two-word phrases first, then words (whole words; Devanagari too)
+    subj = ""
+    for i in range(len(toks) - 1):
+        if toks[i] in src_words or toks[i + 1] in src_words:
+            continue
+        s = subject_from_word(toks[i] + " " + toks[i + 1], fuzzy=False)
+        if s:
+            subj, _pair = s, (toks[i], toks[i + 1])
+            used.extend(_pair)
+            break
+    if not subj:
+        for t in toks:
+            if t in src_words or t in _FTYPE_WORD:
+                continue
+            s = subject_from_word(t, fuzzy=t not in _FILTER_STOP)
+            if s:
+                subj = s
+                used.append(t)
+                break
+    if subj:
+        f["subject"] = subj
+    for t in toks:
+        if t in _FTYPE_WORD:
+            f["type"] = _FTYPE_WORD[t]
+            break
+    if set(toks) & {"only", "sirf", "bas", "srf", "sirif", "keval", "sirph"}:
+        f["only"] = True
+    # leftover words → title words ("parmar sir wali files dikhao")
+    import difflib
+    used_words = set(" ".join(used).split()) | src_words
+    left = []
+    for t in toks:
+        if t in used_words or t in _FILTER_STOP or t in _FTYPE_WORD or t.isdigit() or len(t) <= 2 or subject_from_word(t, fuzzy=False):
+            continue
+        if re.fullmatch(r"[a-z]+", t) and difflib.get_close_matches(t, [w for w in _FILTER_STOP if len(w) >= 3], n=1, cutoff=0.8):
+            continue          # typo of a filler word ("dikhaoo", "fils")
+        if subject_from_word(t):
+            continue
+        left.append(t)
+    if left:
+        f["query"] = " ".join(left[:4])
+    return f
+
+
+FILTER_KEYS = ("subject", "type", "source", "min_size", "max_size", "date_from", "date_to", "limit", "query")
+
+
+def has_filters(f: Optional[Dict[str, Any]]) -> bool:
+    return bool(f) and any(f.get(k) for k in FILTER_KEYS)
+
+
+def clean_ai_filters(raw: Any) -> Dict[str, Any]:
+    """Validate the AI's filters (whitelisted keys, normalised values)."""
+    out: Dict[str, Any] = {}
+    if not isinstance(raw, dict):
+        return out
+    s = raw.get("subject") or raw.get("category")
+    if isinstance(s, str) and s.strip():
+        slug = subject_from_word(s) or norm_category(s)
+        if slug and slug != "other" and known_category(slug):
+            out["subject"] = slug
+    t = raw.get("type")
+    if isinstance(t, str) and t.strip().lower() in _FTYPE_WORD:
+        out["type"] = _FTYPE_WORD[t.strip().lower()]
+    elif isinstance(t, str) and t.strip().lower() in FILE_TYPES:
+        out["type"] = t.strip().lower()
+    src = raw.get("source")
+    if isinstance(src, str) and 1 < len(src.strip()) <= 60:
+        out["source"] = src.strip().lower()
+    for k in ("min_size", "max_size"):
+        v = raw.get(k) if raw.get(k) is not None else raw.get(k + "_mb")
+        try:
+            if v is not None and str(v).strip() != "":
+                mv = re.match(r"^\s*(\d+(?:\.\d+)?)\s*(kb|mb|gb)?\s*$", str(v).lower())
+                if mv:
+                    val = _size_bytes(mv.group(1), mv.group(2) or "mb")
+                    if 0 < val < 5 * 1073741824:
+                        out[k] = val
+        except Exception:
+            pass
+    for k in ("date_from", "date_to"):
+        v = raw.get(k)
+        if isinstance(v, str) and re.match(r"^\d{4}-\d{2}-\d{2}", v.strip()):
+            d = v.strip()[:10]
+            try:
+                import calendar
+                ts = calendar.timegm(time.strptime(d, "%Y-%m-%d")) - IST_OFFSET  # IST midnight of that day
+                out[k] = _iso(ts)
+                out["date_label"] = (out.get("date_label", "") + (" " if out.get("date_label") else "") + ("se " if k == "date_from" else "tak ") + d).strip()
+            except Exception:
+                pass
+    try:
+        lim = int(raw.get("limit")) if raw.get("limit") not in (None, "", False) else 0
+        if 0 < lim <= 500:
+            out["limit"] = lim
+    except (TypeError, ValueError):
+        pass
+    q = raw.get("query")
+    if isinstance(q, str) and q.strip() and len(q.strip()) <= 60:
+        qs = " ".join(w for w in re.findall(r"[a-z0-9]+|[\u0900-\u097F]+", q.lower()) if w not in _FILTER_STOP and not subject_from_word(w, fuzzy=False))
+        if qs:
+            out["query"] = qs
+    return out
+
+
+def merge_filters(ai_f: Dict[str, Any], local_f: Dict[str, Any]) -> Dict[str, Any]:
+    """AI's filters, with the locally read ones filling every gap (a subject/type/source word in the text always counts)."""
+    out = dict(ai_f or {})
+    for k, v in (local_f or {}).items():
+        if k == "query":
+            continue
+        if not out.get(k) and v:
+            out[k] = v
+    if "date_from" in (local_f or {}) and "date_label" in local_f and out.get("date_from") == local_f.get("date_from"):
+        out["date_label"] = local_f["date_label"]
+    if not out.get("query") and (local_f or {}).get("query") and not ai_f:
+        out["query"] = local_f["query"]
+    return out
+
+
+def filter_label(f: Dict[str, Any]) -> str:
+    bits = []
+    if f.get("subject"):
+        bits.append(cat_label(f["subject"]))
+    if f.get("query"):
+        bits.append(f"\"{f['query']}\"")
+    if f.get("type"):
+        bits.append(TYPE_LABEL.get(f["type"], f["type"]))
+    if f.get("source"):
+        bits.append(f"📥 {f['source']}")
+    if f.get("min_size"):
+        bits.append(f"{human_size(f['min_size'])}+")
+    if f.get("max_size"):
+        bits.append(f"< {human_size(f['max_size'])}")
+    if f.get("date_from") or f.get("date_to"):
+        bits.append(f.get("date_label") or "date")
+    if f.get("limit"):
+        bits.append(f"last {f['limit']}")
+    return " · ".join(bits) or "Saari Files"
+
+
+def public_filters(f: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    f = f or {}
+    out = {k: f.get(k) for k in FILTER_KEYS}
+    out["subject"] = f.get("subject")
+    for k in ("min_size", "max_size"):
+        out[k] = human_size(f[k]) if f.get(k) else None
+    return out
+
+
+def _row_type(r: Dict[str, Any]) -> str:
+    mime = str(r.get("mime_type") or "").lower()
+    fn = str(r.get("file_name") or "").lower()
+    ext = fn.rsplit(".", 1)[-1] if "." in fn else ""
+    if mime == "application/pdf" or ext == "pdf":
+        return "pdf"
+    if mime.startswith("video/") or ext in {"mp4", "mkv", "avi", "mov", "webm", "3gp"}:
+        return "video"
+    if mime.startswith("audio/") or ext in {"mp3", "m4a", "ogg", "wav", "aac", "opus"}:
+        return "audio"
+    if mime.startswith("image/") or ext in {"jpg", "jpeg", "png", "webp", "gif"}:
+        return "image"
+    if ext in {"doc", "docx", "ppt", "pptx", "xls", "xlsx", "txt"} or "word" in mime or "presentation" in mime:
+        return "doc"
+    return "pdf" if not mime and not ext else "other"
+
+
+def _has_word(hay: str, w: str) -> bool:
+    if re.search(r"[\u0900-\u097F]", w):
+        return w in hay
+    return re.search(r"(?<![a-z0-9])" + re.escape(w) + r"(?![a-z0-9])", hay) is not None
+
+
+def subject_words(slug: str) -> List[str]:
+    ws = list(FILTER_SUBJECTS.get(slug, []))
+    ws += [w for s, _, _, words in SUBJECTS if s == slug for w in words]
+    ws += NAME_SUBJECT_WORDS.get(slug, [])
+    ws += [w for w, s in CAT_SYNONYMS.items() if s == slug and w]
+    ws += [w for s, _, _, words in EXTRA_KINDS if s == slug for w in words]
+    lab = cat_label(slug).lower()
+    if lab and lab != "other":
+        ws.append(lab)
+    return sorted({w.lower() for w in ws if w and len(w) >= 2}, key=len, reverse=True)
+
+
+def row_matches(r: Dict[str, Any], f: Dict[str, Any], cmap: Dict[str, str]) -> bool:
+    name = " ".join(str(r.get(k) or "") for k in ("title", "file_name", "caption")).lower()
+    if f.get("subject"):
+        slug = f["subject"]
+        if r.get("_cat") != slug and not any(_has_word(name, w) for w in subject_words(slug)):
+            return False
+    if f.get("type") and _row_type(r) != f["type"]:
+        return False
+    if f.get("source"):
+        s = f["source"].lstrip("@").lower()
+        hay = " ".join(str(r.get(k) or "") for k in ("source_chat_title", "source_chat_username")).lower()
+        if s not in hay and not all(w in hay for w in s.split()):
+            return False
+    size = r.get("file_size")
+    try:
+        size = int(size) if size is not None else None
+    except (TypeError, ValueError):
+        size = None
+    if f.get("min_size") and (size is None or size < int(f["min_size"])):
+        return False
+    if f.get("max_size") and (size is None or size > int(f["max_size"])):
+        return False
+    created = str(r.get("created_at") or "")[:19].replace(" ", "T")
+    if f.get("date_from") and (not created or created < f["date_from"][:19]):
+        return False
+    if f.get("date_to") and (not created or created >= f["date_to"][:19]):
+        return False
+    if f.get("query"):
+        hay = name + " " + str(r.get("keywords") or "").lower()
+        if not all(_has_word(hay, w) or w in hay for w in f["query"].split()):
+            return False
+    return True
+
+
+def filtered_rows(f: Dict[str, Any]) -> List[Dict[str, Any]]:
+    cols = ("id,title,file_name,file_size,mime_type,language,source_chat_title,source_chat_username,created_at,caption,keywords"
+            + (",category" if has_category_col() else ""))
+    rows = supabase("books", "GET", query=f"?select={cols}&status=eq.indexed&order=id.desc&limit=5000")
+    cmap = {} if has_category_col() else catmap()
+    out = []
+    for r in rows:
+        if f.get("subject"):
+            r["_cat"] = book_category(r, cmap)
+        if row_matches(r, f, cmap):
+            out.append(r)
+    out.sort(key=lambda r: int(r.get("id") or 0), reverse=True)
+    if f.get("limit"):
+        out = out[:int(f["limit"])]
+    return out
+
+
+def save_filter(f: Dict[str, Any]) -> str:
+    body = json.dumps({k: f[k] for k in sorted(f) if f.get(k) not in (None, "", False)}, ensure_ascii=False, separators=(",", ":"))
+    tok = hashlib.sha256(body.encode()).hexdigest()[:8]
+    try:
+        set_setting(f"flt:{tok}", body)
+    except Exception:
+        log_error("save_filter")
+    return tok
+
+
+def load_filter(tok: str) -> Optional[Dict[str, Any]]:
+    try:
+        v = json.loads(get_setting(f"flt:{tok}") or "null")
+        return v if isinstance(v, dict) else None
+    except Exception:
+        return None
+
+
+def top_categories_kb(n: int = 6) -> List[Any]:
+    try:
+        rows = category_rows()
+    except Exception:
+        rows = []
+    counts: Dict[str, int] = {}
+    for r in rows:
+        counts[r["_cat"]] = counts.get(r["_cat"], 0) + 1
+    kb: List[Any] = []
+    row: List[Any] = []
+    for slug in sorted(counts, key=lambda s: (s == "other", -counts[s]))[:n]:
+        row.append({"text": f"{cat_emoji(slug)} {cat_label(slug)} ({counts[slug]})", "callback_data": f"cat:{slug}:1"})
+        if len(row) == 2:
+            kb.append(row)
+            row = []
+    if row:
+        kb.append(row)
+    return kb
+
+
+def filtered_files_view(f: Dict[str, Any], page: int = 1, tok: str = "") -> Any:
+    if not has_filters(f):
+        return files_view(page)
+    rows = filtered_rows(f)
+    label = filter_label(f)
+    if not rows:
+        lines = [f"😕 {label} ki koi file nahi mili."]
+        kb = top_categories_kb()
+        if kb:
+            lines.append("\n🗂️ Ye categories hain 👇")
+        return "\n".join(lines), {"inline_keyboard": kb + [[{"text": "📂 All Files", "callback_data": "ad:files:1"}], BACK_ROW]}
+    tok = tok or save_filter(f)
+    total = len(rows)
+    pages = max(1, -(-total // FILES_PAGE))
+    page = min(max(1, int(page)), pages)
+    part = rows[(page - 1) * FILES_PAGE: page * FILES_PAGE]
+    lines = [f"📂 {label} — {total} file{'s' if total != 1 else ''}", f"Page {page}/{pages} · nayi files upar", ""]
+    nums: List[Any] = []
+    for n, r in enumerate(part, (page - 1) * FILES_PAGE + 1):
+        bits = [x for x in (human_size(r.get("file_size")), str(r.get("source_chat_title") or "")[:20]) if x]
+        lines.append(f"{n}. {str(r.get('title') or 'Untitled')[:70]}" + (f"\n    {' · '.join(bits)}" if bits else ""))
+        nums.append({"text": str(n), "callback_data": f"ad:f:{r['id']}:{page}:{tok}"})
+    lines.append("\nFile ka number dabao → 📤 Bhejo / ✏️ Rename / ❌ Hatao")
+    kb = [nums[i:i + 5] for i in range(0, len(nums), 5)]
+    nav = []
+    if page > 1:
+        nav.append({"text": "⬅️ Previous", "callback_data": f"ad:fl:{tok}:{page - 1}"})
+    nav.append({"text": f"{page}/{pages}", "callback_data": "ad:noop"})
+    if page < pages:
+        nav.append({"text": "Next ➡️", "callback_data": f"ad:fl:{tok}:{page + 1}"})
+    kb.append(nav)
+    kb.append([{"text": "📂 Saari Files", "callback_data": "ad:files:1"}])
+    kb.append(BACK_ROW)
+    return "\n".join(lines)[:4000], {"inline_keyboard": kb}
+
+
+def known_sources() -> List[str]:
+    v = _REQ.get("_srcnames")
+    if v is None:
+        v = []
+        try:
+            for r in supabase("channels", "GET", query="?select=title,username&limit=200"):
+                v += [str(r.get("title") or ""), str(r.get("username") or "")]
+        except Exception:
+            pass
+        _REQ["_srcnames"] = v = [x for x in v if x]
+    return v
+
+
+# ---- move a file to another category ("Parmar sir polity pdf ko history category me daal do")
+
+def move_category_flow(chat_id: int, user_id: int, find: str, to: str, query: Optional[Dict[str, Any]] = None) -> None:
+    slug = subject_from_word(to) or norm_category(to)
+    if not slug or not known_category(slug):
+        names = ", ".join(cat_label(s) for s, _, _, _ in SUBJECTS if s != "other")
+        send_text(chat_id, f"🤔 \"{to[:30]}\" naam ki category nahi hai.\nInme se likho: {names}",
+                  {"inline_keyboard": [[{"text": "🗂️ Categories", "callback_data": "user_categories"}], BACK_ROW]})
+        return
+    if not find:
+        send_text(chat_id, f"🗂️ Kaunsi file {cat_label(slug)} me daalni hai? File ka naam likho, jaise:\n"
+                           f"\"Parmar sir polity pdf ko {cat_label(slug).lower()} category me daal do\"", {"inline_keyboard": [BACK_ROW]})
+        return
+    rows = find_books(find, 8)
+    if not rows:
+        send_text(chat_id, f"😕 \"{find[:60]}\" naam ki koi file nahi mili.", {"inline_keyboard": [[{"text": "📂 All Files", "callback_data": "ad:files:1"}], BACK_ROW]})
+        return
+    if len(rows) == 1:
+        r = rows[0]
+        ask_confirm(chat_id, user_id, f"🗂️ Category badalni hai?\n\n📄 {str(r.get('title') or '')[:70]}\n→ {cat_emoji(slug)} {cat_label(slug)}",
+                    {"kind": "setcat", "ids": [int(r["id"])], "cat": slug}, query)
+        return
+    token = set_op(user_id, {"kind": "setcat_pick", "cat": slug, "ids": [int(r["id"]) for r in rows]})
+    kb = [[{"text": f"🗂️ {str(r.get('title') or 'Untitled')[:40]}", "callback_data": f"ad:op:c:{token}:{r['id']}"}] for r in rows]
+    kb.append([{"text": "❌ Deny", "callback_data": f"ad:op:n:{token}"}])
+    send_text(chat_id, f"🔎 \"{find[:60]}\" se {len(rows)} files mili. Kaunsi {cat_label(slug)} me daalni hai?", {"inline_keyboard": kb})
+
+
+def apply_setcat(user_id: int, ids: List[int], slug: str) -> List[str]:
+    idl = ",".join(str(int(x)) for x in ids)
+    rows = supabase("books", "GET", query=f"?id=in.({idl})&select=id,title,keywords") if idl else []
+    save_categories({int(r["id"]): slug for r in rows})
+    for r in rows:
+        try:
+            supabase("books", "PATCH", {"keywords": with_cat_tag(str(r.get("keywords") or ""), slug)}, f"?id=eq.{int(r['id'])}")
+        except Exception:
+            log_error("setcat keywords")
+    try:
+        audit_log(f"🗂️ Category badli ({actor_label(user_id)}): " + "; ".join(str(r.get("title") or "")[:50] for r in rows[:5])
+                  + f" → {cat_label(slug)}\n🕒 {ist_now()}")
+    except Exception:
+        log_error("setcat log")
+    return [str(r.get("title") or "") for r in rows]
+
+
+def delete_filtered_flow(chat_id: int, user_id: int, f: Dict[str, Any], find: str = "") -> None:
+    """Delete with a filter never deletes in bulk: it lists the matches, each one asks ✅ Accept / ❌ Deny."""
+    rows = filtered_rows(f)
+    label = filter_label(f)
+    if not rows:
+        send_text(chat_id, f"😕 {label} ki koi file nahi mili — kuch nahi hataya.", {"inline_keyboard": [[{"text": "📂 All Files", "callback_data": "ad:files:1"}], BACK_ROW]})
+        return
+    if len(rows) == 1:
+        send_text(chat_id, *confirm_view(f"fdel:{rows[0]['id']}"))
+        return
+    kb = [[{"text": f"❌ {str(r.get('title') or 'Untitled')[:42]}", "callback_data": f"ad:fdel:{r['id']}"}] for r in rows[:10]]
+    more = f"\n(pehli 10 dikha raha hu, kul {len(rows)})" if len(rows) > 10 else ""
+    send_text(chat_id, f"🔎 {label}: {len(rows)} files mili. Kaunsi hatani hai?\nEk-ek karke — har file pe ✅ Accept / ❌ Deny puchega.{more}",
+              {"inline_keyboard": kb + [BACK_ROW]})
+
+
+def admin_parse(text: str, use_ai: bool = True, user_id: int = 0) -> Dict[str, Any]:
+    """The whole reading of an admin message (diag + tests): local → AI → merged result."""
+    local = local_admin_intent(text)
+    res: Dict[str, Any] = {"text": text, "local": local, "ai": None, "source": "local" if local else None}
+    final = local
+    if local is None and use_ai and looks_like_command(text):
+        ai = ai_admin_intent(user_id, text)
+        res["ai"] = ai
+        final = ai
+        res["source"] = "ai" if ai else "none"
+    res["final"] = final
+    return res
 
 
 # ---- rename / bulk rename / delete flows
@@ -4351,6 +5124,15 @@ def preview_rename(chat_id: int, user_id: int, items: List[Any], query: Optional
         lines.append(f"{n}. {old[:70]}\n   → {new[:70]}")
     if len(items) > 12:
         lines.append(f"\n…aur {len(items) - 12} files")
+    try:
+        ids = ",".join(str(i) for i, _, _ in items[:50])
+        big = [r for r in supabase("books", "GET", query=f"?id=in.({ids})&select=id,file_size,mime_type") if
+               int(r.get("file_size") or 0) > TG_FILE_LIMIT] if ids else []
+    except Exception:
+        big = []
+    if big:
+        lines.append("\n⚠️ 20 MB se badi file ka asli naam Telegram badalne nahi deta, caption me naya naam dikhega"
+                     + (f" ({len(big)} files)" if len(big) > 1 else ""))
     op = {"kind": "rename", "items": [[i, o[:300], n[:300]] for i, o, n in items]}
     op.update(extra or {})
     ask_confirm(chat_id, user_id, "\n".join(lines)[:3900], op, query)
@@ -4497,6 +5279,12 @@ def run_op(query: Dict[str, Any], chat_id: int, user_id: int, op: Dict[str, Any]
             return
         logfill_start(user_id, chat_id, int(op.get("n") or 0))
         logfill_run_from_button(query, chat_id)
+    elif kind == "setcat":
+        clear_op(user_id)
+        slug = str(op.get("cat") or "")
+        titles = apply_setcat(user_id, [int(x) for x in op.get("ids") or []], slug)
+        show(chat_id, f"✅ Category badal di → {cat_emoji(slug)} {cat_label(slug)}\n" + "\n".join(f"• {t[:60]}" for t in titles[:5]),
+             {"inline_keyboard": [[{"text": f"📂 {cat_label(slug)} ki files", "callback_data": f"cat:{slug}:1"}], BACK_ROW]}, query)
     elif kind == "addch":
         clear_op(user_id)
         if op.get("ch") == "join":
@@ -4736,9 +5524,25 @@ def handle_admin_callback_v6(query: Dict[str, Any], cmd: str, chat_id: int, user
         page = cmd.split(":", 1)[1] if ":" in cmd else "1"
         show(chat_id, *files_view(int(page) if page.isdigit() else 1), query=query)
         return True
+    if cmd.startswith("fl:"):      # filtered list page: ad:fl:<filter token>:<page>
+        parts = cmd.split(":")
+        flt = load_filter(parts[1]) if len(parts) > 1 else None
+        page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
+        if flt is None:
+            show(chat_id, *files_view(page), query=query)
+        else:
+            show(chat_id, *filtered_files_view(flt, page, parts[1]), query=query)
+        return True
     if cmd.startswith("f:"):
         parts = cmd.split(":")
-        show(chat_id, *file_menu_view(int(parts[1]), int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1), query=query)
+        page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
+        text, kb = file_menu_view(int(parts[1]), page)
+        if len(parts) > 3 and parts[3]:
+            for row in kb.get("inline_keyboard", []):
+                for b in row:
+                    if b.get("callback_data") == f"ad:files:{page}":
+                        b["callback_data"] = f"ad:fl:{parts[3]}:{page}"
+        show(chat_id, text, kb, query=query)
         return True
     if cmd.startswith("fs:"):
         rows = supabase("books", "GET", query=f"?id=eq.{int(cmd[3:])}&select=*&limit=1")
@@ -4823,6 +5627,12 @@ def handle_admin_callback_v6(query: Dict[str, Any], cmd: str, chat_id: int, user
             if rows:
                 preview_rename(chat_id, user_id, [(rows[0]["id"], rows[0].get("title"),
                                                    new_name_for(str(rows[0].get("title") or ""), op["find"], op["to"]))], query)
+        elif verb == "c" and op.get("kind") == "setcat_pick" and len(parts) > 3 and parts[3].isdigit():
+            rows = supabase("books", "GET", query=f"?id=eq.{int(parts[3])}&select=id,title&limit=1")
+            if rows:
+                slug = str(op.get("cat") or "")
+                ask_confirm(chat_id, user_id, f"🗂️ Category badalni hai?\n\n📄 {str(rows[0].get('title') or '')[:70]}\n→ {cat_emoji(slug)} {cat_label(slug)}",
+                            {"kind": "setcat", "ids": [int(rows[0]["id"])], "cat": slug}, query)
         elif verb == "a" and op.get("kind") == "rename_pick":
             ids = ",".join(str(int(x)) for x in op.get("ids") or [])
             rows = supabase("books", "GET", query=f"?id=in.({ids})&select=id,title") if ids else []
@@ -6319,6 +7129,24 @@ def aidiag() -> Any:
                              "key_terms": [k for k in u["keywords"] if is_key_term(k)]}
         except Exception as exc:
             res["search"] = {"error": _err_class(exc)}
+    if request.args.get("a"):      # admin command reading: local rules → AI → merged filters, + matching files in the live DB
+        try:
+            txt_a = request.args.get("a", "")[:300]
+            p = admin_parse(txt_a, use_ai=request.args.get("noai") != "1", user_id=0)
+            out_a: Dict[str, Any] = {"text": txt_a, "source": p["source"], "local": p["local"], "ai": p["ai"]}
+            if request.args.get("ai") == "1":       # also ask the AI for the same text (shows the structured JSON)
+                out_a["ai_forced"] = ai_admin_intent(0, txt_a)
+            fin = p["final"] or {}
+            out_a["action"] = fin.get("action")
+            out_a["filters"] = public_filters(fin.get("filters")) if "filters" in fin else None
+            if fin.get("action") in ("list_files", "delete_file") and has_filters(fin.get("filters")):
+                rows_a = filtered_rows(fin["filters"])
+                out_a["header"] = f"📂 {filter_label(fin['filters'])} — {len(rows_a)} files"
+                out_a["count"] = len(rows_a)
+                out_a["files"] = [str(r.get("title"))[:70] for r in rows_a[:30]]
+            res["admin"] = out_a
+        except Exception as exc:
+            res["admin"] = {"error": _err_class(exc)}
     if request.args.get("u"):
         try:
             txt_u = request.args.get("u", "")[:200]
@@ -6950,6 +7778,8 @@ CMD_EXAMPLES = ("⚙️ Bolke kaam — aise likho:\n"
                 "▸ \"abhi tak ki sari updates log chat me dal do\"\n"
                 "▸ \"sari ek baar me upload kro\" (backup)\n"
                 "▸ \"lucent wali file hatao\"\n"
+                "▸ \"only polity ki sari pdf dikhao\" / \"aaj ki files\" / \"last 5 files\"\n"
+                "▸ \"Parmar sir pdf ko polity category me daal do\"\n"
                 "▸ \"users dikhao\" / \"status\" / \"bot restart kro\"\n\n"
                 "Ya niche se button chuno 👇")
 
