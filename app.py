@@ -169,25 +169,32 @@ def audit_log(text: str) -> None:
 
 
 def flush_logs() -> None:
+    """📝 Log Chat: one short message per event (🆕 / ✏️ / 📥); the last 50 are always kept for /logs."""
     lines = [x for x in _LOG_QUEUE if x]
     _LOG_QUEUE.clear()
     if not lines:
         return
+    try:
+        remember_logs(lines)
+    except Exception:
+        log_error("log_recent")
     target = get_setting("log_chat_id")
     if not target:
         return
+    # one message per event; a burst bigger than 6 sends the rest joined (Telegram limits ~20 msgs/min per chat)
+    parts = lines[:6]
+    rest = lines[6:]
     chunk = ""
-    chunks = []
-    for line in lines:
+    for line in rest:
         if len(chunk) + len(line) > 3500:
-            chunks.append(chunk)
+            parts.append(chunk)
             chunk = ""
         chunk = (chunk + "\n\n" + line) if chunk else line
     if chunk:
-        chunks.append(chunk)
-    for part in chunks[:3]:
+        parts.append(chunk)
+    for part in parts[:9]:
         try:
-            telegram("sendMessage", {"chat_id": int(target), "text": part, "disable_web_page_preview": True,
+            telegram("sendMessage", {"chat_id": int(target), "text": part[:4000], "disable_web_page_preview": True,
                                      "disable_notification": True})
         except Exception:
             log_error("log chat")
@@ -767,7 +774,13 @@ def status_text(user_id: Optional[int]) -> str:
             lines.append("ℹ️ Auto-save off wale channels ki files forward karke save karo, ya bot ko admin banao. Purani files chalti rahengi.")
     except Exception as exc:
         lines.append(f"\nSource channels: error {str(exc)[:80]}")
-    lines.append(f"Backup: {'ON' if get_setting('backup_chat_id') else 'OFF'} | Log chat: {'ON' if get_setting('log_chat_id') else 'OFF'}")
+    lines.append(f"Backup: {'ON' if get_setting('backup_chat_id') else 'OFF'} | Log chat: {'ON' if get_setting('log_chat_id') else 'OFF (/logs se dekho)'}")
+    try:
+        nb = named_by_counts()
+        lines.append(f"🏷️ Naam kaise bane: saaf naam {nb['clean']} · page padhke {nb['local_text']} (dono 0 token) · "
+                     f"AI {nb['ai']} · fallback {nb['fallback']}")
+    except Exception:
+        pass
     lines.append("\nNote: admins par join gate lagu nahi hota. Gate test karne ke liye dusre (normal) account se /start karo.")
     return "\n".join(lines)
 
@@ -998,7 +1011,8 @@ def handle_admin_callback(query: Dict[str, Any], data: str, chat_id: int, user_i
         show(chat_id, users_view(), {"inline_keyboard": [[{"text": "🔄 Refresh", "callback_data": "ad:users"}], BACK_ROW]}, query)
     elif cmd == "log":
         show(chat_id, *setting_view("log_chat_id", "📝 Log Chat (User Track)", "ad:setlog", "ad:logoff",
-                                    "Naya user aaya, kisne kaunsi file li, nayi file save hui — sab yahan aayega."), query=query)
+                                    "Yahan aayega: 🆕 nayi file (kab, kahan se, purana naam → naya naam, category), ✏️ naam badla (kisne), "
+                                    "📥 kis user ne kaunsi file li, 🗂️ nayi category bani. Set na ho to /logs se last 50 dekho."), query=query)
     elif cmd in {"setbackup", "setlog"}:
         ask_input(chat_id, user_id, cmd)
     elif cmd in {"backupoff", "logoff"}:
@@ -2212,16 +2226,17 @@ def ensure_backup(record: Dict[str, Any], from_chat: Any, message_id: Any, data:
 
 
 def index_file(record: Dict[str, Any], from_chat: Any, message_id: Any, where: str) -> str:
-    """Save a file to the catalog: name it from its CONTENT (AI, automatic), put it in a subject category,
-    THEN back it up once (backup copy carries the clean name), and log it."""
-    text = record.pop("_text", None) or {"excerpt": "", "content": ""}
-    data = record.pop("_bytes", None)
-    orig_title = str(record.get("title") or "")
+    """Save a file to the catalog: name it the cheapest way (clear name → no reading; unclear → page 1..3 locally;
+    AI only as last resort), put it in a category, THEN back it up once (clean name), and log it."""
+    record.pop("_text", None)
+    record.pop("_bytes", None)
+    orig_title = str(record.get("file_name") or "") or str(record.get("title") or "")
     try:
-        how = name_new_file(record, text)
+        how = name_new_file(record)
     except Exception:
-        log_error("ai_title")
-        how = "local"
+        log_error("name_new_file")
+        how = "fallback"
+    data = record.pop("_bytes", None)
     slug = record.pop("_cat", None) or "other"
     record["keywords"] = with_cat_tag(clean_text(" ".join(str(x or "") for x in (
         record.get("title"), record.get("keywords"))))[:3990], slug)
@@ -2241,20 +2256,33 @@ def index_file(record: Dict[str, Any], from_chat: Any, message_id: Any, where: s
             save_categories({int(book_id): slug})
         except Exception:
             log_error("catmap")
-    if how == "retry":
+    if record.pop("_retry", None):
         queue_name_retry(book_id)
+    if how != "kept":
+        try:
+            count_named_by(how)
+        except Exception:
+            log_error("named_by")
     record["_cat"] = slug
+    # name changed but the file was never downloaded (clear name): fetch it only to store the backup under the
+    # clean FILE name (no reading, no AI). Bigger than 15 MB → copy of the post with the clean caption.
+    try:
+        if not data and get_setting("backup_chat_id") and how == "clean" and record.get("file_name") and \
+                safe_filename(str(record.get("title") or ""), str(record["file_name"])) != record["file_name"] and \
+                int(record.get("file_size") or 0) <= REUPLOAD_LIMIT and req_elapsed() < 4.0:
+            got = download_file(record.get("telegram_file_id"), record.get("file_size"))
+            data = got if got and len(got) <= REUPLOAD_LIMIT else None
+    except Exception:
+        data = None
     try:
         backup = ensure_backup(record, from_chat, message_id, data)
     except Exception:
         log_error("ensure_backup")
         backup = "failed"
     record.pop("_cat", None)
-    mark = {"saved": " · 💾 backup ✅", "dup": " · 💾 pehle se backup", "failed": " · 💾 backup ❌"}.get(backup, "")
-    named = orig_title if str(record.get("title") or "") != orig_title else ""
-    audit_log(f"📥 Nayi file save: {str(record.get('title') or '')[:80]} [{SUBJECT_LABEL.get(slug, slug)}] — {where}{mark}" +
-              (f" · 🤖 AI naam (asli: {str(record.get('file_name') or named)[:60]})" if how == "ai" and named else "") +
-              (" · ⏳ AI naam baad me" if how == "retry" else ""))
+    if how != "kept":
+        audit_log(file_added_log(record, orig_title, slug, how, where, backup))
+    record.pop("_pages", None)
     return backup
 
 
@@ -2418,10 +2446,8 @@ def build_metadata(message: Dict[str, Any], channel: Dict[str, Any]) -> Dict[str
     caption = message.get("caption", "") or ""
     raw_name = info.get("file_name", "")
     title = clean_text(caption) or clean_text(os.path.splitext(raw_name)[0])
-    # Read the file itself (≤20 MB, Telegram's bot limit): first pages → AI name + subject; more pages → search.
-    data = download_file(info.get("file_id"), info.get("file_size"))
-    text = text_from_bytes(data, raw_name, info.get("mime_type") or "")
-    content_text = text["content"]
+    # The file is NOT read here: name_new_file reads it only when the name is unclear (page by page, max 3).
+    content_text = ""
     searchable = " ".join([title, caption, raw_name, channel.get("title", ""), content_text])
     # Captions can contain explicit tags such as #ssc #english; retain them for search.
     keywords = clean_text(searchable)
@@ -2442,8 +2468,6 @@ def build_metadata(message: Dict[str, Any], channel: Dict[str, Any]) -> Dict[str
         "content_text": content_text,
         "language": detect_language(searchable),
         "status": "indexed",
-        "_text": text,
-        "_bytes": data if data and len(data) <= REUPLOAD_LIMIT else None,
     }
 
 
@@ -2507,6 +2531,7 @@ ADMIN_MENU = USER_MENU + [
     {"command": "report", "description": "Admin: report"},
     {"command": "rename", "description": "Admin: file ka naam badlo"},
     {"command": "files", "description": "Admin: saari files (10-10 page)"},
+    {"command": "logs", "description": "Owner: update log (nayi file, naam badla, kisne li)"},
     {"command": "addadmin", "description": "Owner: sub-admin jodo"},
     {"command": "removeadmin", "description": "Owner: sub-admin hatao"},
     {"command": "cancel", "description": "Admin: chal raha kaam cancel"},
@@ -2578,7 +2603,8 @@ def log_delivery(chat_id: int, row: Dict[str, Any], user: Optional[Dict[str, Any
     note_user(user if user.get("first_name") else None, files=1)
     label = user_label({"first_name": user.get("first_name"), "last_name": user.get("last_name"),
                         "username": user.get("username")})
-    audit_log(f"📄 {label} ({uid}) ne li: {str(row.get('title') or '')[:80]}" + (f" — query: {q[:60]}" if q else ""))
+    audit_log(f"📥 File li · {ist_now()}\n👤 {label} ({uid})\n📄 {str(row.get('title') or '')[:80]}" +
+              (f"\n🔍 {q[:60]}" if q else ""))
 
 
 def send_by_file_id(chat_id: int, row: Dict[str, Any]) -> None:
@@ -2817,6 +2843,13 @@ def handle_admin_command(message: Dict[str, Any]) -> None:
         send_text(chat_id, status_text(user_id), status_markup())
     elif command == "/restart":
         send_text(chat_id, restart_text(), status_markup())
+    elif command == "/logs":
+        if not is_owner(user_id):
+            send_text(chat_id, "Ye sirf owner ke liye hai.")
+        else:
+            n = int(arg) if arg.strip().isdigit() else 15
+            for part in logs_text(n):
+                send_text(chat_id, part)
     elif command == "/aitest":
         send_text(chat_id, ai_test_text(), {"inline_keyboard": [[{"text": "🔁 Dobara test", "callback_data": "ad:aitest"}], BACK_ROW]}, "HTML")
     elif command == "/ainaming":
@@ -2889,7 +2922,7 @@ def handle_admin_command(message: Dict[str, Any]) -> None:
             handle_admin_input(dict(message, text=arg), "setbackup", None)
     elif command == "/setlogchat":
         if not arg:
-            send_text(chat_id, *setting_view("log_chat_id", "📝 Log Chat", "ad:setlog", "ad:logoff", "Index/delivery logs yahan."))
+            send_text(chat_id, *setting_view("log_chat_id", "📝 Log Chat", "ad:setlog", "ad:logoff", "Nayi file, naam badla, kisne file li — sab yahan. (/logs = last 50)"))
         else:
             handle_admin_input(dict(message, text=arg), "setlog", None)
     elif command in {"/report", "/stats"}:
@@ -3493,7 +3526,8 @@ def backup_flow(chat_id: int, user_id: int) -> None:
                                   f"(20-20 karke, koi duplicate nahi).\n\nShuru karu?", {"kind": "backup"})
 
 
-def apply_renames(items: List[Any], cats: Optional[Dict[str, str]] = None, budget: float = 6.5) -> List[Any]:
+def apply_renames(items: List[Any], cats: Optional[Dict[str, str]] = None, budget: float = 6.5,
+                  who: str = "admin") -> List[Any]:
     """Apply [[id, old, new], ...]; the original file name / caption stay searchable. Returns items not done (time budget)."""
     started = time.monotonic()
     ids = [int(x[0]) for x in items]
@@ -3518,6 +3552,10 @@ def apply_renames(items: List[Any], cats: Optional[Dict[str, str]] = None, budge
             save_categories({int(k): v for k, v in cats.items()})
         except Exception:
             log_error("save_categories")
+    try:
+        rename_log(items[:len(items) - len(left)], who)
+    except Exception:
+        log_error("rename_log")
     return left
 
 
@@ -3525,7 +3563,8 @@ def run_op(query: Dict[str, Any], chat_id: int, user_id: int, op: Dict[str, Any]
     kind = op.get("kind")
     if kind == "rename":
         items = op.get("items") or []
-        left = apply_renames(items, op.get("cats"))
+        who = actor_label(user_id) + (" · AI se purane naam theek" if op.get("next_after") is not None else "")
+        left = apply_renames(items, op.get("cats"), who=who)
         done = items[:len(items) - len(left)]
         lines = [f"✅ {len(done)} file ka naam badal diya" if len(done) != 1 else "✅ Naam badal diya:"]
         for _, old, new in done[:5]:
@@ -3970,6 +4009,11 @@ def health() -> Any:
     except Exception as exc:
         log_error("name_queue")
         names = {"error": type(exc).__name__}
+    try:
+        flush_logs()        # ✏️ renames done by the retry go to the log too
+    except Exception:
+        log_error("flush_logs")
+    _REQ.clear()
     status = setup_status()
     status["webhook_registered"] = registered
     status["self_heal"] = heal
@@ -4026,6 +4070,12 @@ def diagnostics() -> Dict[str, Any]:
     except Exception:
         pass
     d["log_chat_set"] = bool(get_setting("log_chat_id"))
+    try:
+        d["named_by"] = named_by_counts()          # clean / local_text = 0 tokens; ai = one small call; fallback
+        d["categories_auto"] = sorted(cat_registry())
+        _REQ.pop("_catreg", None)
+    except Exception:
+        pass
     return d
 
 
@@ -4048,6 +4098,10 @@ def setup_status() -> Dict[str, Any]:
         "ai_naming": "on" if ai_naming_on() else "off",
         "admin_commands": "on",
     }
+    try:  # how new files got their names: clean + local_text cost 0 tokens, ai = one small call each
+        status["named_by"] = named_by_counts()
+    except Exception:
+        pass
     if GROQ_KEYS:
         # Key check without spending tokens (lists models). Never shows a key.
         checks_ai = {}
@@ -4341,8 +4395,11 @@ AI_NAME2_SYSTEM = (
     "REMOVE person, uploader and channel names (\"History by Aarav\" -> \"History\"), @usernames, links, 'join', promo text, "
     "emojis, file extensions, codes and random letters. Never invent a book title or author. "
     "subject: exactly one of History, Polity, Geography, Economics, Science, Static GK, Current Affairs, Maths, Reasoning, "
-    "Hindi, English, Computer, PYQ, Mock, Other (PYQ = previous year papers, Mock = mock tests / practice sets; Hindi / "
-    "English only for language grammar/literature, not for a book merely written in Hindi).")
+    "Hindi, English, Computer, PYQ, Mock, Admit Card, Answer Key, Result, Cut Off, Syllabus, Notification, Typing, "
+    "Data Analysis, Other (PYQ = previous year papers, Mock = mock tests / practice sets; Hindi / "
+    "English only for language grammar/literature, not for a book merely written in Hindi). If none of these fits but "
+    "the file is clearly a new kind of file, give a NEW short English category of 1-3 words (e.g. Physical Test, "
+    "Interview); otherwise Other.")
 
 
 def title_supported2(title: str, source: str) -> bool:
@@ -4378,7 +4435,9 @@ def ai_name_items(items: List[Dict[str, Any]], cap: float = 9.0, excerpt_chars: 
     payload = [{"i": x["i"], "file": str(x.get("file") or "")[:150],
                 "caption": re.sub(r"\s+", " ", str(x.get("caption") or ""))[:300],
                 "text": re.sub(r"\s+", " ", str(x.get("text") or ""))[:excerpt_chars]} for x in items]
-    content = ai_complete(AI_NAME2_SYSTEM, json.dumps(payload, ensure_ascii=False),
+    extra = [str(r.get("label")) for r in cat_registry().values() if r.get("label")]
+    system = AI_NAME2_SYSTEM + (" Categories the library already has: " + ", ".join(extra[:30]) + "." if extra else "")
+    content = ai_complete(system, json.dumps(payload, ensure_ascii=False),
                           max_tokens=min(2000, 80 + 60 * len(items)), cap=cap)
     _LAST_NAME_RAW[0] = (content or "")[:1500]
     if not content:
@@ -4396,7 +4455,7 @@ def ai_name_items(items: List[Dict[str, Any]], cap: float = 9.0, excerpt_chars: 
         x = by_i[t["i"]]
         title = clean_ai_title(strip_people(str(t.get("title") or "")))
         source = " ".join(str(x.get(k) or "") for k in ("caption", "file", "old", "text"))
-        subj = norm_subject(t.get("subject"))
+        subj = norm_category(t.get("subject"), create=True) if t.get("subject") else ""
         if len(title) >= 3 and title_supported2(title, source):
             out[int(t["i"])] = {"title": title, "subject": subj}
         elif subj:
@@ -4448,45 +4507,9 @@ def with_cat_tag(keywords: str, slug: str) -> str:
     return (k + (" " + CAT_TAG + slug if slug else ""))[:4000]
 
 
-def name_new_file(record: Dict[str, Any], text: Dict[str, str]) -> str:
-    """Set record title + category from the content. Returns "ai" | "local" | "retry" (AI failed → queue)."""
-    caption, fname = str(record.get("caption") or ""), str(record.get("file_name") or "")
-    uniq = record.get("telegram_file_unique_id")
-    if uniq:
-        # Already in the catalog (re-forward): keep its name + category, an admin may have renamed it. No AI.
-        cols = "id,title,file_name,keywords" + (",category" if has_category_col() else "")
-        have = supabase("books", "GET", query=f"?telegram_file_unique_id=eq.{urllib.parse.quote(str(uniq))}&select={cols}&limit=1")
-        if have:
-            record["title"] = have[0].get("title") or record.get("title")
-            record["_cat"] = book_category(have[0], {} if has_category_col() else catmap())
-            return "kept"
-    base = local_clean_name(caption, fname)
-    excerpt = text.get("excerpt") or ""
-    local_cat = classify_local(" ".join([base, caption[:300], fname]), excerpt or text.get("content") or "")
-    record["title"] = base[:500]
-    record["_cat"] = local_cat
-    if is_junk_name(os.path.splitext(fname)[0]) and not caption.strip() and local_cat != "other":
-        record["title"] = SUBJECT_LABEL[local_cat] + " Notes"
-    if not ai_naming_on() or not ai_provider() or not ai_name_budget_ok():
-        return "local"
-    if req_elapsed() > 6.5:
-        return "retry"
-    _count_day("ainame:all")
-    got = ai_name_items([{"i": 1, "caption": caption, "file": fname, "text": excerpt}],
-                        cap=max(2.0, min(7.0, 9.0 - req_elapsed())))
-    if got is None:
-        return "retry"
-    res = got.get(1) or {}
-    if res.get("title"):
-        record["title"] = res["title"][:500]
-    if res.get("subject") and res["subject"] != "other":
-        record["_cat"] = res["subject"]
-    return "ai"
-
-
 def backup_caption(record: Dict[str, Any]) -> str:
     slug = record.get("_cat") or record.get("category") or ""
-    cat = f"\n🗂️ {SUBJECT_LABEL.get(slug, '')}" if slug in SUBJECT_LABEL else ""
+    cat = f"\n🗂️ {cat_label(slug)}" if known_category(slug) else ""
     return (f"📄 {record.get('title') or ''}{cat}")[:1000]
 
 
@@ -4579,6 +4602,7 @@ def process_name_queue(budget: float = 8.0, max_items: int = 10) -> Dict[str, in
             title, row.get("caption"), row.get("file_name")))), slug)}
         try:
             supabase("books", "PATCH", patch, f"?id=eq.{bid}")
+            rename_log([[bid, row.get("title"), title]], "🤖 AI (auto, dobara try)")
             if row.get("backup_chat_id") and row.get("backup_message_id"):
                 try:
                     telegram("editMessageCaption", {"chat_id": row["backup_chat_id"], "message_id": row["backup_message_id"],
@@ -4604,8 +4628,11 @@ def book_category(row: Dict[str, Any], cmap: Dict[str, str]) -> str:
     if not slug:
         m = re.search(CAT_TAG + r"([a-z_]+)", str(row.get("keywords") or ""))
         slug = m.group(1) if m else ""
-    if slug not in SUBJECT_LABEL:
-        slug = classify_local(" ".join(str(row.get(k) or "") for k in ("title", "file_name")))
+    if not known_category(slug):
+        slug = name_category(" ".join(str(row.get(k) or "") for k in ("title", "file_name"))) or \
+            classify_local(" ".join(str(row.get(k) or "") for k in ("title", "file_name")))
+        if not known_category(slug):
+            slug = "other"
     return slug
 
 
@@ -4627,16 +4654,15 @@ def categories_view() -> Any:
         return "🗂️ <b>Categories</b>\n\nAbhi koi file nahi hai.", None
     kb: List[Any] = []
     row: List[Any] = []
-    for slug, label, emoji, _ in SUBJECTS:
-        if not counts.get(slug):
-            continue
-        row.append({"text": f"{emoji} {label} ({counts[slug]})", "callback_data": f"cat:{slug}:1"})
+    # every category that has files, biggest first, Other last (new categories appear by themselves)
+    for slug in sorted(counts, key=lambda s: (s == "other", -counts[s], cat_label(s))):
+        row.append({"text": f"{cat_emoji(slug)} {cat_label(slug)} ({counts[slug]})", "callback_data": f"cat:{slug}:1"})
         if len(row) == 2:
             kb.append(row)
             row = []
     if row:
         kb.append(row)
-    return (f"🗂️ <b>Categories</b> — {len(rows)} files\n\nSubject chuno 👇", {"inline_keyboard": kb})
+    return (f"🗂️ <b>Categories</b> — {len(counts)} categories, {len(rows)} files\n\nCategory chuno 👇", {"inline_keyboard": kb})
 
 
 def category_list_view(slug: str, page: int = 1) -> Any:
@@ -4645,7 +4671,7 @@ def category_list_view(slug: str, page: int = 1) -> Any:
     pages = max(1, (total + CAT_PAGE - 1) // CAT_PAGE)
     page = min(max(1, page), pages)
     chunk = rows[(page - 1) * CAT_PAGE: page * CAT_PAGE]
-    label = f"{SUBJECT_EMOJI.get(slug, '📁')} {SUBJECT_LABEL.get(slug, slug)}"
+    label = f"{cat_emoji(slug)} {cat_label(slug)}"
     if not chunk:
         return f"{label}\n\nIs category me abhi koi file nahi.", {"inline_keyboard": [[{"text": "🔙 Categories", "callback_data": "user_categories"}]]}
     kb = [[{"text": f"📄 {str(r.get('title') or 'Untitled')[:45]}", "callback_data": f"book:{r['id']}"}] for r in chunk]
@@ -4658,6 +4684,530 @@ def category_list_view(slug: str, page: int = 1) -> Any:
     kb.append(nav)
     kb.append([{"text": "🔙 Categories", "callback_data": "user_categories"}])
     return f"{label} — {total} files (page {page}/{pages})\n\nJo chahiye us par tap karo 👇", {"inline_keyboard": kb}
+
+
+# ================================================================ token-saving naming + dynamic categories + log (Oct 26 2026, 6:10 PM)
+# Aarav 5:57 PM: a file whose name already says what it is (History, Geo, GS, Result, Data Analysis, SSC GD…) is NOT
+# read and gets NO AI call — its name is only cleaned. Unclear names ("new pdf", "my pdf", "pdf by X", hjskjd,
+# IMG_123) are read page by page (max 3); the bot stops at the first page where a subject/topic is found locally
+# (Hindi + English keyword dictionary, 0 tokens). Only if 3 pages say nothing clear does ONE small AI call
+# (≤1200 chars) name it. New kinds of files open new categories by themselves; nothing fits → Other.
+
+EXTRA_KINDS = [  # slug, label, emoji, words — document kinds; their category opens itself on the first such file
+    ("admit_card", "Admit Card", "🎫", ["admit card", "admitcard", "admit-card", "hall ticket", "call letter", "प्रवेश पत्र",
+                                       "एडमिट कार्ड"]),
+    ("answer_key", "Answer Key", "🔑", ["answer key", "answerkey", "answer-key", "answer keys", "उत्तर कुंजी", "आंसर की"]),
+    ("result", "Result", "🏆", ["result", "results", "merit list", "रिजल्ट", "परिणाम", "मेरिट लिस्ट"]),
+    ("cut_off", "Cut Off", "📉", ["cut off", "cutoff", "cut-off", "कट ऑफ", "कटऑफ"]),
+    ("syllabus", "Syllabus", "📋", ["syllabus", "सिलेबस", "पाठ्यक्रम", "exam pattern", "परीक्षा पैटर्न"]),
+    ("notification", "Notification", "📢", ["notification", "vacancy", "advertisement", "अधिसूचना", "नोटिफिकेशन",
+                                           "विज्ञप्ति", "भर्ती विज्ञापन"]),
+    ("typing", "Typing", "⌨️", ["typing", "टाइपिंग", "steno", "स्टेनो"]),
+    ("data_analysis", "Data Analysis", "📊", ["data analysis", "data analytics", "data analyst", "डेटा विश्लेषण",
+                                              "डाटा विश्लेषण", "डेटा एनालिसिस"]),
+]
+EXAMS = [  # label, words — an exam name alone is a clear name; with no subject it becomes its own category
+    ("SSC GD", ["ssc gd", "sscgd", "एसएससी जीडी", "ssc जीडी"]), ("Agniveer", ["agniveer", "agnipath", "अग्निवीर", "अग्निपथ"]),
+    ("NTPC", ["ntpc", "एनटीपीसी"]), ("Group D", ["group d", "ग्रुप डी", "rrc group d"]), ("SSC CGL", ["ssc cgl", "cgl"]),
+    ("SSC CHSL", ["chsl"]), ("SSC MTS", ["ssc mts", "mts"]), ("RRB ALP", ["rrb alp", "alp"]),
+    ("UP Police", ["up police", "यूपी पुलिस", "uppolice"]), ("Delhi Police", ["delhi police", "दिल्ली पुलिस"]),
+    ("Police", ["police", "पुलिस", "constable", "कांस्टेबल"]), ("Army", ["army gd", "indian army", "आर्मी", "सेना भर्ती"]),
+    ("CTET", ["ctet", "tet", "सीटेट"]), ("UPSC", ["upsc", "ias", "यूपीएससी"]), ("Bank", ["ibps", "sbi po", "sbi clerk", "bank po"]),
+    ("NDA / CDS", ["nda", "cds", "afcat"]), ("Railway", ["railway", "rrb", "रेलवे"]), ("SSC", ["ssc", "एसएससी"]),
+]
+NAME_SUBJECT_WORDS = {  # extra NAME words (short forms) — matched as whole words in the file name / caption only
+    "geography": ["geo", "bhugol", "geography"], "static_gk": ["gs", "gk", "g k", "g s", "gk gs", "general studies",
+                                                               "सामान्य अध्ययन", "सामान्य ज्ञान", "samanya gyan", "lucent"],
+    "maths": ["math", "maths", "ganit", "गणित", "quant", "arithmetic", "advance maths"], "history": ["itihas", "इतिहास"],
+    "polity": ["rajniti", "rajvyavastha"], "science": ["vigyan", "विज्ञान", "physics", "chemistry", "biology", "gs science"],
+    "economics": ["economy", "arthvyavastha", "अर्थशास्त्र"], "current_affairs": ["current affairs", "करंट अफेयर्स",
+                                                                                    "samsamayiki", "सामयिकी", "ca"],
+    "reasoning": ["reasoning", "tark", "रीजनिंग", "तर्कशक्ति"], "computer": ["computer", "कंप्यूटर"],
+    "hindi": ["hindi vyakaran", "हिंदी व्याकरण", "हिन्दी व्याकरण"], "english": ["english grammar", "vocabulary"],
+}
+TOPICS = [  # subject, topic label, words (≥2 distinct hits, or 1 multi-word phrase, makes the topic)
+    ("history", "Mughal Empire", ["mughal", "मुगल", "मुग़ल", "akbar", "अकबर", "babur", "बाबर", "aurangzeb", "औरंगजेब",
+                                  "humayun", "हुमायूँ", "shah jahan", "शाहजहाँ", "jahangir", "जहाँगीर"]),
+    ("history", "Harappan Civilization", ["harappa", "हड़प्पा", "सिंधु घाटी", "indus valley", "mohenjo", "मोहनजोदड़ो"]),
+    ("history", "Maurya Empire", ["maurya", "मौर्य", "ashoka", "अशोक", "chandragupta", "चंद्रगुप्त", "bindusara"]),
+    ("history", "Gupta Empire", ["gupta empire", "गुप्त वंश", "गुप्त साम्राज्य", "samudragupta", "समुद्रगुप्त"]),
+    ("history", "Delhi Sultanate", ["sultanate", "सल्तनत", "khilji", "खिलजी", "tughlaq", "तुगलक", "lodi", "लोदी"]),
+    ("history", "Vedic Age", ["vedic", "वैदिक", "rigveda", "ऋग्वेद", "आर्य"]),
+    ("history", "Revolt of 1857", ["1857", "sepoy mutiny", "1857 की क्रांति", "मंगल पांडे", "rani lakshmibai"]),
+    ("history", "Freedom Struggle", ["freedom struggle", "स्वतंत्रता संग्राम", "national movement", "राष्ट्रीय आंदोलन",
+                                     "गांधी", "gandhi", "भारत छोड़ो", "quit india", "non cooperation", "असहयोग"]),
+    ("history", "Buddhism and Jainism", ["बौद्ध", "buddhism", "जैन धर्म", "jainism", "mahavir", "महावीर", "गौतम बुद्ध"]),
+    ("polity", "Constitution", ["constitution", "संविधान", "preamble", "प्रस्तावना", "संविधान सभा"]),
+    ("polity", "Fundamental Rights", ["fundamental rights", "मौलिक अधिकार", "मूल अधिकार"]),
+    ("polity", "Parliament", ["parliament", "संसद", "लोकसभा", "राज्यसभा", "lok sabha", "rajya sabha"]),
+    ("polity", "President", ["राष्ट्रपति", "president of india", "उपराष्ट्रपति"]),
+    ("polity", "Judiciary", ["supreme court", "सर्वोच्च न्यायालय", "उच्चतम न्यायालय", "judiciary", "न्यायपालिका", "high court"]),
+    ("polity", "Panchayati Raj", ["panchayat", "पंचायत", "पंचायती राज", "73rd amendment"]),
+    ("geography", "Solar System", ["solar system", "सौरमंडल", "सौर मंडल", "ग्रह", "planets", "पृथ्वी"]),
+    ("geography", "Indian Rivers", ["rivers of india", "नदियाँ", "नदी तंत्र", "ganga", "गंगा", "ब्रह्मपुत्र", "drainage"]),
+    ("geography", "Climate and Monsoon", ["climate", "जलवायु", "monsoon", "मानसून"]),
+    ("geography", "Soils", ["soils", "मृदा", "मिट्टी", "black soil", "काली मिट्टी"]),
+    ("economics", "Budget", ["budget", "बजट", "fiscal deficit", "राजकोषीय घाटा"]),
+    ("economics", "Banking", ["reserve bank", "रिज़र्व बैंक", "रिजर्व बैंक", "banking", "बैंकिंग", "repo rate", "रेपो दर"]),
+    ("economics", "Inflation", ["inflation", "मुद्रास्फीति", "महंगाई"]),
+    ("economics", "National Income", ["gdp", "national income", "राष्ट्रीय आय", "सकल घरेलू उत्पाद"]),
+    ("science", "Physics", ["physics", "भौतिक विज्ञान", "न्यूटन", "newton", "गुरुत्वाकर्षण", "gravitation", "प्रकाश का"]),
+    ("science", "Chemistry", ["chemistry", "रसायन", "अम्ल", "acid", "क्षार", "periodic table", "आवर्त सारणी"]),
+    ("science", "Biology", ["biology", "जीव विज्ञान", "कोशिका", "human body", "मानव शरीर", "विटामिन", "vitamin"]),
+    ("maths", "Percentage", ["percentage", "प्रतिशत"]), ("maths", "Profit and Loss", ["profit and loss", "लाभ और हानि",
+                                                                                     "लाभ-हानि", "लाभ हानि", "cost price", "क्रय मूल्य"]),
+    ("maths", "Ratio and Proportion", ["ratio and proportion", "अनुपात", "समानुपात", "ratio"]),
+    ("maths", "Average", ["average", "औसत"]), ("maths", "Simple and Compound Interest", ["simple interest", "साधारण ब्याज",
+                                                                                         "compound interest", "चक्रवृद्धि ब्याज"]),
+    ("maths", "Time and Work", ["time and work", "समय और कार्य", "समय एवं कार्य"]),
+    ("maths", "Speed Time and Distance", ["speed", "चाल", "समय और दूरी", "time and distance", "रेलगाड़ी"]),
+    ("maths", "Number System", ["number system", "संख्या पद्धति", "lcm", "hcf", "लघुत्तम", "महत्तम"]),
+    ("maths", "Geometry", ["geometry", "ज्यामिति", "त्रिभुज", "triangle", "वृत्त", "circle"]),
+    ("maths", "Mensuration", ["mensuration", "क्षेत्रमिति", "क्षेत्रफल", "आयतन", "surface area"]),
+    ("reasoning", "Coding-Decoding", ["coding decoding", "coding-decoding", "कूट", "कोडिंग"]),
+    ("reasoning", "Blood Relation", ["blood relation", "रक्त संबंध"]), ("reasoning", "Direction Sense", ["direction sense", "दिशा ज्ञान", "दिशा परीक्षण"]),
+    ("reasoning", "Series", ["number series", "श्रृंखला", "श्रेणी", "letter series"]),
+    ("reasoning", "Analogy", ["analogy", "सादृश्यता", "सादृश्य"]), ("reasoning", "Syllogism", ["syllogism", "न्याय निगमन"]),
+    ("hindi", "संधि", ["संधि"]), ("hindi", "समास", ["समास"]), ("hindi", "पर्यायवाची शब्द", ["पर्यायवाची"]),
+    ("hindi", "मुहावरे और लोकोक्तियाँ", ["मुहावरे", "लोकोक्ति", "लोकोक्तियाँ"]), ("hindi", "विलोम शब्द", ["विलोम"]),
+    ("english", "Tenses", ["tenses", "present perfect", "past continuous"]), ("english", "Vocabulary",
+                                                                            ["synonyms", "antonyms", "one word substitution", "idioms and phrases"]),
+    ("english", "Voice and Narration", ["active voice", "passive voice", "narration", "direct and indirect"]),
+    ("computer", "MS Office", ["ms word", "ms excel", "powerpoint", "ms office"]),
+    ("computer", "Computer Basics", ["input device", "output device", "cpu", "operating system", "motherboard"]),
+    ("current_affairs", "Current Affairs", ["current affairs", "करंट अफेयर्स", "समसामयिकी", "सामयिकी"]),
+]
+CAT_SYNONYMS = {  # normalised words → one category, so there are no near-duplicates
+    "geo": "geography", "bhugol": "geography", "भूगोल": "geography", "world geography": "geography",
+    "indian geography": "geography", "गणित": "maths", "ganit": "maths", "arithmetic": "maths", "quantitative": "maths",
+    "इतिहास": "history", "indian history": "history", "राजव्यवस्था": "polity", "राजनीति": "polity", "indian polity": "polity",
+    "अर्थव्यवस्था": "economics", "अर्थशास्त्र": "economics", "indian economy": "economics", "विज्ञान": "science",
+    "general science": "science", "gs": "static_gk", "g.s.": "static_gk", "gk gs": "static_gk", "gk & gs": "static_gk",
+    "सामान्य ज्ञान": "static_gk", "सामान्य अध्ययन": "static_gk", "करंट अफेयर्स": "current_affairs", "ca": "current_affairs",
+    "current affairs monthly": "current_affairs", "monthly current affairs": "current_affairs", "रीजनिंग": "reasoning",
+    "तर्कशक्ति": "reasoning", "mental ability": "reasoning", "हिंदी": "hindi", "हिन्दी": "hindi", "hindi grammar": "hindi",
+    "अंग्रेजी": "english", "english grammar": "english", "कंप्यूटर": "computer", "computer awareness": "computer",
+    "previous year": "pyq", "previous year paper": "pyq", "previous year questions": "pyq", "solved papers": "pyq",
+    "mock test": "mock", "mock tests": "mock", "practice set": "mock", "practice sets": "mock", "test series": "mock",
+    "admit card": "admit_card", "admit cards": "admit_card", "hall ticket": "admit_card", "प्रवेश पत्र": "admit_card",
+    "answer key": "answer_key", "उत्तर कुंजी": "answer_key", "results": "result", "रिजल्ट": "result", "परिणाम": "result",
+    "merit list": "result", "cutoff": "cut_off", "cut-off": "cut_off", "syllabus": "syllabus", "सिलेबस": "syllabus",
+    "exam pattern": "syllabus", "notification": "notification", "notifications": "notification", "vacancy": "notification",
+    "typing test": "typing", "टाइपिंग": "typing", "data analytics": "data_analysis", "data analyst": "data_analysis",
+    "misc": "other", "miscellaneous": "other", "general": "other", "others": "other", "none": "other", "": "other",
+}
+EXTRA_LABEL = {s: l for s, l, _, _ in EXTRA_KINDS}
+EXTRA_EMOJI = {s: e for s, _, e, _ in EXTRA_KINDS}
+_PAGES_READ = [0]   # pages read for the last new file (status / tests)
+
+
+def slugify(label: str) -> str:
+    return re.sub(r"_+", "_", re.sub(r"[^a-z0-9]+", "_", str(label or "").lower())).strip("_")[:30]
+
+
+def cat_registry() -> Dict[str, Dict[str, Any]]:
+    """Categories the bot opened by itself (bot_settings "cat_registry"): {slug: {label, emoji, t}}."""
+    v = _REQ.get("_catreg")
+    if v is None:
+        try:
+            v = json.loads(get_setting("cat_registry") or "{}")
+        except Exception:
+            v = {}
+        _REQ["_catreg"] = v
+    return v
+
+
+def cat_label(slug: str) -> str:
+    return SUBJECT_LABEL.get(slug) or EXTRA_LABEL.get(slug) or (cat_registry().get(slug) or {}).get("label") or \
+        str(slug or "Other").replace("_", " ").title()
+
+
+def cat_emoji(slug: str) -> str:
+    return SUBJECT_EMOJI.get(slug) or EXTRA_EMOJI.get(slug) or (cat_registry().get(slug) or {}).get("emoji") or "📁"
+
+
+def known_category(slug: str) -> bool:
+    return bool(slug) and (slug in SUBJECT_LABEL or slug in EXTRA_LABEL or slug in cat_registry())
+
+
+def ensure_category(slug: str, label: str = "", emoji: str = "") -> str:
+    """Open a new category the first time a file needs it (logged). Base subjects always exist."""
+    if not slug or slug in SUBJECT_LABEL:
+        return slug or "other"
+    reg = cat_registry()
+    if slug in reg:
+        return slug
+    reg[slug] = {"label": (label or EXTRA_LABEL.get(slug) or slug.replace("_", " ").title())[:30],
+                 "emoji": emoji or EXTRA_EMOJI.get(slug) or "📁", "t": int(time.time())}
+    try:
+        set_setting("cat_registry", json.dumps(reg, ensure_ascii=False, separators=(",", ":")))
+        audit_log(f"🗂️ Nayi category bani: {reg[slug]['emoji']} {reg[slug]['label']}\n🕒 {ist_now()}")
+    except Exception:
+        log_error("cat_registry")
+    return slug
+
+
+def norm_category(value: Any, create: bool = False) -> str:
+    """Any subject / category word → one slug (synonyms merged: Geo = Geography, Maths = Math = गणित).
+    Unknown + create → a new category (short English words only); unknown otherwise → ""."""
+    v = re.sub(r"\s+", " ", re.sub(r"[_|/]+", " ", str(value or "").strip().lower())).strip(" .-–:")
+    v = re.sub(r"\s+(notes?|pdf|books?|files?|section|category)$", "", v).strip()
+    if v in CAT_SYNONYMS:
+        return CAT_SYNONYMS[v]
+    s = norm_subject(v) or norm_subject(str(value or ""))
+    if s:
+        return s
+    table = {l.lower(): s for s, l, _, _ in SUBJECTS}
+    table.update({l.lower(): s for s, l, _, _ in EXTRA_KINDS})
+    table.update({s.replace("_", " "): s for s, _, _, _ in EXTRA_KINDS})
+    table.update({str(r.get("label") or "").lower(): s for s, r in cat_registry().items()})
+    table.update({l.lower(): slugify(l) for l, _ in EXAMS})
+    for cand in (v, v[:-1] if v.endswith("s") else v, v + "s"):
+        if cand in table:
+            s = table[cand]
+            return ensure_category(s, next((l for l, _ in EXAMS if slugify(l) == s), "")) if create else s
+    import difflib
+    close = difflib.get_close_matches(v, list(table), n=1, cutoff=0.86) if v else []
+    if close:
+        return table[close[0]]
+    if not create:
+        return ""
+    if not re.fullmatch(r"[a-z][a-z0-9 &.\-]{2,23}", v) or len(v.split()) > 3:
+        return "other"
+    label = " ".join(w if w.isupper() else w.capitalize() for w in str(value).strip().split())[:24]
+    return ensure_category(slugify(label), label)
+
+
+def _hit_words(words: List[str], text: str) -> List[str]:
+    out = []
+    for w in words:
+        if re.search(r"[\u0900-\u097F]", w):
+            if w in text:
+                out.append(w)
+        elif re.search(r"(?<![a-z0-9])" + re.escape(w) + r"(?![a-z0-9])", text):
+            out.append(w)
+    return out
+
+
+def _name_norm(s: str) -> str:
+    s = os.path.splitext(str(s or ""))[0] if re.search(r"\.(pdf|docx?|txt|pptx?|epub)$", str(s or ""), re.I) else str(s or "")
+    return re.sub(r"\s+", " ", re.sub(r"[_\-.()\[\]]+", " ", s.lower())).strip()
+
+
+def exam_in(text: str) -> str:
+    for label, words in EXAMS:
+        if _hit_words(words, text):
+            return label
+    return ""
+
+
+def name_category(name: str) -> str:
+    """Category a NAME already says (kind > PYQ/Mock > subject > exam), "" when the name is unclear."""
+    t = _name_norm(name)
+    if not t:
+        return ""
+    for slug, _, _, words in EXTRA_KINDS:
+        if _hit_words(words, t):
+            return slug
+    for slug in ("pyq", "mock"):
+        if _hit_words([w for s, _, _, ws in SUBJECTS if s == slug for w in ws], t):
+            return slug
+    best, score = "", 0
+    for slug, _, _, words in SUBJECTS:
+        if slug in ("pyq", "mock", "other"):
+            continue
+        n = len(set(_hit_words(words + NAME_SUBJECT_WORDS.get(slug, []), t)))
+        if n > score:
+            best, score = slug, n
+    if best:
+        return best
+    for slug, _, words in TOPICS:
+        if _hit_words(words, t):
+            return slug
+    ex = exam_in(t)
+    return slugify(ex) if ex else ""
+
+
+def clear_name(caption: str, file_name: str) -> Optional[Dict[str, str]]:
+    """{title, cat} when the caption / file name already says the subject or topic; None = unclear (read it)."""
+    cands = [ln for ln in str(caption or "").splitlines() if ln.strip()][:4] + [os.path.splitext(str(file_name or ""))[0]]
+    for c in cands:
+        cleaned = strip_people(c.replace("_", " "))
+        if len(re.findall(r"[A-Za-z\u0900-\u097F]", cleaned)) < 2:
+            continue
+        cat = name_category(cleaned)
+        if cat:
+            title = re.sub(r"\s+", " ", cleaned).strip()
+            return {"title": title[:100], "cat": cat}
+    return None
+
+
+def iter_pages(data: Optional[bytes], file_name: str, mime: str = "", max_pages: int = 3):
+    """Yield the text of page 1, 2, 3 one at a time (lazy: the caller stops early). txt/docx = 2000-char pages."""
+    if not data:
+        return
+    low = (file_name or "").lower()
+    try:
+        if low.endswith(".pdf") or (mime or "").endswith("pdf") or data[:5] == b"%PDF-":
+            reader = PdfReader(io.BytesIO(data), strict=False)
+            for page in reader.pages[:max_pages]:
+                try:
+                    t = page.extract_text() or ""
+                except Exception:
+                    t = ""
+                yield t
+            return
+        if low.endswith(".txt") or (mime or "").startswith("text/"):
+            t = data[:200000].decode("utf-8", "replace")
+        elif low.endswith(".docx"):
+            import zipfile
+            with zipfile.ZipFile(io.BytesIO(data)) as z:
+                xml = z.read("word/document.xml").decode("utf-8", "replace")
+            t = html.unescape(re.sub(r"<[^>]+>", " ", re.sub(r"</w:p>", "\n", xml)))
+        else:
+            return
+        for i in range(max_pages):
+            chunk = t[i * 2000:(i + 1) * 2000]
+            if not chunk.strip():
+                return
+            yield chunk
+    except Exception:
+        return
+
+
+def _heading_lines(text: str) -> List[str]:
+    out = []
+    for ln in str(text or "").splitlines()[:25]:
+        ln = strip_people(re.sub(r"\s+", " ", ln)).strip(" -–—:•*#=")
+        letters = len(re.findall(r"[A-Za-z\u0900-\u097F]", ln))
+        words = ln.split()
+        if 2 <= len(words) <= 8 and letters >= 5 and letters >= 0.6 * len(ln.replace(" ", "")) and \
+                not re.search(r"(page|पृष्ठ|www|http|join|telegram|whatsapp|copyright|index|contents|विषय सूची)", ln, re.I):
+            out.append(ln[:60])
+    return out
+
+
+def detect_from_text(text: str) -> Optional[Dict[str, str]]:
+    """Free (no AI) subject + topic from page text. None = not clear yet (read the next page)."""
+    low = re.sub(r"[ \t]+", " ", str(text or "").lower())
+    if len(re.findall(r"[a-z\u0900-\u097F]", low)) < 40:
+        return None
+    head = low[:500]
+    exam = exam_in(head)
+    for slug, label, _, words in EXTRA_KINDS:
+        if _hit_words(words, head):
+            year = re.search(r"\b(20[1-3]\d)\b", head)
+            return {"cat": slug, "title": " ".join(x for x in (exam, label, year.group(1) if year else "") if x)}
+    best, bscore = None, 0
+    for slug, topic, words in TOPICS:
+        hits = set(_hit_words(words, low[:6000]))
+        score = len(hits) + (1 if any(" " in w for w in hits) else 0) + (1 if _hit_words(words, head) else 0)
+        if score > bscore:
+            best, bscore = (slug, topic), score
+    subj, sscore = "", 0
+    for slug, _, _, words in SUBJECTS:
+        if slug in ("pyq", "mock", "other"):
+            continue
+        n = len(set(_hit_words(words, low[:6000])))
+        if n > sscore:
+            subj, sscore = slug, n
+    kind = ""
+    if _hit_words(["previous year", "पिछले वर्ष", "solved paper", "pyq", "पूर्व वर्ष"], head):
+        kind = "PYQ"
+    elif _hit_words(["practice set", "प्रैक्टिस सेट", "mock test", "मॉक टेस्ट", "अभ्यास प्रश्न", "practice questions"], head):
+        kind = "Practice Set"
+    elif _hit_words(["mcq", "objective", "वस्तुनिष्ठ", "प्रश्नोत्तरी", "quiz"], head):
+        kind = "MCQ"
+    if best and bscore >= 2:
+        slug, topic = best
+        return {"cat": slug, "title": f"{SUBJECT_LABEL[slug]} – {topic} {kind or 'Notes'}"}
+    if subj and sscore >= 2:
+        heads = [h for h in _heading_lines(text) if _hit_words([w for s, _, _, ws in SUBJECTS if s == subj for w in ws],
+                                                                 h.lower())]
+        mid = f" – {heads[0]}" if heads and heads[0].lower() != SUBJECT_LABEL[subj].lower() else ""
+        return {"cat": subj, "title": f"{SUBJECT_LABEL[subj]}{mid} {kind or 'Notes'}".strip()}
+    if exam and kind:
+        return {"cat": "mock" if kind == "Practice Set" else ("pyq" if kind == "PYQ" else slugify(exam)),
+                "title": f"{exam} {kind}"}
+    return None
+
+
+NAMED_BY = ("clean", "local_text", "ai", "fallback")
+NAMED_BY_TEXT = {"clean": "naam already sahi tha → sirf saaf kiya (0 token, file nahi padhi)",
+                 "local_text": "{p} page padhke, bina AI (0 token)", "ai": "AI se (1 chhoti call)",
+                 "fallback": "saaf naam (AI fail / text nahi mila)"}
+
+
+def count_named_by(how: str) -> None:
+    if how not in NAMED_BY:
+        return
+    try:
+        d = json.loads(get_setting("named_by") or "{}")
+    except Exception:
+        d = {}
+    d[how] = int(d.get(how) or 0) + 1
+    set_setting("named_by", json.dumps(d, separators=(",", ":")))
+
+
+def named_by_counts() -> Dict[str, int]:
+    try:
+        d = json.loads(get_setting("named_by") or "{}")
+    except Exception:
+        d = {}
+    return {k: int(d.get(k) or 0) for k in NAMED_BY}
+
+
+def name_new_file(record: Dict[str, Any], text: Optional[Dict[str, str]] = None) -> str:
+    """Name + category for a new file, cheapest first. Returns "kept" | "clean" | "local_text" | "ai" | "fallback".
+    Sets record title / _cat / content_text / _bytes / _pages; "fallback" with readable text queues an AI retry."""
+    caption, fname = str(record.get("caption") or ""), str(record.get("file_name") or "")
+    _PAGES_READ[0] = 0
+    record["_pages"] = 0
+    uniq = record.get("telegram_file_unique_id")
+    if uniq:
+        # Already in the catalog (re-forward): keep its name + category, an admin may have renamed it.
+        cols = "id,title,file_name,keywords" + (",category" if has_category_col() else "")
+        have = supabase("books", "GET", query=f"?telegram_file_unique_id=eq.{urllib.parse.quote(str(uniq))}&select={cols}&limit=1")
+        if have:
+            record["title"] = have[0].get("title") or record.get("title")
+            record["_cat"] = book_category(have[0], {} if has_category_col() else catmap())
+            return "kept"
+    base = local_clean_name(caption, fname)
+    # 1) the name already says it → no download, no reading, no AI
+    c = clear_name(caption, fname)
+    if c:
+        record["title"] = c["title"][:500]
+        record["_cat"] = norm_category(c["cat"], create=True) if not known_category(c["cat"]) else c["cat"]
+        if record["_cat"] not in SUBJECT_LABEL:
+            ensure_category(record["_cat"], next((l for l, _ in EXAMS if slugify(l) == record["_cat"]), ""))
+        return "clean"
+    record["title"] = base[:500]
+    record["_cat"] = "other"
+    # 2) unclear name → read page 1, 2, 3; stop at the first page where the subject / topic is clear (0 tokens)
+    data = download_file(record.get("telegram_file_id"), record.get("file_size"))
+    record["_bytes"] = data if data and len(data) <= REUPLOAD_LIMIT else None
+    pages: List[str] = []
+    found = None
+    for page in iter_pages(data, fname, str(record.get("mime_type") or "")):
+        pages.append(page or "")
+        _PAGES_READ[0] = len(pages)
+        found = detect_from_text("\n".join(pages))
+        if found:
+            break
+    record["_pages"] = len(pages)
+    read = clean_text(" ".join(pages))[:60000]
+    if read:
+        record["content_text"] = read
+        record["keywords"] = clean_text(" ".join([str(record.get("keywords") or ""), read[:3000]]))[:3990]
+    if found:
+        record["title"] = found["title"][:500]
+        record["_cat"] = found["cat"] if found["cat"] in SUBJECT_LABEL else ensure_category(
+            found["cat"], next((l for l, _ in EXAMS if slugify(l) == found["cat"]), ""))
+        return "local_text"
+    excerpt = re.sub(r"\s+", " ", " ".join(pages)).strip()[:1200]
+    if len(re.findall(r"[A-Za-z\u0900-\u097F]", excerpt)) < 40:
+        return "fallback"        # scanned / empty / too big: the cleaned name stays
+    # 3) still unclear after 3 pages → ONE small AI call
+    if not ai_naming_on() or not ai_provider() or not ai_name_budget_ok() or req_elapsed() > 6.5:
+        record["_retry"] = True
+        return "fallback"
+    _count_day("ainame:all")
+    got = ai_name_items([{"i": 1, "caption": caption, "file": fname, "text": excerpt}],
+                        cap=max(2.0, min(7.0, 9.0 - req_elapsed())), excerpt_chars=1200)
+    if got is None:
+        record["_retry"] = True
+        return "fallback"
+    res = got.get(1) or {}
+    if res.get("title"):
+        record["title"] = res["title"][:500]
+    if res.get("subject"):
+        record["_cat"] = res["subject"]
+    return "ai"
+
+
+# ---- 📝 Log channel: one short message per event (🆕 file added, ✏️ renamed, 📥 file taken); last 50 kept for /logs
+LOG_KEEP = 50
+
+
+def ist_now() -> str:
+    t = time.gmtime(time.time() + 19800)
+    return time.strftime("%d %b, %I:%M %p", t)
+
+
+def source_label(where: str) -> str:
+    user = _REQ.get("user") or {}
+    who = user_label({"first_name": user.get("first_name"), "last_name": user.get("last_name"),
+                      "username": user.get("username")}) if user.get("id") else ""
+    if where == "Admin upload":
+        return f"👤 Admin upload ({who})" if who else "👤 Admin upload"
+    if who and is_admin(user.get("id")):
+        return f"↪️ Forward by {who} (from: {where})"
+    return f"📢 Channel: {where}"
+
+
+def file_added_log(record: Dict[str, Any], orig: str, slug: str, how: str, where: str, backup: str) -> str:
+    pages = int(record.get("_pages") or 0)
+    nb = NAMED_BY_TEXT.get(how, how).replace("{p}", str(pages or 1))
+    if how == "fallback" and record.get("_retry"):
+        nb += " · AI baad me dobara"
+    new = str(record.get("title") or "")
+    mark = {"saved": "💾 backup ✅", "dup": "💾 pehle se backup", "failed": "💾 backup ❌"}.get(backup, "")
+    lines = [f"🆕 Nayi file · {ist_now()}", f"📍 {source_label(where)}",
+             (f"📄 {orig[:70]} → {new[:70]}" if orig and orig != new else f"📄 {new[:80]}"),
+             f"🗂️ {cat_label(slug)} · 🏷️ {nb}"]
+    if record.get("telegram_file_id") is not None and record.get("file_size"):
+        lines[-1] += f" · {human_size(record.get('file_size'))}"
+    if mark:
+        lines.append(mark)
+    return "\n".join(lines)
+
+
+def rename_log(items: List[Any], who: str) -> None:
+    items = [x for x in items if str(x[1] or "") != str(x[2] or "")]
+    if not items:
+        return
+    head = f"✏️ Naam badla · {ist_now()} · {who}"
+    body = [f"• {str(o)[:60]} → {str(n)[:60]}" for _, o, n in items[:20]]
+    if len(items) > 20:
+        body.append(f"…aur {len(items) - 20}")
+    audit_log(head + "\n" + "\n".join(body))
+
+
+def actor_label(user_id: Optional[int] = None) -> str:
+    user = _REQ.get("user") or {}
+    if user.get("id") and (user_id is None or user.get("id") == user_id):
+        return "admin " + user_label({"first_name": user.get("first_name"), "last_name": user.get("last_name"),
+                                      "username": user.get("username")})
+    return f"admin {user_id}" if user_id else "admin"
+
+
+def remember_logs(lines: List[str]) -> None:
+    try:
+        old = json.loads(get_setting("log_recent") or "[]")
+    except Exception:
+        old = []
+    old.extend(lines)
+    set_setting("log_recent", json.dumps(old[-LOG_KEEP:], ensure_ascii=False, separators=(",", ":")))
+
+
+def logs_text(n: int = 15) -> List[str]:
+    try:
+        rows = json.loads(get_setting("log_recent") or "[]")
+    except Exception:
+        rows = []
+    if not rows:
+        return ["📝 Abhi koi log nahi hai."]
+    target = "✅ Log Chat set hai, sab wahan bhi jata hai." if get_setting("log_chat_id") else \
+        "ℹ️ Log Chat set nahi hai. /admin → 📝 Log Chat se channel set karo, phir har update wahan aayega."
+    rows = rows[-max(1, min(LOG_KEEP, n)):][::-1]
+    out, cur = [], f"📝 Last {len(rows)} logs (naya upar)\n{target}"
+    for r in rows:
+        if len(cur) + len(r) > 3800:
+            out.append(cur)
+            cur = ""
+        cur = (cur + "\n\n" + r) if cur else r
+    out.append(cur)
+    return out[:4]
 
 
 # ---- 🤖 AI test (owner): one tiny real call, shows ✅ or the exact error (never the key)
