@@ -533,16 +533,19 @@ def admin_menu(user_id: Optional[int] = None) -> Dict[str, Any]:
         [{"text": "💾 Backup Channel", "callback_data": "ad:backup"}, {"text": "📝 Log Chat", "callback_data": "ad:log"}],
         [{"text": "💾 Backup: purani files bhi", "callback_data": "ad:bkold"}],
         [{"text": "👥 Users", "callback_data": "ad:users"}, {"text": "👮 Admins", "callback_data": "ad:admins"}],
+        [{"text": "📂 All Files", "callback_data": "ad:files:1"}, {"text": "🤖 AI Naming", "callback_data": "ad:ainame"}],
         [{"text": "✏️ File Rename", "callback_data": "ad:rename"}, {"text": "📊 Report", "callback_data": "ad:report"}],
         keys_row + [{"text": "🔄 Bot Restart", "callback_data": "ad:restart"}],
         [{"text": "🩺 Status", "callback_data": "ad:status"}, {"text": "❓ Admin Help", "callback_data": "ad:help"}],
+        [{"text": search_mode_label(user_id), "callback_data": "ad:smode"}],
         [{"text": "🔍 Search Menu", "callback_data": "ad:usermenu"}],
     ]}
 
 
 ADMIN_PANEL_TEXT = ("⚙️ <b>Admin Panel</b>\n\n"
                     "Niche se kaam chuno 👇\n"
-                    "<i>Search ke liye seedha book ka naam bhej sakte ho.</i>")
+                    "🤖 <i>Bolke bhi kaam karwa sakte ho, jaise: \"polity ka naam politics kr do\", "
+                    "\"sari files backup kro\". Search ke liye book ka naam likho (ya shuru me ? lagao).</i>")
 
 # Prompts for buttons that need input. The admin answers with a reply (ForceReply) or just
 # sends the next message within 15 minutes (pending state in bot_settings).
@@ -785,23 +788,31 @@ ADMIN_HELP = (
     "🩺 Status — aapka ID, role, channels me bot admin hai ya nahi\n"
     "🔑 AI Keys — Groq/OpenAI key bot me hi jodo/hatao, Vercel deploy nahi (sirf owner)\n"
     "🔄 Bot Restart — bot ruk jaye to webhook + menu dobara set\n"
+    "📂 All Files — saari files 10-10 karke, ⬅️ / ➡️, file pe tap: 📤 Bhejo / ✏️ Rename / ❌ Hatao\n"
+    "🤖 AI Naming — nayi file ka saaf naam AI rakhega (on/off) + purane naam theek karo (20-20)\n"
+    "🔍 Search Mode — ON pe aapka har msg search hoga; OFF pe bot samjhega kaam hai ya search\n\n"
+    "🤖 Bolke kaam (sirf admin): \"polity ka naam politics kr do\", \"sab files me Hindi ko हिंदी kr do\", "
+    "\"lucent wali file hatao\", \"sari ek baar me upload kro\" (backup), \"users dikhao\", \"report\", "
+    "\"bot restart kro\", \"sari files dikhao\", \"ai naming band kro\", \"purane naam theek kro\". "
+    "Har badlav se pehle dikhega kya badlega + ✅ Accept / ❌ Deny. Search karna ho to shuru me ? lagao (?polity)\n"
     "Hatane wale har button pe pehle ✅ Accept / ❌ Deny aayega\n\n"
     "Commands bhi chalti hain: /admin, /requirechannel @ch, /removerequired @ch, /addchannel @ch, /removechannel @ch, "
     "/channels, /requiredchannels, /setbackupchannel, /setlogchat, /addadmin ID, /removeadmin ID, /rename ID naam, "
-    "/report, /stats, /status, /restart, /keys, /user ID, /backupold, /myid, /cancel\n"
+    "/report, /stats, /status, /restart, /keys, /user ID, /backupold, /files, /myid, /cancel\n"
     "Kisi channel ki post bot ko forward karoge to wo source channel ban jayega."
 )
 
 
-def do_rename(chat_id: int, book_id: Any, new_title: str) -> None:
-    new_title = new_title.strip()[:500]
+def do_rename(chat_id: int, book_id: Any, new_title: str, user_id: Optional[int] = None,
+              query: Optional[Dict[str, Any]] = None) -> None:
+    """Rename one file: show old → new first, apply only on ✅ Accept (Aarav's rule)."""
+    new_title = re.sub(r"\s+", " ", new_title or "").strip()[:500]
     if not new_title:
         raise InputError("Naya naam khali hai.")
     rows = supabase("books", "GET", query=f"?id=eq.{int(book_id)}&select=id,title&limit=1")
     if not rows:
         raise InputError(f"File ID {book_id} nahi mili.")
-    supabase("books", "PATCH", {"title": new_title, "keywords": new_title[:4000]}, f"?id=eq.{int(book_id)}")
-    send_text(chat_id, f"✅ Naam badal diya:\n{rows[0].get('title')}\n→ {new_title}", {"inline_keyboard": [BACK_ROW]})
+    preview_rename(chat_id, user_id or chat_id, [(int(rows[0]["id"]), str(rows[0].get("title") or ""), new_title)], query)
 
 
 def handle_admin_input(message: Dict[str, Any], action: str, extra: Any) -> None:
@@ -908,7 +919,7 @@ def handle_admin_input(message: Dict[str, Any], action: str, extra: Any) -> None
             m = re.match(r"^(\d+)\s+(.+)$", text, re.S)
             if m:
                 clear_pending(user_id)
-                do_rename(chat_id, m.group(1), m.group(2))
+                do_rename(chat_id, m.group(1), m.group(2), user_id)
                 return
             results = search_books(text)[:8] if text else []
             if not results:
@@ -919,7 +930,7 @@ def handle_admin_input(message: Dict[str, Any], action: str, extra: Any) -> None
             send_text(chat_id, "Kaunsi file? Chuno:", {"inline_keyboard": kb})
         elif action == "rename_to":
             clear_pending(user_id)
-            do_rename(chat_id, extra, text)
+            do_rename(chat_id, extra, text, user_id)
     except InputError as exc:
         set_pending(user_id, action, extra)  # keep waiting for a corrected answer
         send_text(chat_id, f"❌ Nahi hua: {exc}\n\nSahi value dobara bhejo, ya /cancel.", retry)
@@ -940,6 +951,8 @@ def handle_admin_callback(query: Dict[str, Any], data: str, chat_id: int, user_i
             send_text(chat_id, "Ye sirf owner hata sakta hai.", {"inline_keyboard": [BACK_ROW]})
             return
         show(chat_id, *confirm_view(cmd), query=query)
+        return
+    if handle_admin_callback_v6(query, cmd, chat_id, user_id):
         return
     if cmd == "panel":
         clear_pending(user_id)
@@ -1059,7 +1072,7 @@ def handle_admin_callback(query: Dict[str, Any], data: str, chat_id: int, user_i
 
 # ---- confirm before any remove (Aarav 5:08/5:11 PM: one confirm, ✅ Accept / ❌ Deny)
 
-DESTRUCTIVE_PREFIXES = ("rmreq:", "rmsrc:", "rmadm:", "keyrm:")
+DESTRUCTIVE_PREFIXES = ("rmreq:", "rmsrc:", "rmadm:", "keyrm:", "fdel:")
 DESTRUCTIVE_CMDS = {"backupoff", "logoff"}
 
 
@@ -1083,12 +1096,17 @@ def confirm_view(cmd: str) -> Any:
         elif cmd.startswith("keyrm:"):
             found = [x["k"] for x in db_ai_keys() if key_id(x["k"]) == arg]
             name, back = f"AI key {mask_key(found[0]) if found else ''}".strip(), "ad:keys"
+        elif cmd.startswith("fdel:"):
+            rows = supabase("books", "GET", query=f"?id=eq.{int(arg)}&select=title&limit=1")
+            name, back = f"File \"{(rows[0].get('title') if rows else None) or arg}\"", "ad:files:1"
         elif cmd == "backupoff":
             name, back = "Backup channel", "ad:backup"
         elif cmd == "logoff":
             name, back = "Log chat", "ad:log"
     except Exception:
         log_error("confirm_view")
+    if cmd.startswith("fdel:"):
+        name += " (search me nahi aayegi)"
     return (f"⚠️ {name} hatana hai?",
             {"inline_keyboard": [[{"text": "✅ Accept", "callback_data": f"ad:y:{cmd}"[:64]},
                                   {"text": "❌ Deny", "callback_data": back}]]})
@@ -1536,14 +1554,14 @@ def fail_reason(exc: Exception) -> str:
     return "invalid" if ("http 401" in low or "http 403" in low or "invalid api key" in low) else "limit"
 
 
-def ai_complete(system: str, user_text: str, max_tokens: int = 150) -> Optional[str]:
+def ai_complete(system: str, user_text: str, max_tokens: int = 150, cap: float = 9.0) -> Optional[str]:
     messages = [{"role": "system", "content": system}, {"role": "user", "content": user_text}]
     models = [m for m in dict.fromkeys([GROQ_MODEL, "llama-3.1-8b-instant", "llama-3.3-70b-versatile"]) if m]
     pool = groq_pool()
     usable = [k for k in pool if not key_cooling(k)] or pool
     # One overall time cap, however many keys there are: the webhook must answer Telegram fast,
     # or Telegram retries with growing pauses and the bot looks dead.
-    deadline = time.time() + 9
+    deadline = time.time() + max(2.0, min(9.0, cap))
     for n, key in enumerate(usable):
         for model in models:
             if time.time() > deadline - 1:
@@ -2096,6 +2114,11 @@ def ensure_backup(record: Dict[str, Any], from_chat: Any, message_id: Any) -> st
 
 def index_file(record: Dict[str, Any], from_chat: Any, message_id: Any, where: str) -> str:
     """Save a file to the catalog, back it up once, and log it."""
+    try:
+        named = maybe_ai_title(record)
+    except Exception:
+        log_error("ai_title")
+        named = ""
     upsert_item(record)
     try:
         backup = ensure_backup(record, from_chat, message_id)
@@ -2103,7 +2126,8 @@ def index_file(record: Dict[str, Any], from_chat: Any, message_id: Any, where: s
         log_error("ensure_backup")
         backup = "failed"
     mark = {"saved": " · 💾 backup ✅", "dup": " · 💾 pehle se backup", "failed": " · 💾 backup ❌"}.get(backup, "")
-    audit_log(f"📥 Nayi file save: {str(record.get('title') or '')[:80]} — {where}{mark}")
+    audit_log(f"📥 Nayi file save: {str(record.get('title') or '')[:80]} — {where}{mark}" +
+              (f" · 🤖 AI naam (asli: {named[:60]})" if named else ""))
     return backup
 
 
@@ -2348,6 +2372,7 @@ ADMIN_MENU = USER_MENU + [
     {"command": "setlogchat", "description": "Admin: log chat set karein"},
     {"command": "report", "description": "Admin: report"},
     {"command": "rename", "description": "Admin: file ka naam badlo"},
+    {"command": "files", "description": "Admin: saari files (10-10 page)"},
     {"command": "addadmin", "description": "Owner: sub-admin jodo"},
     {"command": "removeadmin", "description": "Owner: sub-admin hatao"},
     {"command": "cancel", "description": "Admin: chal raha kaam cancel"},
@@ -2573,6 +2598,19 @@ def handle_private_message(message: Dict[str, Any]) -> None:
     if not query:
         send_text(chat_id, SEARCH_PROMPT, None, "HTML")
         return
+    if is_private and not command and is_subadmin(user_id):
+        # Admin free text: a whitelisted admin action (preview + ✅ Accept) or a search.
+        try:
+            routed = admin_text(chat_id, user, query)
+        except InputError as exc:
+            send_text(chat_id, f"❌ Nahi hua: {exc}", {"inline_keyboard": [BACK_ROW]})
+            return
+        except Exception:
+            log_error("admin_text")
+            routed = query
+        if routed is None:
+            return
+        query = routed
     if is_private and not command:
         # Understand first (free), search second, AI only if needed.
         try:
@@ -2717,11 +2755,14 @@ def handle_admin_command(message: Dict[str, Any]) -> None:
             send_text(chat_id, users_view(), {"inline_keyboard": [BACK_ROW]})
     elif command == "/backupold":
         send_text(chat_id, *backup_old_view())
+    elif command in {"/files", "/allfiles"}:
+        page = int(arg) if arg.isdigit() else 1
+        send_text(chat_id, *files_view(page))
     elif command == "/rename":
         parts = text.split(maxsplit=2)
         if len(parts) >= 3 and parts[1].isdigit():
             try:
-                do_rename(chat_id, parts[1], parts[2])
+                do_rename(chat_id, parts[1], parts[2], user_id)
             except Exception as exc:
                 fail(exc)
         else:
@@ -2832,6 +2873,829 @@ def handle_callback(query: Dict[str, Any]) -> None:
     rows = supabase("books", "GET", query=f"?id=eq.{urllib.parse.quote(book_id)}&select=*&limit=1")
     if rows and chat_id:
         deliver_result(chat_id, rows[0], query.get("from"))
+
+
+# ================================================================ v6: admin AI commands, 📂 All Files, 🤖 AI naming
+# Admins can type what they want ("polity ka naam politics kr do", "sari ek baar me upload kro").
+# Cheap local rules first; the AI is asked only when the rules can't tell, and it may only answer
+# with one of ADMIN_ACTIONS + params — it never runs anything itself. Every change is shown first
+# and applied only on ✅ Accept (Aarav, 5:08/5:11 PM Oct 26).
+
+ADMIN_AI_DAILY = int(os.environ.get("ADMIN_AI_DAILY", "60") or 60)
+AI_NAME_DAILY = int(os.environ.get("AI_NAME_DAILY", "600") or 600)
+FILES_PAGE = 10
+FIX_BATCH = 20
+_REQ_T0 = [time.monotonic()]
+
+ADMIN_ACTIONS = {"search", "rename", "bulk_rename", "delete_file", "backup_old", "list_files", "users", "report",
+                 "status", "restart", "add_channel", "remove_channel", "list_channels", "add_admin", "ai_keys",
+                 "ai_naming", "fix_names", "panel", "help", "unknown"}
+OWNER_ONLY_ACTIONS = {"add_admin", "ai_keys"}
+SEARCH_PREFIXES = ("?", "？", "🔍", "search ", "dhoondo ", "dhundo ", "khojo ", "find ")
+CMD_VERBS = {"kr", "kro", "krdo", "krde", "krna", "krne", "krke", "karo", "kardo", "karde", "kar", "karna", "karne",
+             "karke", "kijiye", "kijie", "badlo", "badal", "badl", "badalna", "change", "rename", "hatao", "hata",
+             "hatado", "hatana", "mitao", "mita", "delete", "remove", "set", "jodo", "jod", "add", "upload", "backup",
+             "restart", "chalu", "band", "on", "off", "naam", "name", "rakho", "rakh", "theek", "thik", "sahi",
+             "bana", "banao", "bnao", "bnado", "banado"}
+NAME_WORDS = r"(?:name|naam|nam|title|named)"
+DO_TAIL = r"(?:kr|kar|rakh|krdo|kardo|karo|kro|krde|karde|krna|karna|likh|bana)\s*(?:do|de|dena|dijiye|dijie|o)?"
+
+
+def req_elapsed() -> float:
+    return time.monotonic() - _REQ_T0[0]
+
+
+def search_mode_label(user_id: Optional[int]) -> str:
+    on = False
+    if user_id:
+        try:
+            on = get_setting(f"admsearch:{user_id}") == "1"
+        except Exception:
+            on = False
+    return "🔍 Search Mode: ON" if on else "🔍 Search Mode: OFF"
+
+
+def ai_naming_on() -> bool:
+    try:
+        return (get_setting("ai_naming") or "on") != "off"
+    except Exception:
+        return False
+
+
+def human_size(n: Any) -> str:
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return ""
+    if n <= 0:
+        return ""
+    return f"{n / 1048576:.1f} MB" if n >= 1048576 else f"{max(1, n // 1024)} KB"
+
+
+# ---- pending admin operation: preview → ✅ Accept / ❌ Deny
+
+def set_op(user_id: int, op: Dict[str, Any]) -> str:
+    token = hashlib.sha256(f"{user_id}:{time.time()}:{os.urandom(4).hex()}".encode()).hexdigest()[:8]
+    set_setting(f"adop:{user_id}", json.dumps(dict(op, tok=token, ts=int(time.time())), ensure_ascii=False))
+    return token
+
+
+def get_op(user_id: int, token: str) -> Optional[Dict[str, Any]]:
+    raw = get_setting(f"adop:{user_id}")
+    try:
+        op = json.loads(raw) if raw else None
+    except Exception:
+        return None
+    if not isinstance(op, dict) or op.get("tok") != token or time.time() - float(op.get("ts", 0)) > 3600:
+        return None
+    return op
+
+
+def clear_op(user_id: int) -> None:
+    try:
+        supabase("bot_settings", "DELETE", query=f"?key=eq.{urllib.parse.quote(f'adop:{user_id}')}")
+    except Exception:
+        log_error("clear_op")
+
+
+def accept_kb(token: str) -> Dict[str, Any]:
+    return {"inline_keyboard": [[{"text": "✅ Accept", "callback_data": f"ad:op:y:{token}"},
+                                 {"text": "❌ Deny", "callback_data": f"ad:op:n:{token}"}]]}
+
+
+def ask_confirm(chat_id: int, user_id: int, text: str, op: Dict[str, Any], query: Optional[Dict[str, Any]] = None) -> None:
+    show(chat_id, text, accept_kb(set_op(user_id, op)), query)
+
+
+# ---- understanding an admin's message (local rules first)
+
+def _strip_q(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip().strip("\"'“”‘’`")).strip()
+
+
+def _find_clean(s: str) -> str:
+    s = _strip_q(s)
+    s = re.sub(r"^(?:is|us|ye|yeh|jo|wo|vo|file|files|book|pdf)\s+", "", s, flags=re.I)
+    s = re.sub(r"\s+(?:wali|wala|wale|file|files|book|pdf|ko|ki|ka|ke|vali|vala)$", "", s, flags=re.I)
+    s = re.sub(r"\s+(?:wali|wala|wale|file|files|book|pdf|vali|vala)$", "", s, flags=re.I)
+    return _strip_q(s)
+
+
+def local_admin_intent(text: str) -> Optional[Dict[str, Any]]:
+    """Free rules for the common admin commands. None = not sure (maybe search, maybe AI)."""
+    t = _strip_q(text)
+    low = t.lower()
+    words = set(re.findall(r"[a-z0-9]+|[\u0900-\u097F]+", low))
+    # bulk rename: "sab files me Hindi ko हिंदी kr do" / "sab naamo me X ki jagah Y"
+    m = re.match(r"^(?:sab|sabhi|sari|saari|all|har)\s+(?:files?|naam\w*|names?|books?|pdfs?)?\s*(?:ke\s+naam\w*\s+)?(?:me|mein|mai|m)\s+"
+                 r"(?P<find>.+?)\s+(?:ko|ki\s+jagah|ke\s+badle|se)\s+(?P<to>.+?)\s+" + DO_TAIL + r"\s*$", t, re.I)
+    if m:
+        return {"action": "bulk_rename", "find": _strip_q(m.group("find")), "to": _strip_q(m.group("to"))}
+    # rename: "polity ka name politics kr do", "polity ka name change krne politics kr do", "rename polity to politics"
+    m = re.match(r"^(?:rename\s+)?(?P<find>.+?)\s+(?:ka|ki|ke|kaa)\s+" + NAME_WORDS + r"\s+"
+                 r"(?:(?:change|badal|badl|chng|chnge)\w*\s+(?:(?:kr|kar|krke|karke|krne|karne|ke)\w*\s+)?)?"
+                 r"(?P<to>.+?)\s+" + DO_TAIL + r"\s*$", t, re.I)
+    if m and _strip_q(m.group("to")).lower() not in {"change", "badal", "theek", "thik", "sahi"}:
+        return {"action": "rename", "find": _find_clean(m.group("find")), "to": _strip_q(m.group("to"))}
+    m = re.match(r"^rename\s+(?P<find>.+?)\s+(?:to|->|→|=)\s+(?P<to>.+)$", t, re.I) or \
+        re.match(r"^(?P<find>.+?)\s+(?:ka|ki|ke)\s+" + NAME_WORDS + r"\s+(?P<to>.+?)\s+(?:se\s+)?(?:badlo|badal\s*do|change\s*(?:kr|kar)\w*(?:\s*do)?)\s*$", t, re.I)
+    if m:
+        return {"action": "rename", "find": _find_clean(m.group("find")), "to": _strip_q(m.group("to"))}
+    # AI naming / fix old names
+    if ("ai" in words and words & {"naming", "naam", "name", "nam"}) and words & {"on", "off", "chalu", "band", "start", "stop", "bnd"}:
+        return {"action": "ai_naming", "on": not (words & {"off", "band", "stop", "bnd"})}
+    if words & {"naam", "name", "names", "naamo", "nam"} and words & {"theek", "thik", "sahi", "fix", "clean", "saaf"} and \
+            words & {"purane", "purani", "old", "sab", "sabhi", "sare", "saare", "sari", "saari", "all", "ai"}:
+        return {"action": "fix_names"}
+    # backup of old files ("Sari ek baar me upload kro", "sab files backup kro")
+    if words & {"backup", "bkp", "upload", "uplod", "uplode"}:
+        if words & {"channel", "chat"} and words & {"set", "badlo", "change", "lagao", "jodo"}:
+            return {"action": "panel_button", "button": "setbackup"}
+        return {"action": "backup_old"}
+    # channels
+    chat_ref = re.search(r"(@[A-Za-z0-9_]{4,}|https?://t\.me/\S+|t\.me/\S+|-100\d{6,})", t)
+    if words & {"channel", "channels", "chanel", "group"}:
+        kind = "join" if words & {"join", "required", "zaroori", "jaruri"} else ("source" if words & {"source", "src"} else None)
+        if words & {"hatao", "hata", "remove", "delete", "hatado", "nikalo", "mitao"}:
+            return {"action": "remove_channel", "kind": kind}
+        if words & {"add", "jodo", "jod", "lagao", "dalo", "daalo", "joro"}:
+            return {"action": "add_channel", "kind": kind, "target": chat_ref.group(1) if chat_ref else None}
+        if words & {"list", "dikhao", "dikha", "batao", "show", "kitne"}:
+            return {"action": "list_channels", "kind": kind}
+    if "admin" in words and words & {"add", "jodo", "bana", "banao", "jod"}:
+        return {"action": "add_admin"}
+    if words & {"key", "keys"} and words & {"ai", "api", "groq", "openai", "add", "jodo", "dikhao", "list"}:
+        return {"action": "ai_keys"}
+    # delete one file
+    if words & {"delete", "hatao", "hata", "hatado", "remove", "mitao", "mita", "nikalo"} and \
+            not words & {"channel", "admin", "key", "keys"}:
+        find = re.sub(r"\b(?:delete|hatao|hata|hatado|remove|mitao|mita|nikalo|kr|kro|karo|kar|do|de|dena|file|files|"
+                      r"wali|wala|vali|ko|ki|ka|ye|yeh|is|please|plz|bhai)\b", " ", t, flags=re.I)
+        return {"action": "delete_file", "find": _strip_q(find)}
+    if words & {"restart", "reboot", "reset"} or re.search(r"\bbot\s+(?:ko\s+)?(?:chalu|start)\b", low):
+        return {"action": "restart"}
+    if re.search(r"\b(?:all|sari|saari|sab|sabhi|puri|poori)\s+(?:ki\s+)?(?:files?|pdfs?|books?)\b", low) and \
+            (len(words) <= 3 or words & {"list", "dikhao", "dikha", "batao", "show"}) or \
+            re.search(r"\b(?:files?|pdfs?)\s+(?:ki\s+)?list\b|\ball\s+files\b", low):
+        return {"action": "list_files"}
+    if words & {"log"} and words & {"chat", "channel"} and words & {"set", "lagao", "jodo", "badlo"}:
+        return {"action": "panel_button", "button": "setlog"}
+    if words & {"user", "users", "yuzar"} and (len(words) <= 5 or words & {"dikhao", "batao", "kitne", "list"}) \
+            or "kitne log" in low:
+        return {"action": "users"}
+    if words & {"report", "stats", "statistics", "hisab", "hisaab"} and len(words) <= 5:
+        return {"action": "report"}
+    if words & {"status", "debug"} and len(words) <= 5:
+        return {"action": "status"}
+    if low in {"admin", "admin panel", "panel", "menu"}:
+        return {"action": "panel"}
+    if low in {"help", "admin help", "madad"}:
+        return {"action": "help"}
+    return None
+
+
+def looks_like_command(text: str) -> bool:
+    """Admin text that might be a command the rules missed (then the AI decides)."""
+    toks = set(re.findall(r"[a-z0-9]+|[\u0900-\u097F]+", (text or "").lower()))
+    return bool(toks & CMD_VERBS)
+
+
+ADMIN_AI_SYSTEM = (
+    "You route a message from the ADMIN of a Telegram bot that stores study PDF files. "
+    "Decide if it is an admin command or a file search. Reply ONLY with JSON: "
+    '{"action":"...","find":null,"to":null,"kind":null,"target":null,"on":null,"query":null,"ask":null}. '
+    "action is one of: search (admin is looking for a file; query = search words), rename (change ONE file's name: "
+    "find = words of the current name, to = new name), bulk_rename (replace text in MANY file names: find, to), "
+    "delete_file (find), backup_old (copy/upload all old files to the backup channel), list_files, users, report, "
+    "status, restart, add_channel (kind join|source, target @name/link or null), remove_channel (kind), "
+    "list_channels (kind), add_admin, ai_keys, ai_naming (on true/false), fix_names (let AI clean old file names), "
+    "panel, help, unknown. Message may be Hindi/Hinglish. If unclear, action unknown and ask = ONE short Hinglish question. "
+    "Never invent file names; copy find/to from the message.")
+
+
+def admin_ai_budget_ok(user_id: int) -> bool:
+    if not ai_provider():
+        return False
+    raw = get_setting(f"aiday_admin:{user_id}") or ""
+    day, _, n = raw.partition(":")
+    return not (day == ist_day() and n.isdigit() and int(n) >= ADMIN_AI_DAILY)
+
+
+def _count_day(key: str) -> None:
+    try:
+        raw = get_setting(key) or ""
+        day, _, n = raw.partition(":")
+        set_setting(key, f"{ist_day()}:{int(n) + 1 if day == ist_day() and n.isdigit() else 1}")
+    except Exception:
+        log_error("count_day")
+
+
+def ai_admin_intent(user_id: int, text: str) -> Optional[Dict[str, Any]]:
+    if not admin_ai_budget_ok(user_id):
+        return None
+    _count_day(f"aiday_admin:{user_id}")
+    content = ai_complete(ADMIN_AI_SYSTEM, text[:400], max_tokens=160, cap=8)
+    if not content:
+        return None
+    try:
+        data = json.loads(content[content.find("{"): content.rfind("}") + 1])
+    except Exception:
+        return None
+    if not isinstance(data, dict) or str(data.get("action") or "") not in ADMIN_ACTIONS:
+        return None   # anything outside the whitelist is ignored
+
+    def s(v: Any) -> Optional[str]:
+        return _strip_q(str(v))[:200] if isinstance(v, (str, int)) and str(v).strip() else None
+    on = data.get("on")
+    return {"action": data["action"], "find": s(data.get("find")), "to": s(data.get("to")),
+            "kind": s(data.get("kind")) if s(data.get("kind")) in {"join", "source"} else None,
+            "target": s(data.get("target")), "on": on if isinstance(on, bool) else None,
+            "query": s(data.get("query")), "ask": s(data.get("ask")), "ai": True}
+
+
+def admin_text(chat_id: int, user: Dict[str, Any], text: str) -> Optional[str]:
+    """Admin free text. Returns None when handled here, else the text to search."""
+    user_id = int(user.get("id"))
+    raw = (text or "").strip()
+    low = raw.lower()
+    for p in SEARCH_PREFIXES:
+        if low.startswith(p):
+            rest = raw[len(p):].strip()
+            if not rest:
+                send_text(chat_id, SEARCH_PROMPT, None, "HTML")
+                return None
+            return rest
+    if get_setting(f"admsearch:{user_id}") == "1":
+        return raw
+    intent = local_admin_intent(raw)
+    if intent is None:
+        if not looks_like_command(raw):
+            return raw                       # plain words ("lucent", "ssc gd gk hindi") → search, no AI
+        intent = ai_admin_intent(user_id, raw)
+        if intent is None:
+            token = set_op(user_id, {"kind": "search", "q": raw[:300]})
+            send_text(chat_id, "🤔 Ye koi kaam (command) hai ya file search?\n\n"
+                               "Kaam ho to thoda saaf likho, jaise: \"polity ka naam politics kr do\".",
+                      {"inline_keyboard": [[{"text": "🔍 Search karo", "callback_data": f"ad:op:s:{token}"}],
+                                           [{"text": "⚙️ Admin Panel", "callback_data": "ad:panel"}]]})
+            return None
+    if intent["action"] == "search":
+        return intent.get("query") or raw
+    run_admin_action(chat_id, user, intent, raw)
+    return None
+
+
+def run_admin_action(chat_id: int, user: Dict[str, Any], intent: Dict[str, Any], raw: str,
+                     query: Optional[Dict[str, Any]] = None) -> None:
+    user_id = int(user.get("id"))
+    a = intent.get("action")
+    if a not in ADMIN_ACTIONS and a != "panel_button":
+        return
+    if a in OWNER_ONLY_ACTIONS and not is_owner(user_id):
+        send_text(chat_id, "⛔ Ye kaam sirf owner kar sakta hai.", {"inline_keyboard": [BACK_ROW]})
+        return
+    find, to = intent.get("find") or "", intent.get("to") or ""
+    if a == "rename":
+        if not find or not to:
+            ask_input(chat_id, user_id, "rename", prefix="✏️ Samajh gaya, naam badalna hai.\n")
+            return
+        rename_flow(chat_id, user_id, find, to)
+    elif a == "bulk_rename":
+        if not find or not to:
+            send_text(chat_id, "✏️ Kya badalna hai? Aise likho: \"sab files me Hindi ko हिंदी kr do\"", {"inline_keyboard": [BACK_ROW]})
+            return
+        bulk_rename_flow(chat_id, user_id, find, to)
+    elif a == "delete_file":
+        delete_flow(chat_id, user_id, find)
+    elif a == "backup_old":
+        backup_flow(chat_id, user_id)
+    elif a == "list_files":
+        send_text(chat_id, *files_view(1))
+    elif a == "users":
+        send_text(chat_id, users_view(), {"inline_keyboard": [[{"text": "🔄 Refresh", "callback_data": "ad:users"}], BACK_ROW]})
+    elif a == "report":
+        send_text(chat_id, report_text(), {"inline_keyboard": [BACK_ROW]})
+    elif a == "status":
+        send_text(chat_id, status_text(user_id), status_markup())
+    elif a == "restart":
+        ask_confirm(chat_id, user_id, "🔄 Bot restart karu?\n\nWebhook aur commands menu dobara set honge (files/settings pe koi asar nahi).",
+                    {"kind": "restart"})
+    elif a == "add_channel":
+        kind = intent.get("kind")
+        target = intent.get("target")
+        if not kind:
+            send_text(chat_id, "➕ Kaunsa channel jodna hai?\n\n📢 Join = naye users ko join karna padega\n📥 Source = wahan ki files bot me aayengi",
+                      {"inline_keyboard": [[{"text": "📢 Join Channel Jodo", "callback_data": "ad:addreq"}],
+                                           [{"text": "📥 Source Channel Jodo", "callback_data": "ad:addsrc"}], BACK_ROW]})
+        elif not target:
+            ask_input(chat_id, user_id, "addreq" if kind == "join" else "addsrc")
+        else:
+            label = "📢 Join channel" if kind == "join" else "📥 Source channel"
+            ask_confirm(chat_id, user_id, f"➕ {label} jodna hai: {target}\n\nPakka?", {"kind": "addch", "ch": kind, "target": target})
+    elif a in {"remove_channel", "list_channels"}:
+        kind = intent.get("kind")
+        note = "Hatane ke liye list me ❌ dabao (pehle ✅ Accept puchega).\n\n" if a == "remove_channel" else ""
+        if kind == "join":
+            text, kb = required_list_view()
+            send_text(chat_id, note + text, kb)
+        elif kind == "source":
+            text, kb = source_list_view()
+            send_text(chat_id, note + text, kb)
+        else:
+            send_text(chat_id, note + "Kaunse channels?", {"inline_keyboard": [
+                [{"text": "📋 Join Channels", "callback_data": "ad:reqlist"}],
+                [{"text": "📋 Source Channels", "callback_data": "ad:srclist"}], BACK_ROW]})
+    elif a == "add_admin":
+        ask_input(chat_id, user_id, "addadmin")
+    elif a == "ai_keys":
+        send_text(chat_id, *keys_view())
+    elif a == "ai_naming":
+        on = intent.get("on")
+        if on is None:
+            send_text(chat_id, *ainame_view())
+            return
+        ask_confirm(chat_id, user_id, ("🤖 AI Naming chalu karu?\nNayi files ka naam AI caption + file naam padhke rakhega."
+                                       if on else "🤖 AI Naming band karu?\nNayi files ka naam purane tareeke se (caption / file naam) banega."),
+                    {"kind": "ainame", "on": bool(on)})
+    elif a == "fix_names":
+        fixnames_view(chat_id, user_id, None)
+    elif a == "panel_button" and intent.get("button") in {"setbackup", "setlog"}:
+        ask_input(chat_id, user_id, intent["button"])
+    elif a == "panel":
+        send_text(chat_id, ADMIN_PANEL_TEXT, admin_menu(user_id), "HTML")
+    elif a == "help":
+        send_text(chat_id, ADMIN_HELP, {"inline_keyboard": [BACK_ROW]})
+    else:   # unknown
+        token = set_op(user_id, {"kind": "search", "q": raw[:300]})
+        ask = intent.get("ask") or "Samajh nahi aaya — kya karna hai?"
+        send_text(chat_id, "🤔 " + ask, {"inline_keyboard": [[{"text": "🔍 Search karo", "callback_data": f"ad:op:s:{token}"}],
+                                                             [{"text": "⚙️ Admin Panel", "callback_data": "ad:panel"}]]})
+
+
+# ---- rename / bulk rename / delete flows
+
+def new_name_for(old: str, find: str, to: str) -> str:
+    """Replace the matched words inside the title ("Polity Notes" → "Politics Notes"); else the whole name."""
+    old = old or ""
+    m = re.search(re.escape(find), old, re.I) if find else None
+    if not m:
+        return re.sub(r"\s+", " ", to).strip()[:500]
+    seg = m.group(0)
+    rep_to = to
+    if to.islower() and seg[:1].isupper():
+        rep_to = to.upper() if seg.isupper() and len(seg) > 1 else to[:1].upper() + to[1:]
+    return re.sub(r"\s+", " ", old[:m.start()] + rep_to + old[m.end():]).strip()[:500]
+
+
+def find_books(find: str, limit: int = 10) -> List[Dict[str, Any]]:
+    find = (find or "").strip()
+    if not find:
+        return []
+    if find.isdigit():
+        rows = supabase("books", "GET", query=f"?id=eq.{int(find)}&status=eq.indexed&select=id,title,file_size&limit=1")
+        if rows:
+            return rows
+    rows = search_books(find)
+    lowf = find.lower()
+    in_title = [r for r in rows if lowf in str(r.get("title") or "").lower()]
+    if not in_title:
+        # search_books caps at 10: look straight in the titles too.
+        in_title = supabase("books", "GET", query="?select=id,title,file_size&status=eq.indexed&order=id.desc&limit=" +
+                            f"{limit}&title=ilike." + urllib.parse.quote(f"*{find}*", safe="*"))
+    return (in_title or rows)[:limit]
+
+
+def preview_rename(chat_id: int, user_id: int, items: List[Any], query: Optional[Dict[str, Any]] = None,
+                   extra: Optional[Dict[str, Any]] = None, head: str = "✏️ Ye naam badlega — pakka?") -> None:
+    items = [(int(i), str(o or ""), str(n or "")) for i, o, n in items if n and str(n).strip() and str(n) != str(o)]
+    if not items:
+        show(chat_id, "✅ Kuch badalne ko nahi hai — naam pehle se waise hi hai.", {"inline_keyboard": [BACK_ROW]}, query)
+        return
+    lines = [head + (f" ({len(items)} files)" if len(items) > 1 else ""), ""]
+    for n, (_, old, new) in enumerate(items[:12], 1):
+        lines.append(f"{n}. {old[:70]}\n   → {new[:70]}")
+    if len(items) > 12:
+        lines.append(f"\n…aur {len(items) - 12} files")
+    op = {"kind": "rename", "items": [[i, o[:300], n[:300]] for i, o, n in items]}
+    op.update(extra or {})
+    ask_confirm(chat_id, user_id, "\n".join(lines)[:3900], op, query)
+
+
+def rename_flow(chat_id: int, user_id: int, find: str, to: str) -> None:
+    rows = find_books(find)
+    if not rows:
+        send_text(chat_id, f"😕 \"{find[:60]}\" naam ki koi file nahi mili.\nSahi naam likho ya 📂 All Files me dekho.",
+                  {"inline_keyboard": [[{"text": "📂 All Files", "callback_data": "ad:files:1"}], BACK_ROW]})
+        return
+    if len(rows) == 1:
+        r = rows[0]
+        preview_rename(chat_id, user_id, [(r["id"], r.get("title"), new_name_for(str(r.get("title") or ""), find, to))])
+        return
+    token = set_op(user_id, {"kind": "rename_pick", "find": find, "to": to, "ids": [int(r["id"]) for r in rows]})
+    kb = [[{"text": f"✏️ {str(r.get('title') or 'Untitled')[:40]}", "callback_data": f"ad:op:p:{token}:{r['id']}"}] for r in rows]
+    with_word = [r for r in rows if find.lower() in str(r.get("title") or "").lower()]
+    if len(with_word) > 1:
+        kb.append([{"text": f"✏️ Sab {len(with_word)} me \"{find[:12]}\" badlo", "callback_data": f"ad:op:a:{token}"}])
+    kb.append([{"text": "❌ Deny", "callback_data": f"ad:op:n:{token}"}])
+    send_text(chat_id, f"🔎 \"{find[:60]}\" se {len(rows)} files mili. Kiska naam \"{to[:60]}\" karna hai?", {"inline_keyboard": kb})
+
+
+def bulk_rename_flow(chat_id: int, user_id: int, find: str, to: str) -> None:
+    rows = supabase("books", "GET", query="?select=id,title&status=eq.indexed&order=id.desc&limit=300&title=ilike." +
+                    urllib.parse.quote(f"*{find}*", safe="*"))
+    items = [(r["id"], r.get("title"), new_name_for(str(r.get("title") or ""), find, to)) for r in rows
+             if find.lower() in str(r.get("title") or "").lower()]
+    if not items:
+        send_text(chat_id, f"😕 Kisi file ke naam me \"{find[:60]}\" nahi mila.", {"inline_keyboard": [BACK_ROW]})
+        return
+    preview_rename(chat_id, user_id, items, head=f"✏️ \"{find[:30]}\" → \"{to[:30]}\" — ye naam badlenge, pakka?")
+
+
+def delete_flow(chat_id: int, user_id: int, find: str) -> None:
+    if not find:
+        send_text(chat_id, "❌ Kaunsi file hatani hai? Naam likho, jaise: \"lucent wali file hatao\" — ya 📂 All Files me tap karo.",
+                  {"inline_keyboard": [[{"text": "📂 All Files", "callback_data": "ad:files:1"}], BACK_ROW]})
+        return
+    rows = find_books(find, 8)
+    if not rows:
+        send_text(chat_id, f"😕 \"{find[:60]}\" naam ki koi file nahi mili.", {"inline_keyboard": [[{"text": "📂 All Files", "callback_data": "ad:files:1"}], BACK_ROW]})
+        return
+    if len(rows) == 1:
+        send_text(chat_id, *confirm_view(f"fdel:{rows[0]['id']}"))
+        return
+    kb = [[{"text": f"❌ {str(r.get('title') or 'Untitled')[:42]}", "callback_data": f"ad:fdel:{r['id']}"}] for r in rows]
+    send_text(chat_id, f"🔎 \"{find[:60]}\" se {len(rows)} files mili. Kaunsi hatani hai? (agle step me ✅ Accept puchega)",
+              {"inline_keyboard": kb + [BACK_ROW]})
+
+
+def backup_flow(chat_id: int, user_id: int) -> None:
+    target = get_setting("backup_chat_id")
+    if not target:
+        send_text(chat_id, "💾 Pehle Backup Channel set karo, phir purani files wahan upload hongi.",
+                  {"inline_keyboard": [[{"text": "💾 Backup Channel", "callback_data": "ad:backup"}], BACK_ROW]})
+        return
+    try:
+        n = count_rows("books", backup_pending_query(target))
+    except Exception:
+        n = 0
+    if not n:
+        send_text(chat_id, "✅ Saari files pehle se backup channel me hain. Nayi files apne-aap jaati rahengi.", {"inline_keyboard": [BACK_ROW]})
+        return
+    ask_confirm(chat_id, user_id, f"💾 {n} purani files backup channel \"{chat_title(target)}\" me upload hongi\n"
+                                  f"(20-20 karke, koi duplicate nahi).\n\nShuru karu?", {"kind": "backup"})
+
+
+def apply_renames(items: List[Any], budget: float = 6.5) -> List[Any]:
+    """Apply [[id, old, new], ...]; the original file name / caption stay searchable. Returns items not done (time budget)."""
+    started = time.monotonic()
+    ids = [int(x[0]) for x in items]
+    have: Dict[int, Dict[str, Any]] = {}
+    for i in range(0, len(ids), 50):
+        chunk = ids[i:i + 50]
+        for r in supabase("books", "GET", query=f"?id=in.({','.join(str(x) for x in chunk)})&select=id,caption,file_name,source_chat_title"):
+            have[int(r["id"])] = r
+    left = []
+    for n, (bid, old, new) in enumerate(items):
+        if time.monotonic() - started > budget:
+            left = items[n:]
+            break
+        row = have.get(int(bid)) or {}
+        # Search words = new name + the file's own caption / original file name / channel (not older names).
+        keywords = clean_text(" ".join(str(x or "") for x in (new, row.get("caption"), row.get("file_name"),
+                                                                row.get("source_chat_title"))))
+        supabase("books", "PATCH", {"title": new[:500], "keywords": keywords[:4000]}, f"?id=eq.{int(bid)}")
+    return left
+
+
+def run_op(query: Dict[str, Any], chat_id: int, user_id: int, op: Dict[str, Any]) -> None:
+    kind = op.get("kind")
+    if kind == "rename":
+        items = op.get("items") or []
+        left = apply_renames(items)
+        done = items[:len(items) - len(left)]
+        lines = [f"✅ {len(done)} file ka naam badal diya" if len(done) != 1 else "✅ Naam badal diya:"]
+        for _, old, new in done[:5]:
+            lines.append(f"• {str(old)[:50]} → {str(new)[:50]}")
+        kb: List[Any] = []
+        if left:
+            token = set_op(user_id, dict(op, items=left))
+            lines.append(f"\n⏳ Baaki {len(left)} — niche dabao")
+            kb.append([{"text": f"▶️ Baaki {len(left)} bhi badlo", "callback_data": f"ad:op:y:{token}"}])
+        else:
+            clear_op(user_id)
+        if op.get("next_after") is not None:
+            set_setting("ainame_cursor", str(int(op["next_after"])))
+            if not left:
+                kb.append([{"text": f"▶️ Agle {FIX_BATCH} naam", "callback_data": f"ad:fixn:{int(op['next_after'])}"}])
+        show(chat_id, "\n".join(lines), {"inline_keyboard": kb + [BACK_ROW]}, query)
+    elif kind == "backup":
+        clear_op(user_id)
+        try:
+            telegram("answerCallbackQuery", {"callback_query_id": query.get("id"), "text": "💾 Backup chal raha hai..."})
+        except Exception:
+            pass
+        show(chat_id, *backup_old_view(), query=query)
+    elif kind == "restart":
+        clear_op(user_id)
+        show(chat_id, restart_text(), status_markup(), query)
+    elif kind == "ainame":
+        clear_op(user_id)
+        set_setting("ai_naming", "on" if op.get("on") else "off")
+        text, kb = ainame_view()
+        show(chat_id, ("✅ AI Naming chalu ho gaya\n\n" if op.get("on") else "✅ AI Naming band ho gaya\n\n") + text, kb, query)
+    elif kind == "addch":
+        clear_op(user_id)
+        if op.get("ch") == "join":
+            title = add_required_channel(str(op.get("target")), None)
+            show(chat_id, f"✅ Join channel jud gaya: {title}", {"inline_keyboard": [[{"text": "📋 Join Channels", "callback_data": "ad:reqlist"}], BACK_ROW]}, query)
+        else:
+            chat = add_source_channel(str(op.get("target")), None)
+            note = "" if chat.get("_bot_admin") else "\n" + AUTO_SAVE_OFF_NOTE
+            show(chat_id, f"✅ Source channel jud gaya: {chat.get('title')}" + note,
+                 {"inline_keyboard": [[{"text": "📋 Source Channels", "callback_data": "ad:srclist"}], BACK_ROW]}, query)
+    else:
+        show(chat_id, "Ye kaam purana ho gaya. Dobara bolo.", {"inline_keyboard": [BACK_ROW]}, query)
+
+
+# ---- 📂 All Files (10 per page, newest first)
+
+def files_view(page: int = 1) -> Any:
+    total = count_rows("books", "&status=eq.indexed")
+    pages = max(1, -(-total // FILES_PAGE))
+    page = min(max(1, int(page)), pages)
+    rows = supabase("books", "GET", query="?select=id,title,file_size,language,source_chat_title&status=eq.indexed"
+                                          f"&order=id.desc&offset={(page - 1) * FILES_PAGE}&limit={FILES_PAGE}") if total else []
+    lines = [f"📂 Saari Files — {total}", f"Page {page}/{pages} · nayi files upar", ""]
+    nums: List[Any] = []
+    for n, r in enumerate(rows, (page - 1) * FILES_PAGE + 1):
+        bits = [x for x in (human_size(r.get("file_size")), str(r.get("source_chat_title") or "")[:20]) if x]
+        lines.append(f"{n}. {str(r.get('title') or 'Untitled')[:70]}" + (f"\n    {' · '.join(bits)}" if bits else ""))
+        nums.append({"text": str(n), "callback_data": f"ad:f:{r['id']}:{page}"})
+    if not rows:
+        lines.append("Abhi koi file nahi hai.")
+    else:
+        lines.append("\nFile ka number dabao → 📤 Bhejo / ✏️ Rename / ❌ Hatao")
+    kb = [nums[i:i + 5] for i in range(0, len(nums), 5)]
+    nav = []
+    if page > 1:
+        nav.append({"text": "⬅️ Previous", "callback_data": f"ad:files:{page - 1}"})
+    nav.append({"text": f"{page}/{pages}", "callback_data": "ad:noop"})
+    if page < pages:
+        nav.append({"text": "Next ➡️", "callback_data": f"ad:files:{page + 1}"})
+    kb.append(nav)
+    kb.append(BACK_ROW)
+    return "\n".join(lines)[:4000], {"inline_keyboard": kb}
+
+
+def file_menu_view(book_id: int, page: int = 1) -> Any:
+    rows = supabase("books", "GET", query=f"?id=eq.{int(book_id)}&select=id,title,file_name,file_size,language,source_chat_title,status&limit=1")
+    if not rows or rows[0].get("status") not in (None, "indexed"):
+        return "😕 Ye file ab nahi hai.", {"inline_keyboard": [[{"text": "📂 All Files", "callback_data": f"ad:files:{page}"}]]}
+    r = rows[0]
+    lines = [f"📄 {r.get('title') or 'Untitled'}", ""]
+    if r.get("file_name"):
+        lines.append(f"Asli file naam: {r['file_name']}")
+    if human_size(r.get("file_size")):
+        lines.append(f"Size: {human_size(r.get('file_size'))}")
+    if r.get("source_chat_title"):
+        lines.append(f"Source: {r['source_chat_title']}")
+    lines.append(f"ID: {r['id']}")
+    return "\n".join(lines)[:3900], {"inline_keyboard": [
+        [{"text": "📤 Bhejo", "callback_data": f"ad:fs:{r['id']}"}, {"text": "✏️ Rename", "callback_data": f"ad:rn:{r['id']}"}],
+        [{"text": "❌ Hatao", "callback_data": f"ad:fdel:{r['id']}"}],
+        [{"text": "🔙 List", "callback_data": f"ad:files:{page}"}]]}
+
+
+# ---- 🤖 AI naming of files
+
+AI_NAME_SYSTEM = (
+    "You clean file titles for an Indian govt-exam study PDF library. Each item has the post caption and the original "
+    "file name. Reply ONLY with JSON {\"titles\":[{\"i\":1,\"title\":\"...\"}]}. Rules: a short clean title, max 70 "
+    "characters. Use ONLY words found in the caption or file name (you may fix spelling, spacing and capital letters). "
+    "Keep book/author/publisher, exam, subject, class, part/volume, year and language if present. Remove channel names, "
+    "@usernames, links, emojis, hashtags, 'join', 'download', promo lines, file extensions, underscores and ID numbers. "
+    "Never invent a book title, author or exam that is not written there. If nothing useful, return the cleaned file name.")
+GENERIC_TITLE_WORDS = {"hindi", "english", "notes", "note", "book", "books", "pdf", "part", "vol", "volume", "class", "exam",
+                       "gk", "gs", "and", "the", "of", "for", "in", "with", "by", "edition", "new", "complete", "general",
+                       "knowledge", "test", "mock", "paper", "papers", "question", "questions", "answer", "answers",
+                       "solved", "previous", "year", "set", "series", "chapter", "medium", "guide", "practice", "full",
+                       "study", "material", "important", "se", "ki", "ka", "ke", "aur", "evam"}
+
+
+def title_supported(title: str, source: str) -> bool:
+    """Guard against made-up titles: every word must come from the caption / file name (spelling fixes allowed)."""
+    import difflib
+    src = normalize(source)
+    src_words = re.findall(r"[a-z0-9]+|[\u0900-\u097F]+", src)
+    for w in re.findall(r"[a-z0-9]+|[\u0900-\u097F]+", (title or "").lower()):
+        if w in GENERIC_TITLE_WORDS or len(w) <= 2 or w in src:
+            continue
+        if w.isdigit():
+            return False
+        if difflib.get_close_matches(w, src_words, n=1, cutoff=0.75):
+            continue
+        return False
+    return True
+
+
+def clean_ai_title(t: Any) -> str:
+    t = re.sub(r"\s+", " ", str(t or "")).strip().strip("\"'“”`")
+    t = re.sub(r"\.(pdf|docx?|pptx?|zip|rar|mp4|epub)$", "", t, flags=re.I).strip()
+    return t[:100]
+
+
+def ai_titles(items: List[Dict[str, Any]], cap: float = 9.0) -> Dict[int, str]:
+    """{i: title} for [{"i", "caption", "file", "old"}] — only titles that pass the no-invention guard."""
+    payload = [{"i": x["i"], "caption": re.sub(r"\s+", " ", str(x.get("caption") or ""))[:300],
+                "file": str(x.get("file") or "")[:150]} for x in items]
+    content = ai_complete(AI_NAME_SYSTEM, json.dumps(payload, ensure_ascii=False), max_tokens=min(1800, 50 + 45 * len(items)), cap=cap)
+    if not content:
+        return {}
+    try:
+        data = json.loads(content[content.find("{"): content.rfind("}") + 1])
+    except Exception:
+        return {}
+    got = data.get("titles") if isinstance(data, dict) else None
+    out: Dict[int, str] = {}
+    by_i = {x["i"]: x for x in items}
+    for t in got if isinstance(got, list) else []:
+        if not isinstance(t, dict) or t.get("i") not in by_i:
+            continue
+        x = by_i[t["i"]]
+        title = clean_ai_title(t.get("title"))
+        source = " ".join(str(x.get(k) or "") for k in ("caption", "file", "old"))
+        if len(title) >= 3 and title_supported(title, source):
+            out[int(t["i"])] = title
+    return out
+
+
+def ai_name_budget_ok() -> bool:
+    raw = get_setting("ainame:all") or ""
+    day, _, n = raw.partition(":")
+    return not (day == ist_day() and n.isdigit() and int(n) >= AI_NAME_DAILY)
+
+
+def maybe_ai_title(record: Dict[str, Any]) -> str:
+    """New file: let the AI clean its name (caption + original file name). Returns the old title when renamed.
+    Falls back silently to the normal cleanup when off / no key / limit / slow / unsure."""
+    if not record.get("caption") and not record.get("file_name"):
+        return ""
+    if req_elapsed() > 5 or not ai_provider() or not ai_naming_on() or not ai_name_budget_ok():
+        return ""
+    uniq = record.get("telegram_file_unique_id")
+    if uniq:
+        # Already in the catalog (re-forward): keep its name, an admin may have renamed it.
+        have = supabase("books", "GET", query=f"?telegram_file_unique_id=eq.{urllib.parse.quote(str(uniq))}&select=id,title&limit=1")
+        if have:
+            record["title"] = have[0].get("title") or record.get("title")
+            return ""
+    _count_day("ainame:all")
+    old = str(record.get("title") or "")
+    got = ai_titles([{"i": 1, "caption": record.get("caption"), "file": record.get("file_name"), "old": old}],
+                    cap=max(2.0, min(5.0, 9.0 - req_elapsed())))
+    new = got.get(1)
+    if not new or new == old:
+        return ""
+    record["title"] = new[:500]
+    record["keywords"] = (new + " " + str(record.get("keywords") or old))[:4000]
+    return old or str(record.get("file_name") or "")
+
+
+def ainame_view() -> Any:
+    on = ai_naming_on()
+    key = bool(ai_provider())
+    cursor = get_setting("ainame_cursor") or "0"
+    lines = [f"🤖 AI Naming: {'ON ✅' if on else 'OFF ❌'}", "",
+             "Nayi file save hote hi AI uska caption + asli file naam padhke saaf naam rakhta hai.",
+             "Asli file naam bhi save rehta hai (search me purane naam se bhi milegi).",
+             "AI ki key na ho / limit ho / pakka na ho → purana tareeka (caption / file naam).",
+             "AI kabhi naya book naam nahi banata — sirf caption / file naam ke shabd.",
+             "", f"AI key: {'✅ hai' if key else '❌ nahi (🔑 AI Keys me jodo)'}"]
+    if cursor not in ("", "0"):
+        lines.append(f"Purane naam: ID {cursor} tak check ho chuke")
+    kb = [[{"text": "⏸️ AI Naming band karo" if on else "▶️ AI Naming chalu karo", "callback_data": f"ad:ainame:{'off' if on else 'on'}"}],
+          [{"text": "🛠️ AI se purane naam theek karo", "callback_data": "ad:fixn"}], BACK_ROW]
+    return "\n".join(lines), {"inline_keyboard": kb}
+
+
+def fixnames_view(chat_id: int, user_id: int, after: Optional[int], query: Optional[Dict[str, Any]] = None) -> None:
+    """Next FIX_BATCH old files → one AI call → preview old → new → ✅ Accept applies."""
+    if after is None:
+        try:
+            after = int(get_setting("ainame_cursor") or 0)
+        except ValueError:
+            after = 0
+    else:
+        set_setting("ainame_cursor", str(int(after)))
+    if not ai_provider():
+        show(chat_id, "❌ AI key nahi hai. Pehle 🔑 AI Keys me key jodo.", {"inline_keyboard": [BACK_ROW]}, query)
+        return
+    rows = supabase("books", "GET", query=f"?select=id,title,caption,file_name&status=eq.indexed&id=gt.{int(after)}&order=id&limit={FIX_BATCH}")
+    if not rows:
+        show(chat_id, "🎉 Saare purane naam check ho gaye! Nayi files ka naam AI apne-aap rakhega.",
+             {"inline_keyboard": [[{"text": "🔁 Shuru se dobara", "callback_data": "ad:fixn:0"}], BACK_ROW]}, query)
+        return
+    if not ai_name_budget_ok():
+        show(chat_id, "⏳ Aaj ki AI naming limit poori ho gayi. Kal dobara try karo.", {"inline_keyboard": [BACK_ROW]}, query)
+        return
+    _count_day("ainame:all")
+    last = int(rows[-1]["id"])
+    got = ai_titles([{"i": n, "caption": r.get("caption"), "file": r.get("file_name"), "old": r.get("title")}
+                     for n, r in enumerate(rows, 1)], cap=max(3.0, 9.0 - req_elapsed()))
+    if not got:
+        show(chat_id, "❌ AI abhi jawab nahi de raha (limit / key). Thodi der baad dobara dabao.",
+             {"inline_keyboard": [[{"text": "🔁 Dobara try", "callback_data": f"ad:fixn:{int(after)}"}], BACK_ROW]}, query)
+        return
+    items = [(r["id"], r.get("title"), got[n]) for n, r in enumerate(rows, 1)
+             if got.get(n) and got[n].strip().lower() != str(r.get("title") or "").strip().lower()]
+    if not items:
+        set_setting("ainame_cursor", str(last))
+        show(chat_id, f"✅ Ye {len(rows)} naam pehle se theek hain.",
+             {"inline_keyboard": [[{"text": f"▶️ Agle {FIX_BATCH} naam", "callback_data": f"ad:fixn:{last}"}], BACK_ROW]}, query)
+        return
+    preview_rename(chat_id, user_id, items, query, {"next_after": last},
+                   head=f"🤖 AI ke naam sujhav ({len(rows)} me se {len(items)} badlenge) — pakka?")
+
+
+def handle_admin_callback_v6(query: Dict[str, Any], cmd: str, chat_id: int, user_id: int) -> bool:
+    """New buttons (v6). True when handled."""
+    if cmd == "noop":
+        return True
+    if cmd.startswith("files"):
+        page = cmd.split(":", 1)[1] if ":" in cmd else "1"
+        show(chat_id, *files_view(int(page) if page.isdigit() else 1), query=query)
+        return True
+    if cmd.startswith("f:"):
+        parts = cmd.split(":")
+        show(chat_id, *file_menu_view(int(parts[1]), int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1), query=query)
+        return True
+    if cmd.startswith("fs:"):
+        rows = supabase("books", "GET", query=f"?id=eq.{int(cmd[3:])}&select=*&limit=1")
+        if rows:
+            deliver_result(chat_id, rows[0], query.get("from"))
+        else:
+            send_text(chat_id, "😕 Ye file ab nahi hai.")
+        return True
+    if cmd.startswith("fdel:"):      # reached only after ✅ Accept (ad:y:fdel:<id>)
+        bid = int(cmd.split(":", 1)[1])
+        rows = supabase("books", "GET", query=f"?id=eq.{bid}&select=title&limit=1")
+        supabase("books", "PATCH", {"status": "removed"}, f"?id=eq.{bid}")
+        text, kb = files_view(1)
+        show(chat_id, f"✅ File hata di: {(rows[0].get('title') if rows else bid)}\n\n" + text, kb, query)
+        return True
+    if cmd == "smode":
+        on = get_setting(f"admsearch:{user_id}") == "1"
+        set_setting(f"admsearch:{user_id}", "0" if on else "1")
+        note = ("🔍 Search Mode OFF — ab bot samjhega aapka msg kaam hai ya search 🤖\n\n" if on else
+                "🔍 Search Mode ON — ab aapka har msg seedha search hoga.\n(Bolke kaam ke liye ise OFF karo)\n\n")
+        show(chat_id, note + ADMIN_PANEL_TEXT, admin_menu(user_id), query, "HTML")
+        return True
+    if cmd == "ainame":
+        show(chat_id, *ainame_view(), query=query)
+        return True
+    if cmd in {"ainame:on", "ainame:off"}:
+        run_admin_action(chat_id, query.get("from") or {"id": user_id}, {"action": "ai_naming", "on": cmd.endswith(":on")}, "", query)
+        return True
+    if cmd == "fixn" or cmd.startswith("fixn:"):
+        try:
+            telegram("answerCallbackQuery", {"callback_query_id": query.get("id"), "text": "🤖 AI naam soch raha hai..."})
+        except Exception:
+            pass
+        arg = cmd.split(":", 1)[1] if ":" in cmd else ""
+        fixnames_view(chat_id, user_id, int(arg) if arg.isdigit() else None, query)
+        return True
+    if cmd.startswith("op:"):
+        parts = cmd.split(":")
+        verb, token = (parts + ["", ""])[1:3]
+        op = get_op(user_id, token)
+        if not op:
+            show(chat_id, "⌛ Ye button purana ho gaya. Dobara bolo / dabao.", {"inline_keyboard": [BACK_ROW]}, query)
+            return True
+        if verb == "n":
+            clear_op(user_id)
+            kb = []
+            if op.get("next_after") is not None:
+                kb.append([{"text": f"⏭️ Inhe chhodo, agle {FIX_BATCH}", "callback_data": f"ad:fixn:{int(op['next_after'])}"}])
+            show(chat_id, "❌ Theek hai, kuch nahi badla.", {"inline_keyboard": kb + [BACK_ROW]}, query)
+        elif verb == "y":
+            run_op(query, chat_id, user_id, op)
+        elif verb == "s" and op.get("kind") == "search":
+            clear_op(user_id)
+            smart_reply(chat_id, query.get("from") or {"id": user_id}, str(op.get("q") or ""))
+        elif verb == "p" and op.get("kind") == "rename_pick" and len(parts) > 3 and parts[3].isdigit():
+            rows = supabase("books", "GET", query=f"?id=eq.{int(parts[3])}&select=id,title&limit=1")
+            if rows:
+                preview_rename(chat_id, user_id, [(rows[0]["id"], rows[0].get("title"),
+                                                   new_name_for(str(rows[0].get("title") or ""), op["find"], op["to"]))], query)
+        elif verb == "a" and op.get("kind") == "rename_pick":
+            ids = ",".join(str(int(x)) for x in op.get("ids") or [])
+            rows = supabase("books", "GET", query=f"?id=in.({ids})&select=id,title") if ids else []
+            items = [(r["id"], r.get("title"), new_name_for(str(r.get("title") or ""), op["find"], op["to"])) for r in rows
+                     if str(op["find"]).lower() in str(r.get("title") or "").lower()]
+            preview_rename(chat_id, user_id, items, query)
+        return True
+    return False
+
 
 
 PUBLIC_HOME = "https://" + (os.environ.get("PUBLIC_URL") or os.environ.get("VERCEL_PROJECT_PRODUCTION_URL")
@@ -2995,6 +3859,8 @@ def setup_status() -> Dict[str, Any]:
         },
         "ai": ("on (" + ai_provider() + ")") if ai_provider() else "off",
         "ai_keys_in_bot": len(db_ai_keys()),
+        "ai_naming": "on" if ai_naming_on() else "off",
+        "admin_commands": "on",
     }
     if GROQ_KEYS:
         # Key check without spending tokens (lists models). Never shows a key.
@@ -3067,6 +3933,7 @@ def webhook() -> Any:
     update = request.get_json(silent=True) or {}
     _REQ.clear()
     _LOG_QUEUE.clear()
+    _REQ_T0[0] = time.monotonic()
     reply_chat = ((update.get("message") or {}).get("chat") or {}).get("id") or \
         (((update.get("callback_query") or {}).get("message") or {}).get("chat") or {}).get("id")
     try:
