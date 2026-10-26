@@ -802,6 +802,7 @@ def admin_menu(user_id: Optional[int] = None) -> Dict[str, Any]:
         [{"text": "📂 All Files", "callback_data": "ad:files:1"}, {"text": "🤖 AI Naming", "callback_data": "ad:ainame"}],
         [{"text": "✏️ File Rename", "callback_data": "ad:rename"}, {"text": "📊 Report", "callback_data": "ad:report"}],
         keys_row + [{"text": "🔄 Bot Restart", "callback_data": "ad:restart"}],
+    ] + ([[{"text": "👤 Userbot", "callback_data": "ad:ub"}]] if (user_id is None or is_owner(user_id)) else []) + [
         [{"text": "🩺 Status", "callback_data": "ad:status"}, {"text": "❓ Admin Help", "callback_data": "ad:help"}],
         [{"text": search_mode_label(user_id), "callback_data": "ad:smode"}],
         [{"text": "🔍 Search Menu", "callback_data": "ad:usermenu"}],
@@ -1260,6 +1261,8 @@ def handle_admin_callback(query: Dict[str, Any], data: str, chat_id: int, user_i
             return
         show(chat_id, *confirm_view(cmd), query=query)
         return
+    if cmd.startswith("ub") and handle_ub_callback(query, cmd, chat_id, user_id):
+        return                 # 👤 Userbot screen / login link / check now / pause / logout (after Accept)
     if handle_admin_callback_v6(query, cmd, chat_id, user_id):
         return
     if cmd == "panel":
@@ -1372,7 +1375,7 @@ def handle_admin_callback(query: Dict[str, Any], data: str, chat_id: int, user_i
 # ---- confirm before any remove (Aarav 5:08/5:11 PM: one confirm, ✅ Accept / ❌ Deny)
 
 DESTRUCTIVE_PREFIXES = ("rmreq:", "rmsrc:", "rmadm:", "keyrm:", "fdel:")
-DESTRUCTIVE_CMDS = {"backupoff", "logoff"}
+DESTRUCTIVE_CMDS = {"backupoff", "logoff", "ublogout"}
 
 
 def is_destructive(cmd: str) -> bool:
@@ -1402,6 +1405,8 @@ def confirm_view(cmd: str) -> Any:
             name, back = "Backup channel", "ad:backup"
         elif cmd == "logoff":
             name, back = "Log chat", "ad:log"
+        elif cmd == "ublogout":
+            name, back = "Userbot login (aapke Telegram account ka session)", "ad:ub"
     except Exception:
         log_error("confirm_view")
     if cmd.startswith("fdel:"):
@@ -2124,14 +2129,23 @@ def check_ai_key(key: str) -> str:
     """Keys Check (no tokens where the provider has a free auth check): "ok" | "invalid" | "limit" | "error"."""
     p = next((x for x in PROVIDER_ORDER if key in provider_keys(x)), "") or key_provider(key) or "openai"
     if p == "nvidia":
-        try:   # NVIDIA has no free auth check (its model list is public): one 1-token call
-            http_json(PROVIDERS[p]["base"] + "/chat/completions", "POST",
-                      {"model": (provider_models(p, key) or ["meta/llama-3.1-8b-instruct"])[0],
-                       "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}, _auth(p, key), timeout=8)
-            return "ok"
-        except Exception as exc:
-            cls = ai_err_class(exc)
-            return cls if cls in ("invalid", "limit") else "error"
+        # NVIDIA has no free auth check (its model list is public): a 1-token call; a model that answers 404
+        # "Function … Not found for account" is skipped (key stays fine), the next model is tried
+        last = "error"
+        for model in (provider_models(p, key) or PROVIDERS[p]["prefer"])[:4]:
+            try:
+                http_json(PROVIDERS[p]["base"] + "/chat/completions", "POST",
+                          {"model": model, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1},
+                          _auth(p, key), timeout=8)
+                promote_model(p, key, model)
+                return "ok"
+            except Exception as exc:
+                cls = ai_err_class(exc)
+                if cls == "model":
+                    drop_model(p, key, model)
+                    continue
+                return cls if cls in ("invalid", "limit") else "error"
+        return last
     url = PROVIDERS[p]["base"] + ("/key" if p == "openrouter" else "/models")
     try:
         http_json(url, "GET", None, _auth(p, key), timeout=6)
@@ -2257,8 +2271,12 @@ PROVIDERS: Dict[str, Dict[str, Any]] = {
                               "meta-llama/llama-3.3-70b-instruct:free", "openai/gpt-oss-20b:free"]},
     "nvidia": {"name": "NVIDIA", "c": "n", "base": "https://integrate.api.nvidia.com/v1", "json": False,
                "env": ["NVIDIA_API_KEY", "NVIDIA_API_KEY_2"], "get": "build.nvidia.com → Get API Key",
-               "prefer": ["meta/llama-3.1-8b-instruct", "meta/llama-3.2-3b-instruct", "mistralai/mistral-7b-instruct-v0.3",
-                          "google/gemma-2-9b-it", "meta/llama-3.3-70b-instruct", "nvidia/llama-3.1-nemotron-nano-8b-v1"]},
+               # Oct 26 2026: meta/llama-3.1-8b-instruct etc. answer 404 "Function …: Not found for account" (retired /
+               # not on the key's account) — fast models first, every 404 model is skipped and remembered per key
+               "prefer": ["openai/gpt-oss-20b", "google/gemma-3-12b-it", "nv-mistralai/mistral-nemo-12b-instruct",
+                          "mistralai/mistral-7b-instruct-v0.3", "z-ai/glm-5.3-flash", "deepseek-ai/deepseek-v4.1-flash",
+                          "meta/llama-3.3-70b-instruct", "meta/llama-3.1-8b-instruct", "meta/llama-3.2-3b-instruct",
+                          "google/gemma-3-4b-it", "ibm/granite-3.0-8b-instruct", "minimaxai/minimax-m3.1-flash"]},
     "openai": {"name": "OpenAI", "c": "a", "base": "https://api.openai.com/v1", "json": True,
                "env": ["OPENAI_API_KEY"], "get": "platform.openai.com/api-keys", "prefer": [], "hidden": True},
 }
@@ -2376,7 +2394,7 @@ def _model_ok(p: str, mid: str) -> bool:
     if p == "gemini":
         return "gemini" in low and "pro" not in low.split("/")[-1].split("-")
     if p == "nvidia":
-        return any(x in low for x in ("instruct", "-it", "chat"))
+        return mid in PROVIDERS["nvidia"]["prefer"] or any(x in low for x in ("instruct", "-it", "chat"))
     return True
 
 
@@ -2427,7 +2445,8 @@ def provider_models(p: str, key: str, fresh: bool = False) -> List[str]:
                         if p == "mistral" and isinstance(m.get("capabilities"), dict) and m["capabilities"].get("completion_chat") is False:
                             continue
                         got.append(mid)
-                    ids = sorted(dict.fromkeys(got), key=lambda x: _rank(p, x))[:8]
+                    _bad = set(bad_models(p, key))
+                    ids = sorted(dict.fromkeys(g for g in got if g not in _bad), key=lambda x: _rank(p, x))[:8]
                 except Exception:
                     ids = []
                 if ids:
@@ -2436,9 +2455,35 @@ def provider_models(p: str, key: str, fresh: bool = False) -> List[str]:
                     except Exception:
                         log_error("aimodels3 cache")
             if not ids:
-                ids = PROVIDERS[p]["prefer"][:3]
+                _bad = set(bad_models(p, key))
+                ids = [m for m in PROVIDERS[p]["prefer"] if m not in _bad][:4]
             _PMODELS[ck] = (time.time(), ids)
     return [m for m in dict.fromkeys([pinned] + list(ids)) if m]
+
+
+def bad_models(p: str, key: str) -> List[str]:
+    """Models that answered 'not found' for this key (kept 24 h, so a /models refresh can't bring them back)."""
+    raw = get_setting(f"aimbad:{p}:{key_id(key)}") or ""
+    ts, _, lst = raw.partition("|")
+    if lst and ts.isdigit() and time.time() - int(ts) < 86400:
+        return [x for x in lst.split(",") if x]
+    return []
+
+
+def promote_model(p: str, key: str, model: str) -> None:
+    """The model that just worked goes first for this key (cached like the list)."""
+    if p in ("groq", "openai"):
+        return
+    ck = f"{p}:{key_id(key)}"
+    ids = provider_models(p, key)
+    if not ids or ids[0] == model or router_cfg()["models"].get(p):
+        return
+    ids = [model] + [m for m in ids if m != model]
+    _PMODELS[ck] = (time.time(), ids)
+    try:
+        set_setting(f"aimodels3:{ck}", f"{int(time.time())}|{','.join(ids[:8])}")
+    except Exception:
+        log_error("promote_model")
 
 
 def drop_model(p: str, key: str, model: str) -> None:
@@ -2446,6 +2491,11 @@ def drop_model(p: str, key: str, model: str) -> None:
         drop_groq_model(key, model)
         return
     ck = f"{p}:{key_id(key)}"
+    try:
+        bad = list(dict.fromkeys(bad_models(p, key) + [model]))[-30:]
+        set_setting(f"aimbad:{ck}", f"{int(time.time())}|{','.join(bad)}")
+    except Exception:
+        log_error("bad_models")
     ids = [m for m in provider_models(p, key) if m != model]
     _PMODELS[ck] = (time.time(), ids or [m for m in PROVIDERS[p]["prefer"] if m != model][:3])
     try:
@@ -2555,6 +2605,8 @@ def ai_err_class(exc: Exception) -> str:
         return "invalid"
     if "json_validate_failed" in low or "failed_generation" in low or "response_format" in low or "json mode" in low:
         return "badjson"
+    if "function" in low and "not found" in low or "not found for account" in low:
+        return "model"          # NVIDIA: the model's function is gone / not on this account → next model, key is fine
     if "model" in low and any(x in low for x in ("not found", "decommission", "does not exist", "not supported",
                                                  "no access", "no endpoints", "is not a valid model", "unknown model")):
         return "model"
@@ -2686,7 +2738,7 @@ def ai_complete(system: str, user_text: str, max_tokens: int = 150, cap: float =
         for n, key in enumerate(usable):
             if prov_done:
                 break
-            models = provider_models(p, key)[:4 if p == "groq" else 3]
+            models = provider_models(p, key)[:4 if p == "groq" else (6 if p == "nvidia" else 3)]
             key_done = False
             for model in models:
                 left = deadline - time.time()
@@ -2710,6 +2762,8 @@ def ai_complete(system: str, user_text: str, max_tokens: int = 150, cap: float =
                             break
                         _stat(p, True)
                         _AI_LAST.update(provider=p, model=model, ms=int((time.time() - t_call) * 1000), usage=r["usage"])
+                        if model != models[0]:
+                            promote_model(p, key, model)
                         if first_fail and first_fail[0] != p:
                             _AI_LAST["switched_from"] = pname(first_fail[0])
                             note_switch(first_fail[0], p, first_fail[1])
@@ -2760,16 +2814,21 @@ def validate_key(p: str, key: str) -> Dict[str, Any]:
     out: Dict[str, Any] = {"st": "ok"}
     _PMODELS.pop(f"{p}:{key_id(key)}", None)
     models = provider_models(p, key, fresh=True) if p != "groq" else groq_models(key)
-    for model in models[:2]:
+    for model in models[:6 if p == "nvidia" else 2]:
         t0 = time.monotonic()
         try:
             r = provider_call(p, key, model, [{"role": "system", "content": "Reply ONLY with JSON {\"ok\":true}."},
                                               {"role": "user", "content": "ping"}], 20, 7, True, True)
             out.update(ms=int((time.monotonic() - t0) * 1000), model=model, reply=r["text"][:30], err=None)
+            if model != models[0]:
+                promote_model(p, key, model)
             return out
         except Exception as exc:
             cls = ai_err_class(exc)
             out.update(model=model, err=scrub_keys(str(exc), key)[:160])
+            if cls == "model":
+                drop_model(p, key, model)
+                continue
             if cls == "invalid":
                 out["st"] = "invalid"
                 return out
@@ -3414,7 +3473,7 @@ def index_file(record: Dict[str, Any], from_chat: Any, message_id: Any, where: s
     # name changed but the file was never downloaded (clear name): fetch it only to store the backup under the
     # clean FILE name (no reading, no AI). Bigger than 15 MB → copy of the post with the clean caption.
     try:
-        if not data and get_setting("backup_chat_id") and how == "clean" and record.get("file_name") and \
+        if not data and not record.get("backup_message_id") and get_setting("backup_chat_id") and how == "clean" and record.get("file_name") and \
                 safe_filename(str(record.get("title") or ""), str(record["file_name"])) != record["file_name"] and \
                 int(record.get("file_size") or 0) <= REUPLOAD_LIMIT and req_elapsed() < 4.0:
             got = download_file(record.get("telegram_file_id"), record.get("file_size"))
@@ -4116,6 +4175,11 @@ def handle_admin_command(message: Dict[str, Any]) -> None:
             n = int(arg) if arg.strip().isdigit() else 15
             for part in logs_text(n):
                 send_text(chat_id, part)
+    elif command == "/userbot":
+        if not is_owner(user_id):
+            send_text(chat_id, "Ye sirf owner ke liye hai.")
+        else:
+            send_text(chat_id, *ub_view(), parse_mode="HTML")
     elif command == "/bigfix":
         if not is_owner(user_id):
             send_text(chat_id, "Ye sirf owner ke liye hai.")
@@ -4242,6 +4306,8 @@ def handle_admin_command(message: Dict[str, Any]) -> None:
 def handle_channel_post(message: Dict[str, Any]) -> None:
     channel = message.get("chat", {})
     try:
+        if userbot_post_in_backup(message):
+            return          # the userbot's forward/re-upload: saved through its own report (source = original channel)
         allowed = supabase("channels", "GET", query=f"?chat_id=eq.{channel.get('id')}&active=eq.true&select=chat_id")
         if not allowed:
             return
@@ -4250,6 +4316,22 @@ def handle_channel_post(message: Dict[str, Any]) -> None:
             index_file(record, channel.get("id"), message.get("message_id"), str(channel.get("title") or "channel"))
     except Exception:
         log_error("channel_post")
+
+
+def userbot_post_in_backup(message: Dict[str, Any]) -> bool:
+    """A post in the Backup channel that the userbot made (a forward from another channel, or any post while a
+    userbot run is going) is never indexed from the channel_post — no loop, no double save."""
+    try:
+        backup = get_setting("backup_chat_id")
+        if not backup or str((message.get("chat") or {}).get("id")) != str(backup):
+            return False
+        origin = message.get("forward_origin") or {}
+        if origin.get("type") == "channel" or message.get("forward_from_chat"):
+            return True
+        st = json.loads(get_setting("ub:state") or "{}")
+        return bool(st.get("run")) and time.time() - float(st.get("run_t") or 0) < 1800
+    except Exception:
+        return False
 
 
 def handle_group_file(message: Dict[str, Any]) -> None:
@@ -4278,21 +4360,23 @@ CALLBACK_PATTERNS = [
     r"ad:fixn:\d+", r"ad:cmdq:[0-9a-f]{4,16}", r"ad:op:[nyspca]:[0-9a-f]{4,16}(:\d+)?",
     r"ad:rn:\d+", r"ad:mkreq:-?\d+", r"ad:keyadd:[a-z]+", r"ad:rtl:[a-z]", r"ad:rtord:[a-z]*", r"ad:rtos:[a-z]*",
     r"ad:rtm:[a-z]", r"ad:rtms:[a-z]:(a|\d+)",
-    r"ad:(y:)?(rmreq:-?\d+|rmsrc:-?\d+|rmadm:\d+|keyrm:[0-9a-f]{4,32}|fdel:\d+|backupoff|logoff)",
+    r"ad:(y:)?(rmreq:-?\d+|rmsrc:-?\d+|rmadm:\d+|keyrm:[0-9a-f]{4,32}|fdel:\d+|backupoff|logoff|ublogout)",
+    r"ad:(ub|ublogin|ubrun|ubpause)",
     r"ad:y:(rtl:[a-z]|rtos:[a-z]*|rtms:[a-z]:(a|\d+))",
 ]
 _CB_RE = re.compile("(?:" + ")|(?:".join(CALLBACK_PATTERNS) + ")")
 STALE_ADMIN = "🔄 Ye button purana hai, /admin dobara kholo"
 STALE_USER = "🔄 Ye button purana hai, /start dobara karo"
 CONFIRM_TTL = 3600      # an ✅ Accept older than this (message date) asks to start again
-OWNER_ONLY_CMDS = ("keys", "key", "rt", "bigfix", "addadm", "rmadm:", "y:keyrm:", "y:rmadm:", "y:rt")
+OWNER_ONLY_CMDS = ("keys", "key", "rt", "bigfix", "addadm", "rmadm:", "y:keyrm:", "y:rmadm:", "y:rt", "ub", "y:ublogout")
 # toast shown at once for buttons whose screen needs a few lookups; quick screens just stop the spinner
 CB_TOASTS = [("ad:status", "⏳ Status check ho raha hai..."), ("ad:keychk", "🔄 Keys check ho rahi hain..."),
              ("ad:aitest", "⏳ AI test ho raha hai..."), ("ad:report", "⏳"), ("ad:users", "⏳"), ("ad:bkold", "💾 Backup chal raha hai..."),
              ("ad:restart", "🔄 Restart ho raha hai..."), ("ad:fixn", "🤖 AI naam soch raha hai..."),
              ("ad:bigfix", "🔁 Badi files dekh raha hu..."), ("ad:logfill", "📜 Log Chat me bhej raha hu..."),
              ("ad:fs:", "📤 File bhej raha hu..."), ("book:", "📤 File bhej raha hu..."), ("ad:y:", "⏳"), ("ad:op:y:", "⏳"),
-             ("ad:keys", "⏳"), ("ad:rtm:", "⏳")]
+             ("ad:keys", "⏳"), ("ad:rtm:", "⏳"), ("ad:ub", "⏳"), ("ad:ubrun", "🔄 Check shuru kar raha hu..."),
+             ("ad:ublogin", "🔑 Login link bana raha hu...")]
 
 
 def callback_known(data: str) -> bool:
@@ -6239,7 +6323,7 @@ def light_status() -> Dict[str, Any]:
                                        "boot_ms": _BOOT_MS[0], "http_conns": dict(_POOL_STATS)}}
     if SUPABASE_URL and SUPABASE_KEY:
         try:
-            prefetch_settings([ROUTER_KEY, "ai_keys", BIG_QUEUE_KEY, "ai_naming"])
+            prefetch_settings([ROUTER_KEY, "ai_keys", BIG_QUEUE_KEY, "ai_naming", "ub:sess", "ub:state", "ub:paused", "ub:login"])
             supabase("bot_settings", "GET", query="?select=key&limit=1")
             st["database"] = "ok"
         except Exception as exc:
@@ -6259,6 +6343,12 @@ def light_status() -> Dict[str, Any]:
         st["bigfile"] = bst
     except Exception:
         log_error("bigfile status")
+    try:
+        _ubi = ub_health_info()
+        st["userbot"] = _ubi["state"]            # not_logged_in | ready | paused | error
+        st["userbot_info"] = _ubi
+    except Exception:
+        log_error("userbot status")
     return st
 
 
@@ -7571,18 +7661,22 @@ def _probe_provider(p: str, json_mode: bool, all_models: bool) -> List[Dict[str,
         else:
             _PMODELS.pop(f"{p}:{key_id(key)}", None)
             row["models_picked"] = provider_models(p, key, fresh=True)
-        for model in row["models_picked"][:4 if all_models else 3]:
+        for model in row["models_picked"][:4 if all_models else (8 if p == "nvidia" else 3)]:
             t0 = time.monotonic()
             try:
                 r = provider_call(p, key, model, [{"role": "system", "content": "Reply ONLY with JSON {\"ok\":true}."},
                                                   {"role": "user", "content": "ping"}], 20, 8, True, json_mode)
                 txt = r["text"][:40]
                 row["tries"].append({"model": model, "ok": bool(txt), "ms": int((time.monotonic() - t0) * 1000), "reply": txt})
+                if txt and model != row["models_picked"][0]:
+                    promote_model(p, key, model)
                 if txt and not all_models:
                     break
             except Exception as exc:
                 row["tries"].append({"model": model, "ok": False, "ms": int((time.monotonic() - t0) * 1000),
                                      "error": _err_class(exc, key)})
+                if ai_err_class(exc) == "model":
+                    drop_model(p, key, model)       # a 404 model never marks the key dead: next model
                 if ai_err_class(exc) in {"invalid", "limit"}:
                     break
         out.append(row)
@@ -9018,8 +9112,10 @@ def rs256_ok(signing_input: bytes, sig: bytes, n: int, e: int) -> bool:
     return hmac.compare_digest(m, expected)
 
 
-def verify_oidc(token: str) -> Dict[str, Any]:
-    """Claims of a valid GitHub Actions OIDC token from THIS repo's bigfile workflow on main. Raises InputError."""
+def verify_oidc(token: str, workflow: str = "", aud_want: str = "") -> Dict[str, Any]:
+    """Claims of a valid GitHub Actions OIDC token from THIS repo's workflow (default: bigfile) on main. Raises InputError."""
+    workflow = workflow or BIG_WORKFLOW
+    aud_want = aud_want or OIDC_AUD
     try:
         h64, p64, s64 = str(token or "").split(".")
         header = json.loads(_b64u(h64))
@@ -9037,11 +9133,11 @@ def verify_oidc(token: str) -> Dict[str, Any]:
         raise InputError("bad signature")
     now = time.time()
     aud = claims.get("aud")
-    if claims.get("iss") != OIDC_ISS or (aud != OIDC_AUD and not (isinstance(aud, list) and OIDC_AUD in aud)):
+    if claims.get("iss") != OIDC_ISS or (aud != aud_want and not (isinstance(aud, list) and aud_want in aud)):
         raise InputError("bad issuer/audience")
     if not (float(claims.get("exp", 0)) > now - 30 and float(claims.get("nbf", claims.get("iat", 0)) or 0) <= now + 60):
         raise InputError("expired")
-    wf = f"{GH_REPO}/.github/workflows/{BIG_WORKFLOW}@refs/heads/main"
+    wf = f"{GH_REPO}/.github/workflows/{workflow}@refs/heads/main"
     if (claims.get("repository") != GH_REPO or claims.get("ref") != "refs/heads/main" or
             claims.get("workflow_ref") != wf or
             claims.get("event_name") not in ("workflow_dispatch", "repository_dispatch", "schedule")):
@@ -9211,6 +9307,886 @@ def bigfile_done_api() -> Any:
     result["state"] = job.get("st")
     flush_request()
     return jsonify(result)
+
+
+# ================================================================ 👤 USERBOT: auto-forward from channels where the bot is NOT admin
+# (Aarav, Oct 26 2026 8:04/8:24 PM). A bot can't read a channel it isn't admin in, so the owner logs in his OWN Telegram
+# account once (web page below, phone → code → 2FA). The session string is stored ENCRYPTED in bot_settings
+# (key derived from USERBOT_SECRET or BOT_TOKEN). A GitHub Action (.github/workflows/userbot-forward.yml, every 10 min
+# + "🔄 Abhi check karo") proves itself with GitHub OIDC, gets the session, forwards NEW file posts of those channels to
+# the Backup channel (re-uploads when the channel blocks forwarding), gently (≤25 files/run, 2–4 s apart, stops on
+# FloodWait) and reports each one here; the bot then saves/names/categorises it like an admin-channel post.
+UB_WORKFLOW = "userbot-forward.yml"
+UB_AUD = "filesbull-userbot"
+UB_SESS_KEY = "ub:sess"
+UB_STATE_KEY = "ub:state"
+UB_PAUSE_KEY = "ub:paused"
+UB_LOGIN_KEY = "ub:login"
+UB_LOGIN_TTL = 600                # a half-done login (phone/code step) is deleted after 10 min
+UB_MAX_PER_RUN = 25
+UB_FIRST_RUN_MAX = 20             # first look at a channel: only its last ~20 posts of the last 24 h, no history dump
+UB_ALERT_EVERY = 3600             # the same "❌ Userbot: …" at most once per hour
+UB_DEVICE = "Filesbull Userbot"
+_UB_SECRETS: List[str] = []
+
+
+def ub_master() -> bytes:
+    raw = os.environ.get("USERBOT_SECRET", "").strip() or hashlib.sha256(f"filesbull-userbot:{BOT_TOKEN}".encode()).hexdigest()
+    return raw.encode()
+
+
+def _ub_keys() -> tuple:
+    m = ub_master()
+    return (hmac.new(m, b"filesbull-userbot-enc-v1", hashlib.sha256).digest(),
+            hmac.new(m, b"filesbull-userbot-mac-v1", hashlib.sha256).digest())
+
+
+def ub_encrypt(plain: str) -> str:
+    """Encrypt-then-MAC with stdlib only: HMAC-SHA256 counter keystream + 16-byte HMAC tag."""
+    ek, mk = _ub_keys()
+    nonce = os.urandom(16)
+    data = plain.encode("utf-8")
+    ks = b"".join(hmac.new(ek, nonce + i.to_bytes(8, "big"), hashlib.sha256).digest() for i in range(len(data) // 32 + 1))
+    ct = bytes(a ^ b for a, b in zip(data, ks))
+    tag = hmac.new(mk, b"v1" + nonce + ct, hashlib.sha256).digest()[:16]
+    return "v1." + base64.urlsafe_b64encode(nonce + ct + tag).decode().rstrip("=")
+
+
+def ub_decrypt(blob: str) -> Optional[str]:
+    """None when missing, tampered or encrypted under another key (e.g. BOT_TOKEN changed)."""
+    try:
+        if not blob or not str(blob).startswith("v1."):
+            return None
+        raw = _b64u(str(blob)[3:])
+        nonce, ct, tag = raw[:16], raw[16:-16], raw[-16:]
+        ek, mk = _ub_keys()
+        if len(nonce) != 16 or not hmac.compare_digest(tag, hmac.new(mk, b"v1" + nonce + ct, hashlib.sha256).digest()[:16]):
+            return None
+        ks = b"".join(hmac.new(ek, nonce + i.to_bytes(8, "big"), hashlib.sha256).digest() for i in range(len(ct) // 32 + 1))
+        return bytes(a ^ b for a, b in zip(ct, ks)).decode("utf-8")
+    except Exception:
+        return None
+
+
+def ub_scrub(text: Any) -> str:
+    text = _scrub(str(text or ""))
+    for s in _UB_SECRETS:
+        if s:
+            text = text.replace(s, "***")
+    text = re.sub(r"\+?\d[\d \-]{8,}\d", "***", text)          # phone numbers
+    return re.sub(r"[A-Za-z0-9_\-+/]{100,}={0,2}", "***", text)  # session strings / long tokens
+
+
+def ub_t(ts: Any) -> str:
+    try:
+        return time.strftime("%d %b %I:%M %p", time.gmtime(float(ts) + IST_OFFSET))
+    except Exception:
+        return ""
+
+
+def ub_ready() -> bool:
+    return bool(TG_API_ID and TG_API_HASH and BOT_TOKEN)
+
+
+def ub_state() -> Dict[str, Any]:
+    try:
+        v = json.loads(get_setting(UB_STATE_KEY) or "{}")
+        return v if isinstance(v, dict) else {}
+    except Exception:
+        return {}
+
+
+def ub_save_state(st: Dict[str, Any]) -> None:
+    set_setting(UB_STATE_KEY, json.dumps(st, ensure_ascii=False, separators=(",", ":")))
+
+
+def ub_del(key: str) -> None:
+    try:
+        supabase("bot_settings", "DELETE", query=f"?key=eq.{urllib.parse.quote(key)}")
+    except Exception:
+        log_error("ub del")
+    _set_memo().pop(key, None)
+    _SET_CACHE.pop(key, None)
+
+
+def ub_session() -> Optional[str]:
+    blob = get_setting(UB_SESS_KEY)
+    return ub_decrypt(blob) if blob else None
+
+
+def ub_paused() -> bool:
+    return (get_setting(UB_PAUSE_KEY) or "") == "1"
+
+
+def ub_login_state() -> Dict[str, Any]:
+    """The half-done login, or {} (and deleted) once it is older than 10 min."""
+    try:
+        v = json.loads(get_setting(UB_LOGIN_KEY) or "{}")
+    except Exception:
+        v = {}
+    if not isinstance(v, dict):
+        v = {}
+    if v and time.time() - float(v.get("t") or 0) > UB_LOGIN_TTL:
+        ub_del(UB_LOGIN_KEY)
+        return {}
+    return v
+
+
+def ub_health() -> str:
+    """not_logged_in | ready | paused | error"""
+    if not get_setting(UB_SESS_KEY):
+        return "not_logged_in"
+    if ub_paused():
+        return "paused"
+    st = ub_state()
+    if st.get("err") and float(st.get("err_t") or 0) >= float(st.get("ok_t") or 0):
+        return "error"
+    return "ready"
+
+
+def ub_owner_chat(st: Optional[Dict[str, Any]] = None) -> Optional[int]:
+    st = st if st is not None else ub_state()
+    o = st.get("owner")
+    if o and int(o) in ADMIN_USER_IDS:
+        return int(o)
+    return sorted(ADMIN_USER_IDS)[0] if ADMIN_USER_IDS else None
+
+
+def ub_alert(st: Dict[str, Any], key: str, text: str) -> bool:
+    """One short '❌ Userbot: …' to the owner, at most once per hour per same error. Caller saves st."""
+    al = st.setdefault("al", {})
+    now = time.time()
+    if now - float(al.get(key) or 0) < UB_ALERT_EVERY:
+        return False
+    al[key] = int(now)
+    for k in list(al):
+        if now - float(al[k] or 0) > 86400:
+            al.pop(k, None)
+    chat = ub_owner_chat(st)
+    if chat:
+        try:
+            send_text(chat, ub_scrub(text)[:600], {"inline_keyboard": [[{"text": "👤 Userbot", "callback_data": "ad:ub"}]]})
+        except Exception:
+            log_error("ub alert")
+    return True
+
+
+def ub_dispatch(why: str = "") -> str:
+    """Start the userbot workflow now (GH_TOKEN). 'dispatched' | 'no_token' | 'error: …'. Never raises."""
+    if not GH_DISPATCH_TOKEN:
+        return "no_token"
+    if _DIAG["dry"]:
+        _DIAG["sent"].append({"ms": 0, "m": "ub_dispatch"})
+        return "dispatched"
+    url = f"https://api.github.com/repos/{GH_REPO}/actions/workflows/{UB_WORKFLOW}/dispatches"
+    body = json.dumps({"ref": "main", "inputs": {"why": str(why or "button")[:40]}}).encode()
+    req = urllib.request.Request(url, data=body, method="POST", headers={
+        "Authorization": f"Bearer {GH_DISPATCH_TOKEN}", "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "filesbull-bot", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            return "dispatched" if resp.status in (200, 204) else f"error: HTTP {resp.status}"
+    except urllib.error.HTTPError as exc:
+        try:
+            why_ = json.loads(exc.read().decode("utf-8", "replace")).get("message", "")
+        except Exception:
+            why_ = ""
+        return _scrub(f"error: HTTP {exc.code} {why_}")[:160]
+    except Exception as exc:
+        return _scrub(f"error: {type(exc).__name__}")[:160]
+
+
+def ub_sources() -> List[Dict[str, Any]]:
+    """Active source channels where the bot is NOT admin (those the bot can't read itself). Never the Backup/Log chat."""
+    skip = {str(get_setting("backup_chat_id") or ""), str(get_setting("log_chat_id") or "")}
+    rows = [r for r in source_channels() if str(r.get("chat_id")) not in skip]
+    admin = par(*[(lambda cid=r["chat_id"]: bot_admin_in(cid)) for r in rows]) if rows else []
+    return [r for r, a in zip(rows, admin) if a is not True]
+
+
+# ---- login: one-time signed link from /admin → 👤 Userbot → 🔑 Login (owner only), then a small web page
+# (phone → code → 2FA password). The code is typed on the page, never sent in a Telegram chat (Telegram
+# cancels a login code that is sent inside a message).
+
+def _ub_sig(uid: int, nonce: str, exp: int) -> str:
+    return hmac.new(ub_master(), f"ublogin:{uid}:{nonce}:{exp}".encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def ub_login_link(uid: int) -> str:
+    nonce = hashlib.sha1(os.urandom(16)).hexdigest()[:16]
+    exp = int(time.time()) + UB_LOGIN_TTL
+    set_setting(UB_LOGIN_KEY, json.dumps({"n": nonce, "u": int(uid), "t": int(time.time()), "step": "phone", "pt": 0}))
+    return f"{PUBLIC_HOME}ub/login?t={uid}.{nonce}.{exp}.{_ub_sig(int(uid), nonce, exp)}"
+
+
+def ub_check_token(tok: str) -> Dict[str, Any]:
+    """The login state for a valid, unexpired, current link; raises InputError otherwise."""
+    try:
+        uid_s, nonce, exp_s, sig = str(tok or "").split(".")
+        uid, exp = int(uid_s), int(exp_s)
+    except Exception:
+        raise InputError("Link galat hai")
+    if not hmac.compare_digest(sig, _ub_sig(uid, nonce, exp)) or not is_owner(uid):
+        raise InputError("Link galat hai")
+    if exp < time.time():
+        raise InputError("Link purana ho gaya (10 min)")
+    st = ub_login_state()
+    if not st or st.get("n") != nonce or int(st.get("u") or 0) != uid:
+        raise InputError("Link purana ho gaya ya istemal ho chuka")
+    return st
+
+
+def ub_norm_phone(v: str) -> str:
+    raw = str(v or "").strip()
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) == 10 and not raw.startswith("+"):
+        digits = "91" + digits                       # Indian number typed without +91
+    elif len(digits) == 11 and digits.startswith("0"):
+        digits = "91" + digits[1:]
+    if not 8 <= len(digits) <= 15:
+        raise InputError("Number sahi daalo, jaise +91 98765 43210")
+    return "+" + digits
+
+
+def ub_norm_code(v: str) -> str:
+    code = re.sub(r"\D", "", str(v or ""))
+    if not 4 <= len(code) <= 8:
+        raise InputError("Code me sirf 5 number hote hain (jaise 12345)")
+    return code
+
+
+def ub_client(session: str = "") -> Any:
+    from telethon import TelegramClient                      # lazy: only login/logout/ping load Telethon
+    from telethon.sessions import StringSession
+    return TelegramClient(StringSession(session or ""), int(TG_API_ID), TG_API_HASH, connection_retries=1, retry_delay=1,
+                          timeout=8, request_retries=2, device_model=UB_DEVICE, system_version="filesbull",
+                          app_version="1.0", lang_code="en", system_lang_code="en")
+
+
+def ub_run(coro_fn: Any, *args: Any) -> Any:
+    import asyncio
+    return asyncio.run(asyncio.wait_for(coro_fn(*args), timeout=25))
+
+
+def _ub_err_text(exc: Exception) -> str:
+    """Telegram's error → a short Hinglish line (never the number/code itself)."""
+    name = type(exc).__name__
+    sec = getattr(exc, "seconds", None)
+    table = {
+        "PhoneNumberInvalidError": "Ye number Telegram me sahi nahi hai. +91 ke saath dobara daalo.",
+        "PhoneNumberBannedError": "Telegram ne is number ko band kiya hua hai.",
+        "PhoneNumberUnoccupiedError": "Is number pe Telegram account nahi hai.",
+        "PhoneCodeInvalidError": "Code galat hai. Telegram app me aaya 5 number wala code dobara dekh ke daalo.",
+        "PhoneCodeExpiredError": "Code expire ho gaya (ya kisi chat me bhej diya gaya tha). Upar 'Naya code' dabao.",
+        "PhoneCodeEmptyError": "Code khali hai.",
+        "PasswordHashInvalidError": "2-step password galat hai. Dobara daalo.",
+        "SessionPasswordNeededError": "2-step password chahiye.",
+        "ApiIdInvalidError": "TG_API_ID / TG_API_HASH galat hain (Vercel env).",
+        "AuthRestartError": "Telegram ne login dobara shuru karne bola. 'Naya code' dabao.",
+    }
+    if name in ("FloodWaitError", "FloodError", "PhonePasswordFloodError") or sec:
+        mins = max(1, int(sec or 60) // 60)
+        return f"Telegram ne bahut baar try karne pe roka hai. {mins} min baad dobara karo."
+    return table.get(name) or f"Telegram error: {name}"
+
+
+async def _ub_send_code(phone: str) -> Dict[str, Any]:
+    client = ub_client()
+    await client.connect()
+    try:
+        sent = await client.send_code_request(phone)
+        via = type(getattr(sent, "type", None)).__name__.replace("SentCodeType", "").lower() or "app"
+        return {"h": sent.phone_code_hash, "s": client.session.save(), "via": via}
+    finally:
+        await client.disconnect()
+
+
+async def _ub_sign_in(session: str, phone: str, code: str, hsh: str, password: str) -> Dict[str, Any]:
+    from telethon import errors
+    client = ub_client(session)
+    await client.connect()
+    try:
+        try:
+            if password:
+                me = await client.sign_in(password=password)
+            else:
+                me = await client.sign_in(phone=phone, code=code, phone_code_hash=hsh)
+        except errors.SessionPasswordNeededError:
+            return {"need_password": True, "s": client.session.save()}
+        return {"ok": True, "s": client.session.save(), "me": {"id": int(me.id), "username": me.username or "",
+                                                               "name": " ".join(x for x in (me.first_name, me.last_name) if x)}}
+    finally:
+        await client.disconnect()
+
+
+async def _ub_logout(session: str) -> bool:
+    client = ub_client(session)
+    await client.connect()
+    try:
+        return bool(await client.log_out())
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+
+async def _ub_ping() -> Dict[str, Any]:
+    from telethon import functions
+    t0 = time.monotonic()
+    client = ub_client()
+    await client.connect()
+    try:
+        r = await client(functions.help.GetNearestDcRequest())
+        return {"ok": True, "this_dc": r.this_dc, "nearest_dc": r.nearest_dc, "country": r.country,
+                "ms": int((time.monotonic() - t0) * 1000)}
+    finally:
+        await client.disconnect()
+
+
+UB_FAKE: Dict[str, Any] = {}       # harness: replaces the Telethon calls (send_code/sign_in/logout/ping)
+
+
+def ub_call(name: str, *args: Any) -> Any:
+    fn = UB_FAKE.get(name)
+    if fn:
+        return fn(*args)
+    return ub_run({"send_code": _ub_send_code, "sign_in": _ub_sign_in, "logout": _ub_logout, "ping": _ub_ping}[name], *args)
+
+
+def ub_login_step(st: Dict[str, Any], step: str, value: str) -> Dict[str, Any]:
+    """Advance the login. Returns {"st": state, "msg": error/info text, "done": me}. Saves the state."""
+    if not ub_ready():
+        raise InputError("Vercel me TG_API_ID / TG_API_HASH nahi hain")
+    out: Dict[str, Any] = {"msg": ""}
+    try:
+        if step == "restart":
+            st.update(step="phone", h=None, s=None, ph=None)
+        elif step == "phone":
+            if int(st.get("pt") or 0) >= 3:
+                raise InputError("Is link se 3 baar code maang liya. /admin → 👤 Userbot → 🔑 Login se naya link lo.")
+            phone = ub_norm_phone(value)
+            r = ub_call("send_code", phone)
+            st.update(step="code", h=r["h"], s=ub_encrypt(r["s"]), ph=ub_encrypt(phone), via=r.get("via") or "app",
+                      pt=int(st.get("pt") or 0) + 1, ct=0)
+        elif step == "code":
+            if st.get("step") != "code":
+                raise InputError("Pehle number daalo")
+            code = ub_norm_code(value)
+            st["ct"] = int(st.get("ct") or 0) + 1
+            if st["ct"] > 5:
+                raise InputError("Bahut baar galat code. 'Naya code' dabao.")
+            r = ub_call("sign_in", ub_decrypt(st.get("s") or "") or "", ub_decrypt(st.get("ph") or "") or "", code,
+                        st.get("h") or "", "")
+            if r.get("need_password"):
+                st.update(step="password", s=ub_encrypt(r["s"]), wt=0)
+            elif r.get("ok"):
+                out["done"] = ub_finish_login(st, r)
+                return out
+        elif step == "password":
+            if st.get("step") != "password":
+                raise InputError("Pehle code daalo")
+            if not str(value or ""):
+                raise InputError("Password daalo")
+            st["wt"] = int(st.get("wt") or 0) + 1
+            if st["wt"] > 5:
+                raise InputError("Bahut baar galat password. Thodi der baad naya link lo.")
+            r = ub_call("sign_in", ub_decrypt(st.get("s") or "") or "", "", "", "", str(value))
+            if r.get("ok"):
+                out["done"] = ub_finish_login(st, r)
+                return out
+        else:
+            raise InputError("Galat step")
+    except InputError as exc:
+        out["msg"] = str(exc)
+    except Exception as exc:
+        name = type(exc).__name__
+        out["msg"] = _ub_err_text(exc)
+        print(f"[filesbull] userbot login step {step}: {name}", flush=True)
+        if name in ("PhoneCodeExpiredError", "AuthRestartError"):
+            st.update(step="phone", h=None, s=None)
+    set_setting(UB_LOGIN_KEY, json.dumps(st))
+    out["st"] = st
+    return out
+
+
+def ub_finish_login(st: Dict[str, Any], r: Dict[str, Any]) -> Dict[str, Any]:
+    me = r.get("me") or {}
+    set_setting(UB_SESS_KEY, ub_encrypt(r["s"]))
+    ub_del(UB_LOGIN_KEY)
+    ust = ub_state()
+    ust.update(me={"username": me.get("username") or "", "name": str(me.get("name") or "")[:60]}, owner=int(st.get("u") or 0),
+               login_t=int(time.time()), err="", err_t=0)
+    ub_save_state(ust)
+    ub_del(UB_PAUSE_KEY)
+    who = ("@" + me["username"]) if me.get("username") else (me.get("name") or "aapka account")
+    d = ub_dispatch("login")
+    chat = int(st.get("u") or 0) or ub_owner_chat(ust)
+    try:
+        send_text(chat, f"✅ Userbot login ho gaya: {who}\n\nAb har 10 min un channels ki nayi files (jahan bot admin nahi) "
+                        f"Backup channel me aayengi, bot unhe save + naam + category karega.\n"
+                        + ("Pehla check abhi shuru ho gaya." if d == "dispatched" else "Pehla check 10 min me."),
+                  {"inline_keyboard": [[{"text": "👤 Userbot", "callback_data": "ad:ub"}]]})
+    except Exception:
+        log_error("ub login notify")
+    audit_log(f"👤 Userbot login · {ist_now()} · {who}")
+    flush_request()
+    return {"who": who}
+
+
+UB_PAGE_CSS = ("body{font-family:system-ui,-apple-system,sans-serif;max-width:420px;margin:24px auto;padding:0 16px;"
+               "background:#0f172a;color:#e2e8f0}h2{font-size:20px}.box{background:#1e293b;border-radius:14px;padding:18px}"
+               "input{width:100%;box-sizing:border-box;font-size:22px;padding:12px;border-radius:10px;border:1px solid #475569;"
+               "background:#0f172a;color:#fff;margin:10px 0;letter-spacing:2px}button{width:100%;font-size:18px;padding:12px;"
+               "border:0;border-radius:10px;background:#22c55e;color:#04120a;font-weight:700}.err{background:#7f1d1d;"
+               "padding:10px;border-radius:10px;margin:10px 0}.mut{color:#94a3b8;font-size:14px}.link{background:#334155;"
+               "color:#e2e8f0;margin-top:10px}")
+
+
+def ub_page(st: Optional[Dict[str, Any]], tok: str, msg: str = "", done: Optional[Dict[str, Any]] = None, fatal: str = "") -> Any:
+    def form(step: str, label: str, inp: str, btn: str) -> str:
+        return (f'<form method="post" autocomplete="off"><input type="hidden" name="t" value="{esc(tok)}">'
+                f'<input type="hidden" name="step" value="{step}"><label>{label}</label>{inp}<button>{btn}</button></form>')
+    head = ('<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+            '<meta name="robots" content="noindex"><title>Filesbull Userbot Login</title>'
+            f'<style>{UB_PAGE_CSS}</style></head><body><h2>👤 Filesbull Userbot Login</h2><div class="box">')
+    body = ""
+    if fatal:
+        body = f'<div class="err">❌ {esc(fatal)}</div><p class="mut">Bot me /admin → 👤 Userbot → 🔑 Login dabao, naya link milega.</p>'
+    elif done:
+        body = (f'<p>✅ Login ho gaya: <b>{esc(done.get("who"))}</b></p><p>Ab ye page band kar do. Bot me message aa gaya hoga.</p>'
+                '<p class="mut">Har 10 min un channels ki nayi files Backup channel me jayengi.</p>')
+    else:
+        step = (st or {}).get("step") or "phone"
+        if msg:
+            body += f'<div class="err">{esc(msg)}</div>'
+        if step == "phone":
+            body += form("phone", "Apna Telegram number (wahi jis account se channels joined hain):",
+                         '<input name="v" type="tel" inputmode="tel" placeholder="+91 98765 43210" required autofocus>',
+                         "Code bhejo")
+            body += '<p class="mut">Telegram aapke Telegram app me (ya SMS se) ek login code bhejega.</p>'
+        elif step == "code":
+            via = "SMS" if "sms" in str((st or {}).get("via") or "") else "Telegram app (\"Telegram\" naam ki chat)"
+            body += form("code", f"Code daalo jo {via} me aaya:",
+                         '<input name="v" inputmode="numeric" autocomplete="one-time-code" placeholder="12345" required autofocus>',
+                         "Login karo")
+            body += ('<p class="mut">⚠️ Ye code kisi ko mat bhejna, kisi chat me forward bhi mat karna (Telegram code cancel kar deta hai). '
+                     'Sirf yahan daalo.</p>')
+            body += (f'<form method="post"><input type="hidden" name="t" value="{esc(tok)}"><input type="hidden" name="step" '
+                     'value="restart"><button class="link">↩️ Naya code / number badlo</button></form>')
+        elif step == "password":
+            body += form("password", "Aapke account pe 2-step verification hai. Apna Telegram cloud password daalo:",
+                         '<input name="v" type="password" autocomplete="current-password" required autofocus>', "Login karo")
+            body += '<p class="mut">Ye password kahin save nahi hota, sirf Telegram ko jata hai.</p>'
+    body += '<p class="mut">Link 10 min chalega. Session encrypt karke save hota hai. Logout: bot me 👤 Userbot → 🚪 Logout.</p>'
+    resp = app.response_class(head + body + "</div></body></html>", mimetype="text/html")
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["X-Frame-Options"] = "DENY"
+    return resp
+
+
+@app.route("/ub/login", methods=["GET", "POST"])
+def ub_login_page() -> Any:
+    _REQ.clear()
+    _LOG_QUEUE.clear()
+    tok = (request.form.get("t") if request.method == "POST" else request.args.get("t")) or ""
+    try:
+        st = ub_check_token(tok)
+    except InputError as exc:
+        return ub_page(None, "", fatal=str(exc))
+    if request.method == "GET":
+        return ub_page(st, tok)
+    try:
+        res = ub_login_step(st, str(request.form.get("step") or ""), str(request.form.get("v") or "")[:200])
+    except InputError as exc:
+        return ub_page(st, tok, fatal=str(exc))
+    if res.get("done"):
+        return ub_page(None, tok, done=res["done"])
+    return ub_page(res.get("st") or st, tok, res.get("msg") or "")
+
+
+# ---- the GitHub Action: ask for work (OIDC), check which files are new, report each forward, report the run
+
+def ub_run_key(run: str, nonce: str) -> str:
+    return hmac.new(ub_master(), f"ubrun:{run}:{nonce}".encode(), hashlib.sha256).hexdigest()
+
+
+def ub_verify_report() -> tuple:
+    """(body, state) of a report signed with the current run's key; raises InputError."""
+    raw = request.get_data() or b""
+    try:
+        body = json.loads(raw.decode("utf-8") or "{}")
+    except Exception:
+        raise InputError("bad body")
+    st = ub_state()
+    cur = st.get("run") or {}
+    sig = request.headers.get("X-Filesbull-Signature", "")
+    if not cur.get("id") or str(body.get("run") or "") != str(cur.get("id")) or not sig or \
+            time.time() - float(cur.get("t") or 0) > 3600 or \
+            not hmac.compare_digest(sig, hmac.new(ub_run_key(str(cur["id"]), str(cur.get("n") or "")).encode(), raw,
+                                                  hashlib.sha256).hexdigest()):
+        raise InputError("unauthorized")
+    return body, st
+
+
+@app.post("/api/userbot-job")
+def ub_job_api() -> Any:
+    body = request.get_json(silent=True) or {}
+    try:
+        claims = verify_oidc(str(body.get("oidc") or ""), UB_WORKFLOW, UB_AUD)
+    except InputError as exc:
+        return jsonify({"ok": False, "error": "unauthorized", "why": str(exc)}), 401
+    except Exception as exc:
+        return jsonify({"ok": False, "error": "unauthorized", "why": type(exc).__name__}), 401
+    _REQ.clear()
+    _LOG_QUEUE.clear()
+    prefetch_settings([UB_SESS_KEY, UB_STATE_KEY, UB_PAUSE_KEY, UB_LOGIN_KEY, "backup_chat_id", "log_chat_id"])
+    ub_login_state()                       # sweeps a stale half-done login
+    if not ub_ready():
+        return jsonify({"ok": True, "state": "missing_secrets"})
+    blob = get_setting(UB_SESS_KEY)
+    if not blob:
+        return jsonify({"ok": True, "state": "not_logged_in"})
+    sess = ub_decrypt(blob)
+    st = ub_state()
+    if not sess:
+        ub_del(UB_SESS_KEY)
+        st.update(err="session padha nahi gaya (BOT_TOKEN badla?)", err_t=int(time.time()))
+        ub_alert(st, "decrypt", "❌ Userbot: login dobara karna hoga (purana session khul nahi raha). /admin → 👤 Userbot → 🔑 Login")
+        ub_save_state(st)
+        flush_request()
+        return jsonify({"ok": True, "state": "not_logged_in"})
+    if ub_paused():
+        return jsonify({"ok": True, "state": "paused"})
+    backup = get_setting("backup_chat_id")
+    if not backup:
+        st.update(err="Backup channel set nahi hai", err_t=int(time.time()))
+        ub_alert(st, "nobackup", "❌ Userbot: Backup channel set nahi hai. /admin → 💾 Backup Channel")
+        ub_save_state(st)
+        flush_request()
+        return jsonify({"ok": True, "state": "no_backup"})
+    srcs = ub_sources()
+    ch = st.get("ch") or {}
+    run = f"{claims.get('run_id') or ''}.{claims.get('run_attempt') or ''}"
+    nonce = hashlib.sha1(os.urandom(16)).hexdigest()[:16]
+    st["run"] = {"id": run, "n": nonce, "t": int(time.time()), "ev": str(claims.get("event_name") or "")}
+    st["run_t"] = int(time.time())
+    ub_save_state(st)
+    out = {"ok": True, "state": "ready", "session": sess, "api_id": TG_API_ID, "api_hash": TG_API_HASH,
+           "backup": int(backup), "run": run, "k": ub_run_key(run, nonce), "max": UB_MAX_PER_RUN,
+           "first_max": UB_FIRST_RUN_MAX, "first_hours": 24, "gap": [2.0, 4.0], "device": UB_DEVICE,
+           "sources": [{"id": int(r["chat_id"]), "title": str(r.get("title") or ""), "username": r.get("username") or "",
+                        "last": int((ch.get(str(r["chat_id"])) or {}).get("last") or 0)} for r in srcs]}
+    flush_request()
+    return jsonify(out)
+
+
+def ub_known(items: List[Dict[str, Any]]) -> List[bool]:
+    """For each {u: file_unique_id, n: file name, s: size}: already in the catalog?"""
+    found = [False] * len(items)
+    uniq = [str(i.get("u") or "") for i in items if i.get("u")]
+    have_u = set()
+    if uniq:
+        rows = supabase("books", "GET", query="?select=telegram_file_unique_id&telegram_file_unique_id=in.(" +
+                        ",".join(urllib.parse.quote(f'"{u}"') for u in uniq[:100]) + ")")
+        have_u = {str(r.get("telegram_file_unique_id")) for r in rows}
+    sizes = sorted({int(i.get("s") or 0) for i in items if int(i.get("s") or 0) > 0})
+    have_ns = set()
+    if sizes:
+        rows = supabase("books", "GET", query=f"?select=file_name,file_size&file_size=in.({','.join(str(s) for s in sizes[:100])})")
+        have_ns = {(_norm_nm(str(r.get("file_name") or "")), int(r.get("file_size") or 0)) for r in rows}
+    for n, i in enumerate(items):
+        if str(i.get("u") or "") in have_u or (_norm_nm(str(i.get("n") or "")), int(i.get("s") or 0)) in have_ns:
+            found[n] = True
+    return found
+
+
+@app.post("/api/userbot-seen")
+def ub_seen_api() -> Any:
+    try:
+        body, _ = ub_verify_report()
+    except InputError:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    items = [i for i in (body.get("items") or []) if isinstance(i, dict)][:200]
+    try:
+        known = ub_known(items)
+    except Exception:
+        log_error("ub seen")
+        return jsonify({"ok": False, "error": "db"}), 500
+    return jsonify({"ok": True, "known": known})
+
+
+def ub_read_post(backup: Any, mid: Any) -> Dict[str, Any]:
+    """The Bot API view of a Backup-channel post (file_id etc.): forward it inside the same channel, read, delete."""
+    res = telegram("forwardMessage", {"chat_id": int(backup), "from_chat_id": int(backup), "message_id": int(mid),
+                                      "disable_notification": True})
+    msg = (res or {}).get("result") or {}
+    try:
+        if msg.get("message_id"):
+            telegram("deleteMessage", {"chat_id": int(backup), "message_id": int(msg["message_id"])})
+    except Exception:
+        pass
+    return msg
+
+
+def ub_ingest(body: Dict[str, Any], st: Dict[str, Any]) -> str:
+    """One forwarded/re-uploaded file → catalog, exactly like a post from an admin source channel, with the ORIGINAL
+    channel as its source. 'saved' | 'dup' | 'nofile'."""
+    backup = get_setting("backup_chat_id")
+    src = body.get("src") or {}
+    msg = ub_read_post(backup, body["backup_msg"])
+    info = file_info(msg)
+    if not info:
+        return "nofile"
+    rows = supabase("books", "GET", query="?select=id&limit=1&telegram_file_unique_id=eq." +
+                    urllib.parse.quote(str(info.get("file_unique_id") or "")))
+    if rows or ub_known([{"n": info.get("file_name"), "s": info.get("file_size")}])[0]:
+        return "dup"
+    channel = {"id": int(src.get("id") or 0), "title": str(src.get("title") or "channel"), "username": src.get("username") or None,
+               "type": "channel"}
+    fake = dict(msg, message_id=int(src.get("msg") or 0), chat=channel)
+    fake.pop("forward_origin", None)
+    record = build_metadata(fake, channel)
+    record["backup_chat_id"] = int(backup)
+    record["backup_message_id"] = int(body["backup_msg"])
+    index_file(record, int(backup), int(body["backup_msg"]), str(channel["title"]))
+    return "saved"
+
+
+@app.post("/api/userbot-done")
+def ub_done_api() -> Any:
+    """kind=file: one post was forwarded → save it now and move that channel's last_id.
+    kind=final: the run's summary (last ids, counts, errors, fatal) → Log Chat line, owner alert, health state."""
+    try:
+        body, st = ub_verify_report()
+    except InputError:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    _REQ.clear()
+    _LOG_QUEUE.clear()
+    ch = st.setdefault("ch", {})
+    now = int(time.time())
+    today = ist_day()
+    if (st.get("today") or {}).get("d") != today:
+        st["today"] = {"d": today, "n": 0}
+    out: Dict[str, Any] = {"ok": True}
+    if body.get("kind") == "file":
+        src = body.get("src") or {}
+        c = ch.setdefault(str(src.get("id")), {})
+        try:
+            res = ub_ingest(body, st)
+        except Exception as exc:
+            log_error("ub ingest")
+            res = "error"
+            c["err"] = ub_scrub(str(exc))[:120]
+        if res == "saved":
+            st["today"]["n"] = int(st["today"].get("n") or 0) + 1
+            st["run_saved"] = int(st.get("run_saved") or 0) + 1
+            rs = st.setdefault("run_by", {})
+            rs[str(src.get("title") or "?")[:40]] = int(rs.get(str(src.get("title") or "?")[:40]) or 0) + 1
+        c["last"] = max(int(c.get("last") or 0), int(src.get("msg") or 0))
+        c["title"] = str(src.get("title") or c.get("title") or "")[:60]
+        c["n"] = int(c.get("n") or 0) + (1 if res == "saved" else 0)
+        out["result"] = res
+    elif body.get("kind") == "final":
+        fatal = str(body.get("fatal") or "")
+        for cid, last in (body.get("last") or {}).items():
+            c = ch.setdefault(str(cid), {})
+            c["last"] = max(int(c.get("last") or 0), int(last or 0))
+            c["t"] = now
+        for cid in (body.get("ok_ids") or []):
+            ch.setdefault(str(cid), {})["err"] = ""
+        for cid, err in (body.get("errors") or {}).items():
+            ch.setdefault(str(cid), {})["err"] = ub_scrub(err)[:120]
+        for cid, title in (body.get("titles") or {}).items():
+            ch.setdefault(str(cid), {})["title"] = str(title)[:60]
+        if body.get("me"):
+            st["me"] = {"username": str(body["me"].get("username") or "")[:40], "name": str(body["me"].get("name") or "")[:60]}
+        saved = int(st.pop("run_saved", 0) or 0)
+        by = st.pop("run_by", {}) or {}
+        st["last_run"] = {"t": now, "saved": saved, "fwd": int(body.get("sent") or 0), "seen": int(body.get("checked") or 0),
+                          "stop": str(body.get("stop") or "")[:80]}
+        if saved:
+            parts = sorted(by.items(), key=lambda x: -x[1])
+            where = parts[0][0] + " se" if len(parts) == 1 else ", ".join(f"{t} ({n})" for t, n in parts) + " se"
+            audit_log(f"👤 Userbot: {saved} nayi file{'' if saved == 1 else 's'}, {where}")
+        if fatal in ("revoked", "unauthorized"):
+            ub_del(UB_SESS_KEY)
+            st.update(err="login khatam (Telegram ne session band kiya)", err_t=now, me={})
+            ub_alert(st, "revoked", "❌ Userbot: login khatam ho gaya (Telegram ne session band kar diya). "
+                                    "/admin → 👤 Userbot → 🔑 Login dobara karo.")
+        elif fatal or body.get("error"):
+            reason = ub_scrub(fatal or body.get("error"))[:160]
+            st.update(err=reason, err_t=now)
+            key = re.sub(r"\d+", "#", reason)[:60]
+            ub_alert(st, key, f"❌ Userbot: {reason}")
+        else:
+            st.update(ok_t=now, err="")
+            if body.get("errors"):
+                st["warn"] = "; ".join(f"{(ch.get(str(k)) or {}).get('title') or k}: {ub_scrub(v)[:60]}"
+                                       for k, v in body["errors"].items())[:200]
+            else:
+                st["warn"] = ""
+        st.pop("run", None)
+    ub_save_state(st)
+    flush_request()
+    return jsonify(out)
+
+
+# ---- 👤 Userbot screen (owner only)
+
+def ub_view(note: str = "") -> Any:
+    prefetch_settings([UB_SESS_KEY, UB_STATE_KEY, UB_PAUSE_KEY, UB_LOGIN_KEY, "backup_chat_id", "log_chat_id"])
+    st = ub_state()
+    hs = ub_health()
+    me = st.get("me") or {}
+    who = ("@" + me["username"]) if me.get("username") else (me.get("name") or "")
+    word = {"not_logged_in": "❌ Login nahi hai", "ready": "✅ Chal raha hai", "paused": "⏸️ Ruka hua (Pause)",
+            "error": "⚠️ Dikkat"}[hs]
+    lines = ["👤 <b>Userbot</b> — jin channels me bot admin nahi, unki nayi files aapke account se Backup channel me", ""]
+    if note:
+        lines += [note, ""]
+    lines.append(f"Status: {word}" + (f" — {esc(who)}" if who and hs != "not_logged_in" else ""))
+    if not ub_ready():
+        lines.append("⚠️ Vercel me TG_API_ID / TG_API_HASH nahi hain")
+    if hs == "error" and st.get("err"):
+        lines.append(f"Wajah: {esc(st.get('err'))}")
+    lr = st.get("last_run") or {}
+    if lr.get("t"):
+        lines.append(f"Last check: {ub_t(lr['t'])} — {int(lr.get('saved') or 0)} nayi file"
+                     + (f" ({esc(lr['stop'])})" if lr.get("stop") else ""))
+    td = st.get("today") or {}
+    lines.append(f"Aaj forward: {int(td.get('n') or 0) if td.get('d') == ist_day() else 0} files")
+    try:
+        srcs = ub_sources()
+    except Exception:
+        log_error("ub sources")
+        srcs = []
+    ch = st.get("ch") or {}
+    lines += ["", f"📡 Channels (bot admin nahi): {len(srcs)}"]
+    for r in srcs[:15]:
+        c = ch.get(str(r["chat_id"])) or {}
+        tail = f"last check {ub_t(c['t'])}" if c.get("t") else "abhi check nahi hua"
+        if c.get("n"):
+            tail += f", {int(c['n'])} files"
+        if c.get("err"):
+            tail += f" ⚠️ {esc(str(c['err'])[:60])}"
+        lines.append(f"• {esc(str(r.get('title') or r['chat_id'])[:40])} — {tail}")
+    if not srcs:
+        lines.append("• koi nahi (sab source channels me bot admin hai, ya source channel hi nahi)")
+    lines += ["", "<i>Har 10 min check · ek baar me max 25 files · har file ke beech 2–4 sec · Telegram roke to agli baar.</i>"]
+    kb: List[List[Dict[str, str]]] = []
+    if hs == "not_logged_in":
+        kb.append([{"text": "🔑 Login", "callback_data": "ad:ublogin"}])
+    else:
+        kb.append([{"text": "🔄 Abhi check karo", "callback_data": "ad:ubrun"}])
+        kb.append([{"text": "▶️ Resume" if hs == "paused" else "⏸️ Pause", "callback_data": "ad:ubpause"},
+                   {"text": "🚪 Logout", "callback_data": "ad:ublogout"}])
+    kb.append(BACK_ROW)
+    return "\n".join(lines), {"inline_keyboard": kb}
+
+
+UB_LOGIN_STEPS = ("🔑 <b>Userbot login</b> (sirf ek baar)\n\n"
+                  "1️⃣ Niche 🔐 Login page kholo\n"
+                  "2️⃣ Apna Telegram number daalo (+91 ke saath) → Code bhejo\n"
+                  "3️⃣ Telegram app me \"Telegram\" naam ki chat me 5 number ka code aayega → wahi page pe daalo\n"
+                  "4️⃣ 2-step password laga hai to wo bhi page pe daalo\n\n"
+                  "⚠️ Code kisi chat me mat bhejna/forward karna (bot ko bhi nahi) — Telegram code cancel kar deta hai. Sirf page pe.\n"
+                  "Link 10 min chalega, ek hi baar.")
+
+
+def handle_ub_callback(query: Dict[str, Any], cmd: str, chat_id: int, user_id: int) -> bool:
+    if cmd == "ub":
+        show(chat_id, *ub_view(), query=query, parse_mode="HTML")
+    elif cmd == "ublogin":
+        if not ub_ready():
+            show(chat_id, "❌ Pehle Vercel me TG_API_ID aur TG_API_HASH daalo, phir Redeploy.", {"inline_keyboard": [BACK_ROW]}, query)
+            return True
+        url = ub_login_link(user_id)
+        show(chat_id, UB_LOGIN_STEPS, {"inline_keyboard": [[{"text": "🔐 Login page kholo", "url": url}],
+                                                           [{"text": "🔙 Userbot", "callback_data": "ad:ub"}]]}, query, "HTML")
+    elif cmd == "ubrun":
+        if not get_setting(UB_SESS_KEY):
+            show(chat_id, *ub_view("❌ Pehle 🔑 Login karo."), query=query, parse_mode="HTML")
+        elif ub_paused():
+            show(chat_id, *ub_view("⏸️ Userbot ruka hua hai. Pehle ▶️ Resume dabao."), query=query, parse_mode="HTML")
+        else:
+            d = ub_dispatch("button")
+            note = ("🔄 Check shuru ho gaya — 1–2 min me nayi files Backup channel me aayengi." if d == "dispatched" else
+                    "⏳ Turant start nahi ho saka (GH_TOKEN nahi) — agle 10 min wale check me hoga." if d == "no_token" else
+                    f"❌ Start nahi hua: {esc(d)[:100]}")
+            show(chat_id, *ub_view(note), query=query, parse_mode="HTML")
+    elif cmd == "ubpause":
+        if ub_paused():
+            ub_del(UB_PAUSE_KEY)
+            audit_log(f"▶️ Userbot resume · {ist_now()}")
+            note = "▶️ Userbot phir chalu."
+        else:
+            set_setting(UB_PAUSE_KEY, "1")
+            audit_log(f"⏸️ Userbot pause · {ist_now()}")
+            note = "⏸️ Userbot ruk gaya. Koi forward nahi hoga jab tak ▶️ Resume na dabao."
+        show(chat_id, *ub_view(note), query=query, parse_mode="HTML")
+    elif cmd == "ublogout":                 # only reached after ✅ Accept (is_destructive → one confirm)
+        sess = ub_session()
+        out = False
+        if sess:
+            try:
+                out = bool(ub_call("logout", sess))
+            except Exception as exc:
+                print(f"[filesbull] userbot logout: {type(exc).__name__}", flush=True)
+        ub_del(UB_SESS_KEY)
+        ub_del(UB_LOGIN_KEY)
+        st = ub_state()
+        st.update(me={}, err="", err_t=0)
+        st.pop("run", None)
+        ub_save_state(st)
+        audit_log(f"🚪 Userbot logout · {ist_now()}")
+        show(chat_id, *ub_view("🚪 Logout ho gaya. Session delete" + (" + Telegram se bhi hata diya." if out else
+                                                                       ". (Telegram → Settings → Devices me 'Filesbull Userbot' dikhe to wahan se bhi hata sakte ho.)")),
+             query=query, parse_mode="HTML")
+    else:
+        return False
+    return True
+
+
+
+def ub_health_info() -> Dict[str, Any]:
+    """Health page: userbot state word + last run (never the session, number or account id)."""
+    ub_login_state()                    # a half-done login older than 10 min is deleted here (keepalive every 5 min)
+    st = ub_state()
+    lr = st.get("last_run") or {}
+    td = st.get("today") or {}
+    return {"state": ub_health(), "secrets": "ok" if ub_ready() else "missing TG_API_ID/TG_API_HASH",
+            "trigger": "instant" if GH_DISPATCH_TOKEN else "schedule_10min",
+            "last_run": ub_t(lr["t"]) if lr.get("t") else None, "last_saved": lr.get("saved"),
+            "today": int(td.get("n") or 0) if td.get("d") == ist_day() else 0,
+            "error": (st.get("err") or None) if ub_health() == "error" else None}
+
+
+@app.get("/api/ubdiag")
+def ub_diag() -> Any:
+    """Diag token only: &ping=1 = MTProto connect from Vercel (no login); state + sources (titles only)."""
+    tok = request.args.get("t", "")
+    if not tok or not hmac.compare_digest(hashlib.sha256(tok.encode()).hexdigest(), DIAG_TOKEN_SHA256):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    _REQ.clear()
+    out: Dict[str, Any] = {"ok": True, "build": os.environ.get("VERCEL_GIT_COMMIT_SHA", "")[:7], "health": ub_health_info()}
+    st = ub_state()
+    out["channels"] = {(v.get("title") or k): {x: v.get(x) for x in ("last", "n", "err") if x in v} | ({"t": ub_t(v["t"])} if v.get("t") else {})
+                       for k, v in (st.get("ch") or {}).items()}
+    out["last_run"] = st.get("last_run")
+    try:
+        out["sources_not_admin"] = [str(r.get("title")) for r in ub_sources()]
+    except Exception as exc:
+        out["sources_not_admin"] = "error: " + type(exc).__name__
+    if request.args.get("ping") == "1":
+        try:
+            out["mtproto"] = ub_call("ping")
+        except Exception as exc:
+            out["mtproto"] = {"ok": False, "error": type(exc).__name__}
+    if request.args.get("view") == "1":
+        out["view"] = ub_view()[0]
+    return jsonify(out)
 
 
 _SEEN_UPDATES: List[Any] = []
