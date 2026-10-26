@@ -157,6 +157,38 @@ def send_text(chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = 
     telegram("sendMessage", payload)
 
 
+def set_command_menu() -> None:
+    telegram("setMyCommands", {"commands": [
+        {"command": "start", "description": "Bot start karein"},
+        {"command": "search", "description": "Book/file search karein"},
+        {"command": "help", "description": "Help aur instructions"},
+        {"command": "addchannel", "description": "Admin: channel add karein"},
+        {"command": "channels", "description": "Admin: active channels"},
+        {"command": "removechannel", "description": "Admin: channel disable karein"},
+        {"command": "stats", "description": "Admin: indexed files count"},
+    ]})
+
+
+def register_channel(channel: Dict[str, Any]) -> Dict[str, Any]:
+    record = {
+        "chat_id": channel.get("id"),
+        "title": channel.get("title") or channel.get("first_name") or "Telegram source",
+        "username": channel.get("username"),
+        "active": True,
+    }
+    if not record["chat_id"]:
+        raise ValueError("chat id missing")
+    rows = supabase("channels", "POST", record, "?on_conflict=chat_id")
+    return rows[0] if isinstance(rows, list) and rows else record
+
+
+def forwarded_source(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    origin = message.get("forward_origin") or {}
+    if origin.get("type") == "channel":
+        return origin.get("chat") or {}
+    return message.get("forward_from_chat") or None
+
+
 def deliver_result(chat_id: int, row: Dict[str, Any]) -> None:
     try:
         # copyMessage works for both public and private source channels when permitted.
@@ -183,6 +215,18 @@ def handle_private_message(message: Dict[str, Any]) -> None:
         return
 
     info = file_info(message)
+    if is_admin(user.get("id")) and forwarded_source(message):
+        source = forwarded_source(message)
+        try:
+            register_channel(source)
+            if info:
+                upsert_item(build_metadata(message, source))
+                send_text(chat_id, f"Channel auto-add aur file index ho gayi: {source.get('title', 'source')}\nFile: {clean_text(info.get('file_name', 'file'))}")
+            else:
+                send_text(chat_id, f"Channel auto-add ho gaya: {source.get('title', 'source')}\nAb is channel ki nayi files index hongi.")
+        except Exception as exc:
+            send_text(chat_id, f"Forwarded channel add nahi hua: {str(exc)[:250]}")
+        return
     if info and is_admin(user.get("id")):
         # Files sent directly by an admin are indexed under the bot chat as a local source.
         pseudo_channel = {"id": chat_id, "title": "Admin uploads", "username": None}
@@ -231,17 +275,17 @@ def handle_admin_command(message: Dict[str, Any]) -> None:
     if text.startswith("/addchannel"):
         target = text[len("/addchannel"):].strip()
         if not target:
-            send_text(chat_id, "Use: /addchannel @channelusername\nBot ko pehle channel mein admin banayein.")
+            send_text(chat_id, "2 tareeqe:\n1. /addchannel @channelusername\n2. Channel ki file/post bot ko forward karein; channel automatic add ho jayega.")
             return
         try:
+            if target.startswith("https://t.me/"):
+                target = "@" + target.rstrip("/").split("/")[-1].split("?")[0]
             channel = telegram("getChat", {"chat_id": target}).get("result", {})
-            telegram("getChatMember", {"chat_id": channel["id"], "user_id": telegram("getMe", {}).get("result", {}).get("id")})
-            supabase("channels", "POST", {
-                "chat_id": channel["id"],
-                "title": channel.get("title", target),
-                "username": channel.get("username"),
-                "active": True,
-            }, "?on_conflict=chat_id")
+            bot_id = telegram("getMe", {}).get("result", {}).get("id")
+            membership = telegram("getChatMember", {"chat_id": channel["id"], "user_id": bot_id}).get("result", {})
+            if membership.get("status") not in {"administrator", "creator"}:
+                raise ValueError("Bot channel ka administrator nahi hai")
+            register_channel(channel)
             send_text(chat_id, f"Channel add ho gaya: {channel.get('title', target)}")
         except Exception as exc:
             send_text(chat_id, f"Channel add nahi hua. Bot admin hai aur username/ID sahi hai?\n{str(exc)[:300]}")
@@ -253,11 +297,24 @@ def handle_admin_command(message: Dict[str, Any]) -> None:
         else:
             send_text(chat_id, "Active channels:\n" + "\n".join(f"- {r.get('title')} ({r.get('username') or r.get('chat_id')})" for r in rows))
         return
+    if text.startswith("/removechannel"):
+        target = text[len("/removechannel"):].strip()
+        if not target:
+            send_text(chat_id, "Use: /removechannel @channelusername ya channel ID")
+            return
+        try:
+            if target.startswith("@"):
+                target = str(telegram("getChat", {"chat_id": target}).get("result", {}).get("id"))
+            supabase("channels", "PATCH", {"active": False}, f"?chat_id=eq.{urllib.parse.quote(target)}")
+            send_text(chat_id, "Channel disable kar diya gaya.")
+        except Exception as exc:
+            send_text(chat_id, f"Channel disable nahi hua: {str(exc)[:250]}")
+        return
     if text.startswith("/stats"):
         rows = supabase("books", "GET", query="?select=id&limit=1000")
         send_text(chat_id, f"Indexed files: {len(rows)}")
         return
-    send_text(chat_id, "Admin commands: /addchannel @username, /channels, /stats")
+    send_text(chat_id, "Admin commands: /addchannel, /channels, /removechannel, /stats")
 
 
 def handle_channel_post(message: Dict[str, Any]) -> None:
@@ -268,6 +325,19 @@ def handle_channel_post(message: Dict[str, Any]) -> None:
             return
         if file_info(message):
             upsert_item(build_metadata(message, channel))
+    except Exception:
+        return
+
+
+def handle_group_file(message: Dict[str, Any]) -> None:
+    chat = message.get("chat", {})
+    if chat.get("type") not in {"group", "supergroup"} or not file_info(message):
+        return
+    if not is_admin(message.get("from", {}).get("id")):
+        return
+    try:
+        register_channel(chat)
+        upsert_item(build_metadata(message, chat))
     except Exception:
         return
 
@@ -292,6 +362,7 @@ def health() -> Any:
         try:
             public_url = request.url_root.rstrip("/") + "/api/webhook"
             telegram("setWebhook", {"url": public_url})
+            set_command_menu()
         except Exception:
             pass
     return jsonify({"ok": True, "service": "telegram-book-bot"})
@@ -308,6 +379,9 @@ def webhook() -> Any:
         elif update.get("message"):
             message = update["message"]
             text = (message.get("text") or "").strip()
+            handle_group_file(message)
+            if file_info(message) and message.get("chat", {}).get("type") in {"group", "supergroup"}:
+                return jsonify({"ok": True})
             if text.startswith("/") and is_admin(message.get("from", {}).get("id")):
                 handle_admin_command(message)
             else:
