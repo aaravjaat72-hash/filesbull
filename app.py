@@ -168,6 +168,31 @@ def join_markup() -> Dict[str, Any]:
     return {"inline_keyboard": rows}
 
 
+def admin_menu() -> Dict[str, Any]:
+    return {"inline_keyboard": [
+        [{"text": "Add Required Channel", "callback_data": "admin_add_required"}],
+        [{"text": "Required Channels", "callback_data": "admin_required_list"}],
+        [{"text": "Add Source Channel", "callback_data": "admin_add_source"}],
+        [{"text": "Report", "callback_data": "admin_report"}],
+    ]}
+
+
+def add_required_channel(target: str) -> str:
+    target = (target or "").strip()
+    if target.startswith("https://t.me/"):
+        target = "@" + target.rstrip("/").split("/")[-1].split("?")[0]
+    if not target:
+        raise ValueError("channel username ya link missing hai")
+    channel = telegram("getChat", {"chat_id": target}).get("result", {})
+    bot_id = telegram("getMe", {}).get("result", {}).get("id")
+    membership = telegram("getChatMember", {"chat_id": channel["id"], "user_id": bot_id}).get("result", {})
+    if membership.get("status") not in {"administrator", "creator"}:
+        raise ValueError("pehle bot ko us channel me administrator banayein")
+    link = f"https://t.me/{channel['username']}" if channel.get("username") else None
+    supabase("required_channels", "POST", {"chat_id": channel["id"], "title": channel.get("title", target), "username": channel.get("username"), "invite_link": link, "active": True}, "?on_conflict=chat_id")
+    return channel.get("title", target)
+
+
 def ai_rank(query: str, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not OPENAI_API_KEY or len(rows) < 2:
         return rows
@@ -476,6 +501,15 @@ def handle_private_message(message: Dict[str, Any]) -> None:
         send_text(chat_id, "Bot use karne ke liye pehle required channel join karein, phir Verify dabayein.", join_markup())
         return
 
+    replied = message.get("reply_to_message", {}).get("text", "") or ""
+    if is_subadmin(user.get("id")) and replied.startswith("Channel ka @username") and text and not text.startswith("/"):
+        try:
+            title = add_required_channel(text)
+            send_text(chat_id, f"Required channel add ho gaya: {title}")
+        except Exception as exc:
+            send_text(chat_id, f"Channel add nahi hua: {str(exc)[:250]}")
+        return
+
     info = file_info(message)
     if is_admin(user.get("id")) and forwarded_source(message):
         source = forwarded_source(message)
@@ -510,6 +544,9 @@ def handle_private_message(message: Dict[str, Any]) -> None:
         return
 
     if text.startswith("/start"):
+        if is_subadmin(user.get("id")):
+            send_text(chat_id, "Admin panel", admin_menu())
+            return
         menu = {"inline_keyboard": [[{"text": "Search PDF", "callback_data": "user_search"}], [{"text": "Categories", "callback_data": "user_categories"}, {"text": "PDF List", "callback_data": "user_list"}], [{"text": "Help", "callback_data": "user_help"}]]}
         send_text(chat_id, "Namaste! Book/file ka naam, subject ya exam likhkar search karein.", menu)
         return
@@ -719,14 +756,36 @@ def handle_callback(query: Dict[str, Any]) -> None:
         # An expired callback must not stop the button from working.
         log_error("answerCallbackQuery")
     user_id = query.get("from", {}).get("id")
-    if not is_subadmin(user_id) and not user_has_required_access(user_id):
-        send_text(chat_id, "Pehle required channel join karein.", join_markup())
-        return
     if data == "verify_join":
         if user_has_required_access(user_id):
-            send_text(chat_id, "Verified. Ab aap bot use kar sakte hain. /start dabayein.")
+            try:
+                telegram("editMessageReplyMarkup", {"chat_id": chat_id, "message_id": query.get("message", {}).get("message_id"), "reply_markup": {"inline_keyboard": []}})
+            except Exception:
+                pass
+            send_text(chat_id, "Verified. Join buttons hata diye gaye hain. Ab aap bot use kar sakte hain.")
         else:
             send_text(chat_id, "Abhi required channel join nahi mila. Pehle Join button dabayein, phir Verify karein.", join_markup())
+        return
+    if data == "admin_add_required" and is_subadmin(user_id):
+        send_text(chat_id, "Channel ka @username ya https://t.me/... link isi message ke reply me bhejein.", {"force_reply": True, "input_field_placeholder": "@channelusername ya channel link"})
+        return
+    if data == "admin_required_list" and is_subadmin(user_id):
+        rows = required_channels()
+        send_text(chat_id, "Required channels:\n" + ("\n".join(f"- {r.get('title')} ({r.get('username') or r.get('chat_id')})" for r in rows) if rows else "Koi channel add nahi hai."))
+        return
+    if data == "admin_report" and is_subadmin(user_id):
+        try:
+            files = supabase("books", "GET", query="?select=id&limit=1000")
+            logs = supabase("delivery_logs", "GET", query="?select=id&limit=1000")
+            send_text(chat_id, f"Report\nIndexed files: {len(files)}\nDelivered files: {len(logs)}\nAI: {'ON' if OPENAI_API_KEY else 'OFF'}")
+        except Exception:
+            send_text(chat_id, "Report abhi available nahi hai.")
+        return
+    if data == "admin_add_source" and is_subadmin(user_id):
+        send_text(chat_id, "Source channel add karne ke liye /addchannel @channelusername bhejein.")
+        return
+    if not is_subadmin(user_id) and not user_has_required_access(user_id):
+        send_text(chat_id, "Pehle required channel join karein.", join_markup())
         return
     if data == "user_help":
         send_text(chat_id, "Book, subject, exam ya keyword bhejiye. Bot available indexed files me se result dega.")
