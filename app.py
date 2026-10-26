@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import json
 import io
 import os
@@ -21,6 +23,12 @@ ADMIN_USER_IDS = {
 }
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+# Telegram sends this value in the X-Telegram-Bot-Api-Secret-Token header on every
+# webhook call, so forged updates (fake "admin" messages) can be rejected.
+# Set WEBHOOK_SECRET in Vercel to choose your own; otherwise it is derived from BOT_TOKEN.
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip() or (
+    hashlib.sha256(f"filesbull-webhook:{BOT_TOKEN}".encode("utf-8")).hexdigest() if BOT_TOKEN else ""
+)
 
 
 def http_json(url: str, method: str = "GET", payload: Optional[Dict[str, Any]] = None,
@@ -544,14 +552,21 @@ def handle_callback(query: Dict[str, Any]) -> None:
         deliver_result(chat_id, rows[0])
 
 
+def webhook_url() -> str:
+    # Always register the production domain over https, even if a preview URL was opened.
+    host = os.environ.get("PUBLIC_URL") or os.environ.get("VERCEL_PROJECT_PRODUCTION_URL") or request.host
+    host = host.replace("https://", "").replace("http://", "").strip("/")
+    return f"https://{host}/api/webhook"
+
+
 @app.get("/")
 def health() -> Any:
     # Visiting the deployed URL once is enough to register the webhook.
     # This keeps first-time setup simple for non-technical admins.
     if BOT_TOKEN:
         try:
-            public_url = request.url_root.rstrip("/") + "/api/webhook"
-            telegram("setWebhook", {"url": public_url})
+            telegram("setWebhook", {"url": webhook_url(), "secret_token": WEBHOOK_SECRET,
+                                    "allowed_updates": ["message", "channel_post", "callback_query"]})
             set_command_menu()
         except Exception:
             pass
@@ -592,6 +607,11 @@ def setup_status() -> Dict[str, Any]:
 
 @app.post("/api/webhook")
 def webhook() -> Any:
+    received = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not WEBHOOK_SECRET or not hmac.compare_digest(received, WEBHOOK_SECRET):
+        # Not from Telegram, or the webhook was set without the secret:
+        # open the site's home URL once and it re-registers itself.
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
     update = request.get_json(silent=True) or {}
     try:
         if update.get("callback_query"):
