@@ -4325,8 +4325,7 @@ def handle_callback(query: Dict[str, Any]) -> None:
         if cmd.startswith(("y:", "op:y:")) and msg_date and time.time() - msg_date > CONFIRM_TTL:
             cb_answer(query, "⌛ Ye confirm purana ho gaya (1 ghante se zyada). Dobara karo, phir ✅ Accept dabao.", True)
             return
-    if data != "verify_join":
-        cb_answer(query, cb_toast(data))
+    cb_answer(query, "⏳ Join check ho raha hai..." if data == "verify_join" else cb_toast(data))
     note_user(query.get("from"))
     try:
         _handle_callback_body(query, data, chat_id, user_id)
@@ -4349,7 +4348,6 @@ def _handle_callback_body(query: Dict[str, Any], data: str, chat_id: Any, user_i
         reqs = [] if admin else required_channels()
         missing = missing_required(user_id, reqs) if reqs else []
         if not missing:
-            cb_answer(query, "✅ Verified!")
             if reqs:
                 mark_verified(user_id)
                 note_user(None, verified=True)
@@ -4362,9 +4360,10 @@ def _handle_callback_body(query: Dict[str, Any], data: str, chat_id: Any, user_i
             names = ", ".join(str(c.get("title") or "Channel") for c in missing)
             alert = "❌ Abhi join nahi kiya! Pehle channel join karo, phir Verify dabao."
             alert += f"\n\nBaaki: {names}"
-            cb_answer(query, alert[:200], True)
-            # Refresh the same gate message in place (no new message spam on every tap).
-            show(chat_id, gate_text(missing, was_verified(user_id), len(reqs)), join_markup(missing, len(reqs)), query, "HTML")
+            # Already answered immediately; Telegram allows only one callback answer.
+            # Put the failure in the message itself rather than a second (ignored) alert.
+            show(chat_id, esc(alert[:160]) + "\n\n" + gate_text(missing, was_verified(user_id), len(reqs)),
+                 join_markup(missing, len(reqs)), query, "HTML")
         return
     if (data.startswith("ad:") or data.startswith("admin_")) and chat_id:
         if not is_subadmin(user_id):
@@ -7787,6 +7786,13 @@ def cbdiag() -> Any:
         except Exception:
             pass
         net["pool"] = dict(_POOL_STATS)
+        try:   # response header names/values that hint where the database runs (no cookies/keys)
+            _, hh, _ = http_raw(f"{SUPABASE_URL}/rest/v1/bot_settings?select=key&limit=1", "GET", None,
+                                {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, 10)
+            net["db_headers"] = {k: v[:80] for k, v in hh.items() if k.lower() not in ("set-cookie", "authorization", "apikey")
+                                 and (k.lower().startswith(("sb-", "x-", "cf-", "server", "via")))}
+        except Exception as exc:
+            net["db_headers"] = str(exc)[:80]
         inst["net"] = net
     return jsonify({"ok": True, "build": os.environ.get("VERCEL_GIT_COMMIT_SHA", "")[:7], "instance": inst, "taps": out,
                     "request_ms": int((time.monotonic() - t_req) * 1000)})
