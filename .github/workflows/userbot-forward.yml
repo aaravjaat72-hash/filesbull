@@ -17,6 +17,7 @@ on:
 permissions:
   id-token: write
   contents: read
+  actions: write      # a finished run starts the next one ~10 min later (the schedule is best-effort)
 
 concurrency:
   group: userbot-forward
@@ -25,7 +26,7 @@ concurrency:
 jobs:
   forward:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
         with:
@@ -34,4 +35,6 @@ jobs:
         with:
           python-version: "3.12"
       - name: Forward new files
+        env:
+          GH_CHAIN_TOKEN: ${{ github.token }}
         run: python tools/userbot_runner.py

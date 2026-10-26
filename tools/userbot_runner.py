@@ -143,6 +143,14 @@ def norm_name(n):
     return re.sub(r"[^a-z0-9\u0900-\u097f]+", "", os.path.splitext(str(n or ""))[0].lower())
 
 
+ERR_WORDS = {"UserRestrictedError": "Telegram ne is account ko naya channel banane se roka hai (spam limit)",
+             "ChannelsTooMuchError": "account me bahut zyada channels hain",
+             "ChannelsAdminPublicTooMuchError": "account me bahut zyada channels hain",
+             "UserNotMutualContactError": "bot ko admin nahi bana paya",
+             "BotGroupsBlockedError": "bot ko channel me add nahi kar paya",
+             "UserBotError": "bot ko admin nahi bana paya"}
+
+
 class Stop(Exception):
     pass
 
@@ -206,7 +214,7 @@ class Run:
         self.live_first = {}
         self.stop = ""
 
-    def fresh(self, files):
+    def fresh(self, files, title=""):
         """Which of these file posts are new: not known to the bot (any status) and not already sent this run."""
         if not files:
             return {}
@@ -223,6 +231,8 @@ class Run:
             if nm:
                 self.seen_ns.add((nm, sz))
             out[m.id] = not dup
+            if dup and len(self.s["dup_items"]) < 150:
+                self.s["dup_items"].append({"n": it["n"][:80], "ch": str(title)[:40]})
         return out
 
     async def send(self, ent, cid, m, lane, protected):
@@ -273,7 +283,7 @@ class Run:
             msgs = [m async for m in client.iter_messages(ent, min_id=last, reverse=True, limit=300)]
         self.s["checked"] += len(msgs)
         files = [m for m in msgs if is_file_post(m)]
-        new = self.fresh(files)
+        new = self.fresh(files, self.s["titles"].get(str(cid)) or "")
         self.s["dupes"] += sum(1 for v in new.values() if not v)
         protected = bool(getattr(ent, "noforwards", False))
         done_to = last
@@ -303,7 +313,7 @@ class Run:
                 rec["done"] = True
                 break
             files = [m for m in chunk if is_file_post(m)]
-            new = self.fresh(files)
+            new = self.fresh(files, self.s["titles"].get(str(cid)) or "")
             for m in chunk:
                 if new.get(m.id):
                     if sent >= quota or self.budget <= 0:
@@ -331,7 +341,7 @@ async def main_async(job):
     from telethon.sessions import StringSession
     bot = Bot(job)
     summary = {"kind": "final", "last": {}, "errors": {}, "ok_ids": [], "titles": {}, "sent": 0, "checked": 0,
-               "dupes": 0, "bf": {}, "bf_sent": 0, "flood": 0}
+               "dupes": 0, "dup_items": [], "bf": {}, "bf_sent": 0, "flood": 0}
     client = TelegramClient(StringSession(job["session"]), int(job["api_id"]), job["api_hash"],
                             device_model=job.get("device") or "Filesbull Userbot", system_version="filesbull",
                             app_version="1.0", lang_code="en", system_lang_code="en", flood_sleep_threshold=0)
@@ -368,7 +378,7 @@ async def main_async(job):
                     summary["flood"] = max(summary["flood"], int(e.seconds))
                     setup[kind] = {"error": f"Telegram ne {int(e.seconds)} sec rukne bola"}
                 except Exception as e:
-                    setup[kind] = {"error": type(e).__name__}
+                    setup[kind] = {"error": ERR_WORDS.get(type(e).__name__, type(e).__name__)}
                     print(f"{kind} channel not created:", type(e).__name__)
             inbox_id = int(job.get("inbox") or 0)
             if setup:
@@ -499,8 +509,34 @@ def settle_pump(bot, max_calls=60, max_secs=480):
     return done
 
 
+def started_by():
+    try:
+        ev = json.load(open(os.environ.get("GITHUB_EVENT_PATH") or ""))
+        return str((ev.get("inputs") or {}).get("why") or "")
+    except Exception:
+        return ""
+
+
+def chain_next(t0, why="chain"):
+    """GitHub's 10-min schedule is best-effort (on a new repo it may not run at all): each finished run starts the next
+    one itself ~10 min after it began (workflow_dispatch with the run's own GITHUB_TOKEN). The bot refuses a chained
+    job that comes < 8 min after the last one, so runs never pile up."""
+    tok, repo = os.environ.get("GH_CHAIN_TOKEN"), os.environ.get("GITHUB_REPOSITORY")
+    if not tok or not repo:
+        return "no_token"
+    wait = max(0.0, min(600 - (time.time() - t0), 600))
+    print(f"next run in {int(wait)} s")
+    time.sleep(wait)
+    st, _ = http(f"https://api.github.com/repos/{repo}/actions/workflows/userbot-forward.yml/dispatches",
+                 {"ref": "main", "inputs": {"why": why}},
+                 headers={"Authorization": "Bearer " + tok, "Accept": "application/vnd.github+json"})
+    print("next run started" if st in (200, 204) else f"next run not started (HTTP {st})")
+    return st
+
+
 def main():
-    status, job = http(BOT_URL + "/api/userbot-job", {"oidc": oidc_token()})
+    t0 = time.time()
+    status, job = http(BOT_URL + "/api/userbot-job", {"oidc": oidc_token(), "why": started_by()})
     if status != 200 or not job.get("ok"):
         sys.exit(f"bot said HTTP {status}: {job.get('error')} {job.get('why', '')}")
     for k in ("session", "api_hash", "k"):
@@ -510,7 +546,8 @@ def main():
         print({"not_logged_in": "userbot: not logged in (owner hasn't logged in yet) — nothing to do",
                "paused": "userbot: paused by the owner — nothing to do",
                "missing_secrets": "userbot: TG_API_ID / TG_API_HASH missing in Vercel — nothing to do",
-               "no_backup": "userbot: no Backup channel set — nothing to do"}.get(state, f"userbot: {state}"))
+               "no_backup": "userbot: no Backup channel set — nothing to do",
+               "too_soon": "userbot: another run started < 8 min ago — it keeps the chain going"}.get(state, f"userbot: {state}"))
         return
     bot = Bot(job)
     if not job.get("sources") and not job.get("create") and not job.get("invites"):
@@ -530,6 +567,8 @@ def main():
     print(json.dumps({"sent": summary.get("sent"), "history": summary.get("bf_sent"), "checked": summary.get("checked"),
                       "dupes": summary.get("dupes"), "stop": summary.get("stop"), "errors": len(summary.get("errors") or {}),
                       "fatal": bool(summary.get("fatal"))}))
+    if summary.get("fatal") != "revoked":
+        chain_next(t0)
 
 
 if __name__ == "__main__":

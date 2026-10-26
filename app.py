@@ -3553,13 +3553,14 @@ def index_review(record: Dict[str, Any], from_chat: Any, message_id: Any, where:
     except Exception:
         pass
     try:
-        st = ub_state()
+        st, owned = ub_cur_state()
         st.setdefault("rv", {})[str(book_id)] = {"n": 0, "t": int(time.time())}
         ub_cnt(st, "review")
-        ub_save_state(st)
+        if owned:
+            ub_save_state(st)
     except Exception:
         log_error("review state")
-    inbox_alert(f"❓ Review: {orig_title[:80]} ({where[:40]}) — {reason}. Backup me nahi gayi. /admin → 👤 Userbot → ❓ Samajh nahi aayi files")
+    inbox_alert(f"❓ review: {orig_title[:80]} ({where[:40]}) — {reason}. Backup me nahi gayi (/admin → 👤 Userbot → ❓ Samajh nahi aayi files)")
     return "review"
 
 
@@ -10042,6 +10043,7 @@ UB_SETUP_RETRY = 6 * 3600         # a failed auto-create is tried again at most 
 UB_SETTLE_FAILS = 3
 UB_REVIEW_RETRY_EVERY = 1800
 UB_REVIEW_TRIES = 8
+UB_MIN_GAP = 480                  # chained/scheduled runs: at least 8 min apart (the button / a new channel start at once)
 UB_BF_SCAN = 600                  # history: messages looked at per channel per run (file posts are a fraction)
 UB_SETTINGS = [UB_SESS_KEY, UB_STATE_KEY, UB_PAUSE_KEY, UB_LOGIN_KEY, "backup_chat_id", "log_chat_id",
                UB_INBOX_KEY, UB_ALERTCHAT_KEY, UB_CAP_KEY, UB_BFPAUSE_KEY]
@@ -10076,10 +10078,50 @@ def ub_hm(ts: Optional[float] = None) -> str:
     return time.strftime("%I:%M %p", time.gmtime((ts or time.time()) + IST_OFFSET)).lstrip("0")
 
 
+_UB_REQ: Dict[str, Any] = {"st": None}
+
+
+def ub_cur_state() -> tuple:
+    """(state, owned): inside a userbot report request the request's own state (saved by it), else a fresh read."""
+    st = _UB_REQ.get("st")
+    return (st, False) if st is not None else (ub_state(), True)
+
+
 def inbox_alert(text: str) -> bool:
-    """One line in the separate 📥 Inbox alert chat (NOT the Log Chat). Kept in state when no alert chat is set."""
+    """A line for the separate 📥 Inbox alert chat (NOT the Log Chat). During a userbot run the lines are collected and
+    sent with the run's summary as few messages as possible (Aarav 10:16 PM: full details, no spam)."""
     text = ub_scrub(text)[:3500]
+    st = _UB_REQ.get("st")
+    if st is not None and st.get("run"):
+        buf = st.setdefault("abuf", [])
+        if len(buf) < 400:
+            buf.append(text)
+        return True
+    return inbox_send([text])
+
+
+def inbox_send(lines: List[str]) -> bool:
+    """Send lines to the Inbox alert chat, joined into messages under Telegram's 4096-char limit."""
+    msgs: List[str] = []
+    cur = ""
+    for ln in [x for x in lines if x]:
+        ln = ln[:3800]
+        if cur and len(cur) + 1 + len(ln) > 3900:
+            msgs.append(cur)
+            cur = ln
+        else:
+            cur = (cur + "\n" + ln) if cur else ln
+    if cur:
+        msgs.append(cur)
     chat = ub_alert_chat()
+    ok = True
+    for text in msgs[:8]:
+        if not _inbox_send_one(chat, text):
+            ok = False
+    return ok
+
+
+def _inbox_send_one(chat: Optional[int], text: str) -> bool:
     if chat:
         try:
             telegram("sendMessage", {"chat_id": chat, "text": text, "disable_notification": True, "disable_web_page_preview": True})
@@ -10234,10 +10276,11 @@ def ub_catalog(record: Dict[str, Any], where: str) -> str:
         except Exception:
             pass
     if reason:
-        st = ub_state()
+        st, owned = ub_cur_state()
         st.setdefault("rv", {})[str(book_id)] = {"n": 0, "t": int(time.time())}
-        ub_save_state(st)
-        inbox_alert(f"❓ Review: {orig[:80]} ({where[:40]}) — {reason}. /admin → 👤 Userbot → ❓ Samajh nahi aayi files")
+        if owned:
+            ub_save_state(st)
+        inbox_alert(f"❓ review: {orig[:80]} ({where[:40]}) — {reason}")
     return "review" if reason else "inbox"
 
 
@@ -10251,6 +10294,7 @@ def ub_ingest(body: Dict[str, Any], st: Dict[str, Any]) -> str:
     info = file_info(msg)
     if not info:
         return "nofile"
+    _UB_REQ["file"] = {"n": str(info.get("file_name") or "file")[:80], "s": int(info.get("file_size") or 0)}
     if ub_known([{"u": info.get("file_unique_id"), "n": info.get("file_name"), "s": info.get("file_size")}])[0]:
         return "dup"
     channel = {"id": int(src.get("id") or 0), "title": str(src.get("title") or "channel"), "username": src.get("username") or None,
@@ -10300,7 +10344,8 @@ def ub_mark_settled(row: Dict[str, Any], backup: int, mid: int, file_id: Optiona
         slug = book_category(row, {} if has_category_col() else catmap())
     except Exception:
         pass
-    inbox_alert(f"✅ Backup me settle: {str(row.get('title') or '')[:90]}" + (f" · 🗂️ {cat_label(slug)}" if slug and slug != "other" else ""))
+    inbox_alert(f"✅ Backup: {str(row.get('title') or '')[:90]}" + (f" / 🗂️ {cat_label(slug)}" if slug and slug != "other" else "")
+                + (f" (from {str(row.get('file_name'))[:60]})" if row.get("file_name") else ""))
 
 
 def ub_settle_row(row: Dict[str, Any], st: Dict[str, Any], budget: float = 8.0) -> str:
@@ -10519,6 +10564,9 @@ def ub_job_api() -> Any:
         ub_save_state(st)
         flush_request()
         return jsonify({"ok": True, "state": "no_backup"})
+    why = str(body.get("why") or "")
+    if (why == "chain" or str(claims.get("event_name") or "") == "schedule") and time.time() - float(st.get("run_t") or 0) < UB_MIN_GAP:
+        return jsonify({"ok": True, "state": "too_soon"})       # another run started < 8 min ago; it keeps the chain going
     srcs = ub_sources()
     ch = st.get("ch") or {}
     run = f"{claims.get('run_id') or ''}.{claims.get('run_attempt') or ''}"
@@ -10627,6 +10675,21 @@ def ub_done_api() -> Any:
     _REQ.clear()
     _LOG_QUEUE.clear()
     _REQ_T0[0] = time.monotonic()
+    _UB_REQ["st"], _UB_REQ["file"] = st, None
+    try:
+        return _ub_done(body, st)
+    finally:
+        _UB_REQ["st"] = None
+
+
+def ub_date(ts: Any) -> str:
+    try:
+        return time.strftime("%d %b %Y", time.gmtime(int(ts) + IST_OFFSET)) if int(ts or 0) > 0 else ""
+    except Exception:
+        return ""
+
+
+def _ub_done(body: Dict[str, Any], st: Dict[str, Any]) -> Any:
     ch = st.setdefault("ch", {})
     now = int(time.time())
     today = ist_day()
@@ -10652,20 +10715,34 @@ def ub_done_api() -> Any:
             c = ch.setdefault(str(j.get("id")), {})
             c["title"] = str(j.get("title") or c.get("title") or "")[:60]
             c["need_join"] = 1
-            ub_tell_once(st, f"join:{j.get('id')}", f"➕ Is channel ko userbot account se join karo: {c['title'] or j.get('id')}\n"
-                                                    "(Private channel hai aur link nahi mila. Join ke baad agla check apne-aap padh lega.)")
+            if ub_tell_once(st, f"join:{j.get('id')}", f"➕ Is channel ko userbot account se join karo: {c['title'] or j.get('id')}\n"
+                                                       "(Private channel hai aur link nahi mila. Join ke baad agla check apne-aap padh lega.)"):
+                inbox_alert(f"➕ haath se join karna hoga: {c['title'] or j.get('id')} (private, link nahi)")
         for cid, why in (body.get("failed") or {}).items():
-            ch.setdefault(str(cid), {})["err"] = "join nahi hua: " + ub_scrub(why)[:80]
+            c = ch.setdefault(str(cid), {})
+            c["err"] = "join nahi hua: " + ub_scrub(why)[:80]
+            inbox_alert(f"⚠️ join nahi hua: {c.get('title') or cid} — {ub_scrub(why)[:80]}")
     elif kind == "file":
         src = body.get("src") or {}
         c = ch.setdefault(str(src.get("id")), {})
         lane = "bf" if body.get("lane") == "bf" else "live"
+        pos = len(st.get("abuf") or [])
         try:
             res = ub_ingest(body, st)
         except Exception as exc:
             log_error("ub ingest")
             res = "error"
             c["err"] = ub_scrub(str(exc))[:120]
+        f = _UB_REQ.get("file") or {}
+        if res in ("saved", "review", "dup") and f:
+            if res == "dup":
+                inbox_alert(f"♻️ duplicate skip: {f.get('n')} ({str(src.get('title') or '')[:40]}) — pehle se Inbox/Backup me")
+            else:
+                inbox_alert(f"📥 {f.get('n')} · {human_size(f.get('s'))} · from {str(src.get('title') or '')[:40]}"
+                            + (f" · {ub_date(src.get('date'))}" if src.get("date") else "") + (" · purani" if lane == "bf" else ""))
+                buf = st.get("abuf") or []
+                if buf and len(buf) - 1 > pos:          # the 📥 line goes before its own ❓ review line
+                    buf.insert(pos, buf.pop())
         if res in ("saved", "review"):
             st["today"]["n"] = int(st["today"].get("n") or 0) + 1
             ub_cnt(st, "new")
@@ -10729,7 +10806,24 @@ def ub_done_api() -> Any:
         st["last_run"] = {"t": now, "saved": saved, "fwd": int(body.get("sent") or 0), "seen": int(body.get("checked") or 0),
                           "stop": str(body.get("stop") or "")[:80], "dup": int(rn.get("dup") or 0),
                           "settled": int(rn.get("settled") or 0), "review": int(rn.get("review") or 0), "bf": int(body.get("bf_sent") or 0)}
-        if saved or rn.get("dup") or rn.get("settled") or rn.get("review"):
+        for it in (body.get("dup_items") or [])[:150]:
+            inbox_alert(f"♻️ duplicate skip: {str(it.get('n') or '')[:80]} ({str(it.get('ch') or '')[:40]}) — pehle se Inbox/Backup me")
+        if flood:
+            inbox_alert(f"⏳ Telegram ne {flood} sec rukne bola (FloodWait) — run roka, baaki agli baar")
+        for cid, b in (body.get("bf") or {}).items():
+            c = ch.get(str(cid)) or {}
+            bf = c.get("bf") or {}
+            if int(b.get("scanned") or 0) and not b.get("done"):
+                cur, ratio = int(bf.get("cur") or 0), int(bf.get("files") or 0) / max(1, int(bf.get("scanned") or 0))
+                inbox_alert(f"📚 {str(c.get('title') or cid)[:40]}: {int(b.get('scanned') or 0)} purani posts dekhi"
+                            + (f" · yahan tak {ub_date(bf.get('date'))}" if bf.get("date") else "")
+                            + (" · ✅ history poori" if bf.get("done") else (f" · ~{int(cur * ratio)} file baaki" if cur else "")))
+        for cid, err in (body.get("errors") or {}).items():
+            inbox_alert(f"⚠️ {str((ch.get(str(cid)) or {}).get('title') or cid)[:40]}: {ub_scrub(err)[:100]}")
+        if fatal or body.get("error"):
+            inbox_alert(f"❌ {ub_scrub(fatal or body.get('error'))[:160]}")
+        buf = st.pop("abuf", []) or []
+        if saved or rn.get("dup") or rn.get("settled") or rn.get("review") or buf:
             parts = sorted(by.items(), key=lambda x: -x[1])
             line = f"📥 Inbox · {ub_hm(now)} — {saved} nayi file{'' if saved == 1 else 's'} aayi"
             if parts:
@@ -10737,7 +10831,7 @@ def ub_done_api() -> Any:
             line += f" · {int(rn.get('dup') or 0)} duplicate skip · ✅ {int(rn.get('settled') or 0)} Backup me settle · ❓ {int(rn.get('review') or 0)} review"
             if body.get("stop"):
                 line += f" · ⏸️ {str(body['stop'])[:60]}"
-            inbox_alert(line)
+            inbox_send([line] + buf)
         if fatal in ("revoked", "unauthorized"):
             ub_del(UB_SESS_KEY)
             st.update(err="login khatam (Telegram ne session band kiya)", err_t=now, me={})
@@ -10772,11 +10866,14 @@ def ub_settle_api() -> Any:
     _LOG_QUEUE.clear()
     _REQ_T0[0] = time.monotonic()
     st.setdefault("rn", {})
+    _UB_REQ["st"] = st
     try:
         out = ub_settle_step(st)
     except Exception as exc:
         log_error("ub settle")
         out = {"did": "error", "error": type(exc).__name__, "left": 0}
+    finally:
+        _UB_REQ["st"] = None
     ub_save_state(st)
     flush_request()
     return jsonify(dict(out, ok=True))
