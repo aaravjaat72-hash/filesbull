@@ -58,7 +58,8 @@ WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip() or (
 def log_error(where: str) -> None:
     # Printed tracebacks show up in Vercel -> Project -> Logs. Never print the token.
     text = traceback.format_exc()
-    for secret in (BOT_TOKEN, OPENAI_API_KEY, SUPABASE_KEY, *GROQ_KEYS, *[x.get("k", "") for x in _DBKEYS["v"]]):
+    for secret in (BOT_TOKEN, OPENAI_API_KEY, SUPABASE_KEY, *GROQ_KEYS, *[x.get("k", "") for x in _DBKEYS["v"]],
+                   *[k for v in globals().get("ENV_AI_KEYS", {}).values() for k in v]):
         if secret:
             text = text.replace(secret, "***")
     print(f"[filesbull] error in {where}:\n{text}", flush=True)
@@ -83,6 +84,11 @@ def http_json(url: str, method: str = "GET", payload: Optional[Dict[str, Any]] =
         # Supabase "column ... does not exist") instead of a bare "HTTP Error 400".
         try:
             detail = json.loads(exc.read().decode("utf-8", "replace"))
+            if isinstance(detail, list) and detail and isinstance(detail[0], dict):
+                # Gemini's OpenAI-compatible errors come as [{"error": {"code", "message", "status"}}]
+                detail = detail[0]
+                if isinstance(detail.get("error"), dict) and detail["error"].get("message"):
+                    detail = {"error": str(detail["error"].get("status") or "") + " " + str(detail["error"]["message"])}
             reason = detail.get("description") or detail.get("message") or detail.get("error") or str(detail)
             params = detail.get("parameters") if isinstance(detail, dict) else None
             if isinstance(params, dict):
@@ -586,9 +592,9 @@ PROMPTS = {
     "rename": ("✏️ Kis file ka naam badalna hai? File ka naam/keyword bhejo (ya ID aur naya naam: 12 Lucent GK Hindi).\n"
                "(/cancel = band)", "lucent"),
     "rename_to": ("✏️ Is file ka naya naam bhejo. (/cancel = band)", "Naya naam"),
-    "addkey": ("🔑 Groq ya OpenAI ki API key yahan paste karke bhejo.\n"
+    "addkey": ("🔑 AI ki API key yahan paste karke bhejo.\n"
                "Key wala message main turant chat se delete kar dunga 🔒\n"
-               "(Groq key: console.groq.com → API Keys → Create API Key. /cancel = band)", "gsk_..."),
+               "(Groq / Gemini / Mistral / OpenRouter / NVIDIA. /cancel = band)", "API key"),
 }
 
 
@@ -756,7 +762,7 @@ def report_text() -> str:
         req = len(required_channels())
         src = len(source_channels())
         return (f"📊 Report\nIndexed files: {files}\nFiles bheji gayi (total): {logs}\nAaj bheji gayi: {today_logs}\n"
-                f"Join channels: {req}\nSource channels: {src}\nSmart AI: {'ON (' + ai_provider() + ')' if ai_provider() else 'OFF (GROQ_API_KEY nahi)'}\n"
+                f"Join channels: {req}\nSource channels: {src}\nSmart AI: {'ON (' + pname(ai_provider()) + ')' if ai_provider() else 'OFF (koi AI key nahi)'}\n"
                 f"Backup: {'ON' if get_setting('backup_chat_id') else 'OFF'}\n{log_chat_line()}")
     except Exception as exc:
         return f"Report nahi ban payi: {str(exc)[:200]}"
@@ -849,7 +855,7 @@ def handle_admin_input(message: Dict[str, Any], action: str, extra: Any) -> None
     chat_id = message["chat"]["id"]
     user_id = message["from"]["id"]
     text = (message.get("text") or message.get("caption") or "").strip()
-    retry = {"inline_keyboard": [[{"text": "🔁 Dobara try", "callback_data": f"ad:{ {'rename_to': 'rename', 'addkey': 'keyadd'}.get(action, action)}"}], BACK_ROW]}
+    retry = {"inline_keyboard": [[{"text": "🔁 Dobara try", "callback_data": (f"ad:keyadd:{extra}" if action == "addkey" and extra in PROVIDERS else f"ad:{ {'rename_to': 'rename', 'addkey': 'keyadd'}.get(action, action)}")}], BACK_ROW]}
     if action == "addkey":
         # The message carries a secret: never echo it, never log it, delete it from the chat.
         clear_pending(user_id)
@@ -861,7 +867,7 @@ def handle_admin_input(message: Dict[str, Any], action: str, extra: Any) -> None
             send_text(chat_id, "🔑 AI key sirf owner jod sakta hai. Maine message hata diya 🔒", {"inline_keyboard": [BACK_ROW]})
             return
         try:
-            add_ai_key(message, chat_id, text)
+            add_ai_key(message, chat_id, text, extra if extra in PROVIDERS else None)
         except InputError as exc:
             set_pending(user_id, action, extra)
             send_text(chat_id, f"❌ Nahi hua: {exc}\n\nSahi key dobara bhejo, ya /cancel.", retry)
@@ -974,6 +980,10 @@ def handle_admin_callback(query: Dict[str, Any], data: str, chat_id: int, user_i
               "admin_add_source": "ad:addsrc", "admin_report": "ad:report"}
     data = legacy.get(data, data)
     cmd = data[3:]
+    _conf = cmd.startswith("y:")
+    _rc = cmd[2:] if _conf else cmd
+    if _rc.startswith(("rt", "keyadd")) and handle_router_callback(query, _rc, _conf, chat_id, user_id):
+        return                 # ⭐ Live / 🔁 Backup order / 🧠 Model / ➕ Key Jodo (provider first)
     if cmd.startswith("y:"):
         cmd = cmd[2:]          # ✅ Accept on a confirm prompt: run the remove now
     elif is_destructive(cmd):
@@ -1144,7 +1154,7 @@ def confirm_view(cmd: str) -> Any:
 # ---- 🔑 AI Keys (owner only): add/remove Groq / OpenAI keys without a Vercel redeploy
 
 def all_ai_keys() -> List[str]:
-    return list(dict.fromkeys(groq_pool() + openai_pool()))
+    return list(dict.fromkeys(k for p in PROVIDER_ORDER for k in provider_keys(p)))
 
 
 def key_status_word(key: str) -> str:
@@ -1153,57 +1163,290 @@ def key_status_word(key: str) -> str:
 
 
 def keys_view() -> Any:
-    env = [(n, k) for n, k in (("GROQ_API_KEY", GROQ_API_KEY), ("GROQ_API_KEY_2", GROQ_API_KEY_2),
-                                ("GROQ_API_KEY_3", GROQ_API_KEY_3), ("OPENAI_API_KEY", OPENAI_API_KEY)) if k]
+    """🔑 AI Keys: ⭐ LIVE provider, BACKUP ORDER, each provider's keys (masked), status and today's calls."""
+    cfg = router_cfg(fresh=True)
     db = db_ai_keys(fresh=True)
-    lines = ["🔑 AI Keys", ""]
+    env = env_key_rows()
+    chain = [p for p in cfg["order"] if provider_keys(p)]
+    today = calls_today()
+    lines = ["🔑 AI Keys — ⭐ Live + 🔁 Backup", ""]
+
+    def pline(p: str) -> str:
+        n = len(provider_keys(p))
+        if not n:
+            return f"{pname(p)} — ➖ key nahi"
+        st = STATE_WORD[provider_state(p)]
+        ok, bad = (today.get(p) or [0, 0])[:2]
+        model = cfg["models"].get(p) or "auto"
+        return f"{pname(p)} — {st} · {n} key · model: {model} · aaj {ok} calls" + (f" ({bad} fail)" if bad else "")
+
+    if chain:
+        lines.append("⭐ LIVE: " + pline(chain[0]))
+    else:
+        lines.append("⭐ LIVE: koi nahi — AI OFF ❌ (➕ Key Jodo se key jodo)")
+    backups = [p for p in cfg["order"] if p != (chain[0] if chain else "") and (p in MAIN_PROVIDERS or provider_keys(p))]
+    lines.append("🔁 Backup order:")
+    for i, p in enumerate(backups, 1):
+        lines.append(f"  {i}. " + pline(p))
+    lines.append("Live fail ho (limit / error / slow) → wahi sawaal turant agli wali pe ✅")
+    lines.append("")
     lines.append("Vercel wali keys:" if env else "Vercel wali keys: koi nahi")
-    for n, k in env:
+    for n, p, k in env:
         lines.append(f"• {n}: {mask_key(k)} — {key_status_word(k)}")
     lines.append("")
     lines.append("Bot me judi keys:" if db else "Bot me judi keys: abhi koi nahi")
     kb = []
     for i, x in enumerate(db, 1):
         k = x["k"]
-        lines.append(f"{i}. {mask_key(k)} — {'Groq' if key_provider(k) == 'groq' else 'OpenAI'} — {key_status_word(k)}")
+        lines.append(f"{i}. {mask_key(k)} — {pname(key_prov(x))} — {key_status_word(k)}")
         kb.append([{"text": f"❌ Hatao {mask_key(k)}", "callback_data": f"ad:keyrm:{key_id(k)}"}])
     lines.append("")
-    lines.append(f"AI: {'ON ✅' if ai_provider() else 'OFF ❌'} — saari keys backup ki tarah chalti hain: "
-                 "ek limit pe ya band ho to agli turant.")
+    lines.append(f"AI: {'ON ✅ (' + pname(chain[0]) + ')' if chain else 'OFF ❌'}")
     lines.append("✅ ok = chal rahi · ⏳ limit = thodi der ruki · ❌ invalid = galat/band key")
-    kb = [[{"text": "➕ Key Jodo", "callback_data": "ad:keyadd"}]] + kb + \
-         [[{"text": "🔄 Keys Check", "callback_data": "ad:keychk"}], BACK_ROW]
+    kb = [[{"text": "➕ Key Jodo", "callback_data": "ad:keyadd"}, {"text": "⭐ Live badlo", "callback_data": "ad:rtlive"}],
+          [{"text": "🔁 Backup order", "callback_data": "ad:rtord"}, {"text": "🧠 Model chuno", "callback_data": "ad:rtmod"}]] + kb + \
+         [[{"text": "🔄 Keys Check", "callback_data": "ad:keychk"}, {"text": "🤖 AI test", "callback_data": "ad:aitest"}], BACK_ROW]
     return "\n".join(lines), {"inline_keyboard": kb}
 
 
-def add_ai_key(message: Dict[str, Any], chat_id: int, text: str) -> None:
-    """Owner pasted a key: delete their message first (always), validate for free, save."""
+KEYS_BACK = [{"text": "⬅️ AI Keys", "callback_data": "ad:keys"}]
+
+
+def key_provider_picker() -> Any:
+    rows = [[{"text": f"{pname(p)} ({len(provider_keys(p))})", "callback_data": f"ad:keyadd:{p}"}] for p in MAIN_PROVIDERS]
+    lines = ["➕ Kis company ki key jodni hai?", ""]
+    for p in MAIN_PROVIDERS:
+        lines.append(f"• {pname(p)}: {PROVIDERS[p]['get']}")
+    lines.append("\nSab free keys hain. Key bana ke copy karo, button dabao, phir key paste karo.")
+    return "\n".join(lines), {"inline_keyboard": rows + [KEYS_BACK]}
+
+
+def ask_key(chat_id: int, user_id: int, p: str) -> None:
+    set_pending(user_id, "addkey", p)
+    send_text(chat_id, PROMPTS["addkey"][0] + f"\n\n🏷️ {pname(p)} key — yahan se banti hai: {PROVIDERS[p]['get']}",
+              {"force_reply": True, "input_field_placeholder": PROMPTS["addkey"][1]})
+
+
+def _order_code(order: List[str]) -> str:
+    return "".join(PROVIDERS[p]["c"] for p in order if p in PROVIDERS)
+
+
+def _order_from(code: str) -> List[str]:
+    return [CODE_P[c] for c in dict.fromkeys(code) if c in CODE_P]
+
+
+def rt_live_view() -> Any:
+    cfg = router_cfg(fresh=True)
+    live = live_provider()
+    rows = []
+    for p in cfg["order"]:
+        if p not in MAIN_PROVIDERS and not provider_keys(p):
+            continue
+        if provider_keys(p):
+            rows.append([{"text": ("⭐ " if p == live else "") + f"{pname(p)} {STATE_WORD[provider_state(p)]}"[:40],
+                          "callback_data": f"ad:rtl:{PROVIDERS[p]['c']}"}])
+    none = [pname(p) for p in MAIN_PROVIDERS if not provider_keys(p)]
+    text = (f"⭐ Live AI chuno (abhi: {pname(live) if live else 'koi nahi'})\n\nSirf jinki key judi hai wahi dikh rahe hain."
+            + (f"\nKey nahi: {', '.join(none)} → ➕ Key Jodo" if none else ""))
+    return text, {"inline_keyboard": rows + [[{"text": "➕ Key Jodo", "callback_data": "ad:keyadd"}], KEYS_BACK]}
+
+
+def rt_order_view(code: str = "") -> Any:
+    """Backup order editor. ⬆️/⬇️ only change this screen; 💾 Save → one ✅ Accept / ❌ Deny."""
+    cfg = router_cfg(fresh=True)
+    live = cfg["order"][0]
+    cur = [p for p in cfg["order"][1:] if p in MAIN_PROVIDERS or provider_keys(p)]
+    draft = [p for p in _order_from(code) if p in cur] if code else list(cur)
+    draft += [p for p in cur if p not in draft]
+    lines = [f"🔁 Backup order (⭐ Live: {pname(live)})", "", "Live fail ho to isi line se agli AI chalegi:"]
+    rows = []
+    for i, p in enumerate(draft):
+        lines.append(f"{i + 1}. {pname(p)} — {STATE_WORD[provider_state(p)]}")
+        up = draft[:]
+        dn = draft[:]
+        if i > 0:
+            up[i - 1], up[i] = up[i], up[i - 1]
+        if i < len(draft) - 1:
+            dn[i + 1], dn[i] = dn[i], dn[i + 1]
+        rows.append([{"text": f"{i + 1}. {pname(p)}", "callback_data": f"ad:rtord:{_order_code(draft)}"},
+                     {"text": "⬆️", "callback_data": f"ad:rtord:{_order_code(up)}"},
+                     {"text": "⬇️", "callback_data": f"ad:rtord:{_order_code(dn)}"}])
+    changed = draft != cur
+    if changed:
+        lines.append("\n✏️ Badla hua order — 💾 Save dabao (phir ✅ Accept)")
+    rows.append([{"text": "💾 Save order", "callback_data": f"ad:rtos:{_order_code(draft)}"}] if changed else [])
+    return "\n".join(lines), {"inline_keyboard": [r for r in rows if r] + [KEYS_BACK]}
+
+
+def rt_model_providers() -> Any:
+    rows = [[{"text": f"🧠 {pname(p)}: {router_cfg()['models'].get(p) or 'auto'}"[:60], "callback_data": f"ad:rtm:{PROVIDERS[p]['c']}"}]
+            for p in router_cfg(fresh=True)["order"] if provider_keys(p)]
+    if not rows:
+        return "🧠 Pehle koi AI key jodo.", {"inline_keyboard": [[{"text": "➕ Key Jodo", "callback_data": "ad:keyadd"}], KEYS_BACK]}
+    return "🧠 Kis AI ka model chunna hai? (auto = bot khud sabse sasta/tez chunta hai)", {"inline_keyboard": rows + [KEYS_BACK]}
+
+
+def rt_model_view(p: str) -> Any:
+    keys = provider_keys(p)
+    if not keys:
+        return f"{pname(p)} ki key nahi hai.", {"inline_keyboard": [KEYS_BACK]}
+    pinned = router_cfg(fresh=True)["models"].get(p, "")
+    ids = [m for m in provider_models(p, keys[0]) if m][:8]
+    if pinned and pinned not in ids:
+        ids = [pinned] + ids[:7]
+    try:
+        set_setting(f"aimodel_list:{p}", json.dumps(ids))
+    except Exception:
+        log_error("model list")
+    c = PROVIDERS[p]["c"]
+    rows = [[{"text": ("✅ " if (m == pinned) else "") + m[:48], "callback_data": f"ad:rtms:{c}:{i}"}] for i, m in enumerate(ids)]
+    rows.append([{"text": ("✅ " if not pinned else "") + "🔄 Auto (default)", "callback_data": f"ad:rtms:{c}:a"}])
+    return (f"🧠 {pname(p)} ka model chuno (abhi: {pinned or 'auto → ' + (ids[0] if ids else '?')})\n"
+            "Ye list is key ke apne models se bani hai."), {"inline_keyboard": rows + [KEYS_BACK]}
+
+
+def rt_confirm(chat_id: int, query: Dict[str, Any], text: str, cmd: str, back: str) -> None:
+    show(chat_id, text, {"inline_keyboard": [[{"text": "✅ Accept", "callback_data": f"ad:y:{cmd}"[:64]},
+                                             {"text": "❌ Deny", "callback_data": back}]]}, query)
+
+
+def handle_router_callback(query: Dict[str, Any], cmd: str, confirmed: bool, chat_id: int, user_id: int) -> bool:
+    """⭐ Live / 🔁 Backup order / 🧠 Model. Every change = one ✅ Accept / ❌ Deny (Aarav's settings rule)."""
+    if not cmd.startswith(("rt", "keyadd:")) and cmd != "keyadd":
+        return False
+    if not is_owner(user_id):
+        send_text(chat_id, "🔑 AI Keys sirf owner badal sakta hai.", {"inline_keyboard": [BACK_ROW]})
+        return True
+    cfg = router_cfg(fresh=True)
+    order, models = list(cfg["order"]), dict(cfg["models"])
+    if cmd == "keyadd":
+        show(chat_id, *key_provider_picker(), query=query)
+    elif cmd.startswith("keyadd:"):
+        p = cmd.split(":", 1)[1]
+        if p in PROVIDERS:
+            ask_key(chat_id, user_id, p)
+        else:
+            show(chat_id, *key_provider_picker(), query=query)
+    elif cmd == "rtlive":
+        show(chat_id, *rt_live_view(), query=query)
+    elif cmd.startswith("rtl:"):
+        p = CODE_P.get(cmd[4:], "")
+        old = live_provider()
+        if not p or not provider_keys(p):
+            show(chat_id, *rt_live_view(), query=query)
+        elif not confirmed:
+            if p == old:
+                show(chat_id, f"⭐ {pname(p)} pehle se Live hai.\n\n" + rt_live_view()[0], rt_live_view()[1], query)
+            else:
+                rt_confirm(chat_id, query, f"⭐ Live AI badalna hai?\n\n{pname(old) or 'koi nahi'} → {pname(p)}\n"
+                                           f"({pname(old) or '—'} backup me no. 1 pe chali jayegi)", cmd, "ad:rtlive")
+        else:
+            new = [p] + [x for x in order if x != p]
+            if old and old != p:
+                new = [p, old] + [x for x in order if x not in (p, old)]
+            save_router_cfg(new, models)
+            audit_log(f"⚙️ AI Live badla: {pname(old) or '—'} → {pname(p)}")
+            text, kb = keys_view()
+            show(chat_id, f"✅ Live AI ab {pname(p)} hai\n\n" + text, kb, query)
+    elif cmd == "rtord" or cmd.startswith("rtord:"):
+        show(chat_id, *rt_order_view(cmd[6:] if ":" in cmd else ""), query=query)
+    elif cmd.startswith("rtos:"):
+        live = order[0]
+        draft = [x for x in _order_from(cmd[5:]) if x != live]
+        new = [live] + draft + [x for x in order if x != live and x not in draft]
+        cur_names = " → ".join(pname(x) for x in order[1:] if x in MAIN_PROVIDERS or provider_keys(x))
+        new_names = " → ".join(pname(x) for x in new[1:] if x in MAIN_PROVIDERS or provider_keys(x))
+        if not confirmed:
+            rt_confirm(chat_id, query, f"🔁 Backup order badalna hai?\n\nPehle: {cur_names}\nAb: {new_names}", cmd, "ad:rtord")
+        else:
+            save_router_cfg(new, models)
+            audit_log(f"⚙️ AI backup order: {new_names}")
+            text, kb = keys_view()
+            show(chat_id, "✅ Backup order save ho gaya\n\n" + text, kb, query)
+    elif cmd == "rtmod":
+        show(chat_id, *rt_model_providers(), query=query)
+    elif cmd.startswith("rtm:"):
+        p = CODE_P.get(cmd[4:], "")
+        show(chat_id, *(rt_model_view(p) if p else rt_model_providers()), query=query)
+    elif cmd.startswith("rtms:"):
+        _, c, idx = (cmd.split(":") + ["", ""])[:3]
+        p = CODE_P.get(c, "")
+        if not p:
+            show(chat_id, *rt_model_providers(), query=query)
+            return True
+        try:
+            ids = json.loads(get_setting(f"aimodel_list:{p}") or "[]")
+        except Exception:
+            ids = []
+        model = "" if idx == "a" else (ids[int(idx)] if idx.isdigit() and int(idx) < len(ids) else None)
+        if model is None:
+            show(chat_id, *rt_model_view(p), query=query)
+            return True
+        old = models.get(p) or "auto"
+        if not confirmed:
+            rt_confirm(chat_id, query, f"🧠 {pname(p)} ka model badalna hai?\n\n{old} → {model or 'auto'}", cmd, f"ad:rtm:{c}")
+        else:
+            if model:
+                models[p] = model
+            else:
+                models.pop(p, None)
+            save_router_cfg(order, models)
+            audit_log(f"⚙️ AI model: {pname(p)} {old} → {model or 'auto'}")
+            text, kb = keys_view()
+            show(chat_id, f"✅ {pname(p)} model: {model or 'auto'}\n\n" + text, kb, query)
+    else:
+        return False
+    return True
+
+
+def add_ai_key(message: Dict[str, Any], chat_id: int, text: str, provider: Optional[str] = None) -> None:
+    """Owner pasted a key: delete their message first (always), check it with one tiny call, save it masked."""
     try:
         telegram("deleteMessage", {"chat_id": chat_id, "message_id": message.get("message_id")})
         deleted = True
     except Exception:
         deleted = False
+    provider = provider if provider in PROVIDERS else None
     found = KEY_RE.search(text or "")
     note = "" if deleted else "\n⚠️ Key wala message khud delete kar do."
-    if not found:
-        raise InputError("Ye API key jaisi nahi lag rahi. Groq key \"gsk_\" se, OpenAI key \"sk-\" se shuru hoti hai." + note)
-    key = found.group(1)
+    key = found.group(1) if found else ""
+    if not key and not provider and MISTRAL_KEY_RE.match(text or ""):
+        key, provider = MISTRAL_KEY_RE.match(text or "").group(1), "mistral"
+    if not key and provider:
+        m = ANY_KEY_RE.match(text or "")
+        key = m.group(1) if m else ""
+    if not key:
+        raise InputError("Ye API key jaisi nahi lag rahi. Key poori copy karke bhejo (Groq \"gsk_\", Gemini \"AIza\", "
+                         "OpenRouter \"sk-or-\", NVIDIA \"nvapi-\" se shuru hoti hai; Mistral ki key bina prefix)." + note)
+    p = key_provider(key) or provider
+    if not p:
+        raise InputError("Ye kis company ki key hai? 🔑 AI Keys → ➕ Key Jodo → company chuno, phir key bhejo." + note)
     keys = db_ai_keys(fresh=True)
-    if key in GROQ_KEYS or key == OPENAI_API_KEY or any(x["k"] == key for x in keys):
+    if key in all_ai_keys() or key in GROQ_KEYS or key == OPENAI_API_KEY or any(x["k"] == key for x in keys):
         raise InputError(f"Ye key ({mask_key(key)}) pehle se judi hai." + note)
-    st = check_ai_key(key)
+    chk = validate_key(p, key)
+    st = chk["st"]
     if st == "invalid":
-        raise InputError(f"Ye key ({mask_key(key)}) kaam nahi kar rahi (invalid). Nayi key banao aur dobara bhejo." + note)
-    if st == "error":
+        raise InputError(f"Ye {pname(p)} key ({mask_key(key)}) kaam nahi kar rahi (invalid). Nayi key banao aur dobara bhejo." + note)
+    if st == "error" and not chk.get("model"):
         raise InputError("Key check nahi ho payi (network). Thodi der baad dobara bhejo." + note)
-    keys.append({"k": key, "p": key_provider(key), "ts": int(time.time())})
+    keys.append({"k": key, "p": p, "ts": int(time.time())})
     save_db_ai_keys(keys)
     if st == "limit":
         cool_key(key, KEY_COOLDOWN, "limit")
     else:
         uncool_key(key)
-    send_text(chat_id, f"✅ Key jud gayi ({mask_key(key)})" + (" — abhi limit pe hai, thodi der me chalu" if st == "limit" else "") +
-              f"\nAb kul AI keys: {len(all_ai_keys())}" + note,
+    if chk.get("ms") is not None:
+        test = f"\n🤖 Test call ✅ {chk['ms']} ms ({chk.get('model')})"
+    elif chk.get("err"):
+        test = f"\n⚠️ Test call: {chk['err'][:120]}"
+    else:
+        test = ""
+    switched = f"\n(Ye {pname(p)} ki key thi, {pname(p)} me jodi)" if provider and p != provider else ""
+    chain = ai_chain()
+    role = ("⭐ Live" if chain and chain[0] == p else f"🔁 backup no. {chain.index(p)}") if p in chain else ""
+    send_text(chat_id, f"✅ Key jud gayi ({mask_key(key)}) — {pname(p)}" + (" — abhi limit pe hai, thodi der me chalu" if st == "limit" else "")
+              + test + switched + f"\n{pname(p)} keys: {len(provider_keys(p))} · {role} · kul AI keys: {len(all_ai_keys())}" + note,
               {"inline_keyboard": [[{"text": "🔑 AI Keys", "callback_data": "ad:keys"}], BACK_ROW]})
 
 
@@ -1496,11 +1739,24 @@ def save_ctx(user_id: Optional[int], ctx: Dict[str, Any]) -> None:
 
 # ---- AI (only when the local step cannot decide)
 
-KEY_RE = re.compile(r"\b(gsk_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_\-]{20,})")
+KEY_RE = re.compile(r"\b(gsk_[A-Za-z0-9]{20,}|sk-or-v1-[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_\-]{20,}|AIza[0-9A-Za-z_\-]{30,}|nvapi-[A-Za-z0-9_\-]{20,})")
+MISTRAL_KEY_RE = re.compile(r"^\s*([A-Za-z0-9]{32})\s*$")   # Mistral keys: 32 letters/digits, no prefix
+ANY_KEY_RE = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9_\-\.]{19,199})\s*$")   # prefix-less keys (Mistral) after a provider pick
 
 
 def key_provider(key: str) -> str:
-    return "groq" if key.startswith("gsk_") else "openai"
+    """Provider from the key's own prefix ("" = no known prefix, e.g. Mistral keys)."""
+    if key.startswith("gsk_"):
+        return "groq"
+    if key.startswith("AIza"):
+        return "gemini"
+    if key.startswith("sk-or-"):
+        return "openrouter"
+    if key.startswith("nvapi-"):
+        return "nvidia"
+    if key.startswith("sk-"):
+        return "openai"
+    return ""
 
 
 def key_id(key: str) -> str:
@@ -1508,7 +1764,10 @@ def key_id(key: str) -> str:
 
 
 def mask_key(key: str) -> str:
-    return (key[:4] if key.startswith("gsk_") else key[:3]) + "…" + key[-4:]
+    for pre in ("gsk_", "sk-or-v1-", "sk-or-", "nvapi-", "AIza", "sk-"):
+        if key.startswith(pre):
+            return pre + "…" + key[-4:]
+    return "…" + key[-4:]
 
 
 def db_ai_keys(fresh: bool = False) -> List[Dict[str, Any]]:
@@ -1533,15 +1792,16 @@ def save_db_ai_keys(keys: List[Dict[str, Any]]) -> None:
 
 def groq_pool() -> List[str]:
     """Env keys first (GROQ_API_KEY, _2, _3), then keys added in the bot. Same failover for all."""
-    return [k for k in dict.fromkeys(GROQ_KEYS + [x["k"] for x in db_ai_keys() if key_provider(x["k"]) == "groq"]) if k]
+    return [k for k in dict.fromkeys(GROQ_KEYS + [x["k"] for x in db_ai_keys() if key_prov(x) == "groq"]) if k]
 
 
 def openai_pool() -> List[str]:
-    return [k for k in dict.fromkeys([OPENAI_API_KEY] + [x["k"] for x in db_ai_keys() if key_provider(x["k"]) == "openai"]) if k]
+    return [k for k in dict.fromkeys([OPENAI_API_KEY] + [x["k"] for x in db_ai_keys() if key_prov(x) == "openai"]) if k]
 
 
 def ai_provider() -> str:
-    return "groq" if groq_pool() else ("openai" if openai_pool() else "")
+    """The ⭐ LIVE provider that has a key ("" = AI off)."""
+    return live_provider()
 
 
 _KEY_COOL: Dict[str, float] = {}
@@ -1588,14 +1848,24 @@ def uncool_key(key: str) -> None:
 
 
 def check_ai_key(key: str) -> str:
-    """Free check (lists models, spends no tokens): "ok" | "invalid" | "limit" | "error"."""
-    url = "https://api.groq.com/openai/v1/models" if key_provider(key) == "groq" else "https://api.openai.com/v1/models"
+    """Keys Check (no tokens where the provider has a free auth check): "ok" | "invalid" | "limit" | "error"."""
+    p = next((x for x in PROVIDER_ORDER if key in provider_keys(x)), "") or key_provider(key) or "openai"
+    if p == "nvidia":
+        try:   # NVIDIA has no free auth check (its model list is public): one 1-token call
+            http_json(PROVIDERS[p]["base"] + "/chat/completions", "POST",
+                      {"model": (provider_models(p, key) or ["meta/llama-3.1-8b-instruct"])[0],
+                       "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}, _auth(p, key), timeout=8)
+            return "ok"
+        except Exception as exc:
+            cls = ai_err_class(exc)
+            return cls if cls in ("invalid", "limit") else "error"
+    url = PROVIDERS[p]["base"] + ("/key" if p == "openrouter" else "/models")
     try:
-        http_json(url, "GET", None, {"Authorization": f"Bearer {key}"}, timeout=6)
+        http_json(url, "GET", None, _auth(p, key), timeout=6)
         return "ok"
     except Exception as exc:
         low = str(exc).lower()
-        if "http 401" in low or "http 403" in low or "invalid" in low:
+        if "http 401" in low or "http 403" in low or "invalid" in low or ai_err_class(exc) == "invalid" or (p == "gemini" and "http 400" in low):
             return "invalid"
         if "http 429" in low:
             return "limit"
@@ -1691,64 +1961,549 @@ def strip_think(text: Any) -> str:
 _AI_LAST: Dict[str, Any] = {}   # model / ms / usage of the last successful call (diag only, never keys)
 
 
-def ai_complete(system: str, user_text: str, max_tokens: int = 150, cap: float = 9.0, fast: bool = False) -> Optional[str]:
-    messages = [{"role": "system", "content": system}, {"role": "user", "content": user_text}]
-    _AI_LAST.clear()
-    pool = groq_pool()
-    usable = [k for k in pool if not key_cooling(k)] or pool
-    # One overall time cap, however many keys there are: the webhook must answer Telegram fast,
-    # or Telegram retries with growing pauses and the bot looks dead.
-    deadline = time.time() + max(2.0, min(9.0, cap))
-    for n, key in enumerate(usable):
-        for model in groq_models(key):
-            if time.time() > deadline - 1:
-                return None
-            try:
-                t_call = time.time()
-                res = http_json("https://api.groq.com/openai/v1/chat/completions", "POST",
-                                groq_body(model, messages, max_tokens, fast), {"Authorization": f"Bearer {key}"},
-                                timeout=max(1.0, min(7.0, deadline - time.time())))
-                content = strip_think(res["choices"][0]["message"].get("content"))
-                if not content:
-                    continue
-                usage = res.get("usage") if isinstance(res, dict) else None
-                _AI_LAST.update(provider="groq", model=model, ms=int((time.time() - t_call) * 1000),
-                                usage={k: usage.get(k) for k in ("prompt_tokens", "completion_tokens", "total_tokens")
-                                       if isinstance(usage, dict) and k in usage} if isinstance(usage, dict) else None)
-                return content
-            except Exception as exc:
-                low = str(exc).lower()
-                if "model" in low and any(x in low for x in ("not found", "decommission", "does not exist", "not supported", "no access")):
-                    drop_groq_model(key, model)
-                    continue   # same key, next model
-                if "json_validate_failed" in low or "failed_generation" in low or "response_format" in low:
-                    continue   # the model's JSON came out broken: try the next model, the key is fine
-                print(f"[filesbull] groq key {n + 1} ({mask_key(key)}) error: {str(exc)[:160].replace(key, '***')}", flush=True)
-                # 429 limit / 401-403 bad key / 5xx / timeout: skip this key for a while, try the next one now.
-                m = re.search(r"try again in (\d+)m", low)
-                reason = fail_reason(exc)
-                cool_key(key, 3600 if reason == "invalid" else (max(KEY_COOLDOWN, int(m.group(1)) * 60) if m else KEY_COOLDOWN), reason)
-                break
-    opool = openai_pool()
-    for key in ([k for k in opool if not key_cooling(k)] or opool):
-        if time.time() > deadline - 2:
-            break
-        body: Dict[str, Any] = {"model": OPENAI_MODEL, "messages": messages, "response_format": {"type": "json_object"}}
-        if OPENAI_MODEL.startswith(("gpt-5", "o1", "o3", "o4")):
-            body["reasoning_effort"] = "minimal" if OPENAI_MODEL.startswith("gpt-5") else "low"
+# ================================================================ multi-provider AI router (Aarav 7:03 / 7:04 PM Oct 26 2026)
+# Groq, Gemini, Mistral, OpenRouter, NVIDIA (+ OpenAI if a key exists). The owner picks the ⭐ LIVE provider and the
+# BACKUP ORDER in 🔑 AI Keys; every AI call goes LIVE first and, on a limit / bad key / server error / timeout /
+# empty or broken JSON, the SAME request goes to the next backup at once. Keys are never shown, logged or sent.
+PROVIDERS: Dict[str, Dict[str, Any]] = {
+    "groq": {"name": "Groq", "c": "g", "base": "https://api.groq.com/openai/v1", "json": True,
+             "env": ["GROQ_API_KEY", "GROQ_API_KEY_2", "GROQ_API_KEY_3"], "get": "console.groq.com/keys", "prefer": []},
+    "gemini": {"name": "Gemini", "c": "e", "base": "https://generativelanguage.googleapis.com/v1beta/openai", "json": True,
+               "env": ["GEMINI_API_KEY", "GEMINI_API_KEY_2", "GOOGLE_API_KEY"], "get": "aistudio.google.com/apikey",
+               "prefer": ["gemini-2.5-flash-lite", "gemini-flash-lite-latest", "gemini-2.0-flash-lite", "gemini-2.5-flash",
+                          "gemini-flash-latest", "gemini-2.0-flash"]},
+    "mistral": {"name": "Mistral", "c": "m", "base": "https://api.mistral.ai/v1", "json": True,
+                "env": ["MISTRAL_API_KEY", "MISTRAL_API_KEY_2"], "get": "console.mistral.ai → API Keys",
+                "prefer": ["mistral-small-latest", "open-mistral-nemo", "ministral-8b-latest", "ministral-3b-latest",
+                           "mistral-medium-latest"]},
+    "openrouter": {"name": "OpenRouter", "c": "o", "base": "https://openrouter.ai/api/v1", "json": False,
+                   "env": ["OPENROUTER_API_KEY", "OPENROUTER_API_KEY_2"], "get": "openrouter.ai/keys",
+                   "prefer": ["meta-llama/llama-3.3-8b-instruct:free", "mistralai/mistral-small-3.2-24b-instruct:free",
+                              "google/gemma-3-12b-it:free", "qwen/qwen3-8b:free", "meta-llama/llama-3.2-3b-instruct:free",
+                              "mistralai/mistral-7b-instruct:free", "google/gemma-3-27b-it:free",
+                              "meta-llama/llama-3.3-70b-instruct:free", "openai/gpt-oss-20b:free"]},
+    "nvidia": {"name": "NVIDIA", "c": "n", "base": "https://integrate.api.nvidia.com/v1", "json": False,
+               "env": ["NVIDIA_API_KEY", "NVIDIA_API_KEY_2"], "get": "build.nvidia.com → Get API Key",
+               "prefer": ["meta/llama-3.1-8b-instruct", "meta/llama-3.2-3b-instruct", "mistralai/mistral-7b-instruct-v0.3",
+                          "google/gemma-2-9b-it", "meta/llama-3.3-70b-instruct", "nvidia/llama-3.1-nemotron-nano-8b-v1"]},
+    "openai": {"name": "OpenAI", "c": "a", "base": "https://api.openai.com/v1", "json": True,
+               "env": ["OPENAI_API_KEY"], "get": "platform.openai.com/api-keys", "prefer": [], "hidden": True},
+}
+PROVIDER_ORDER = ["groq", "gemini", "mistral", "openrouter", "nvidia", "openai"]
+MAIN_PROVIDERS = PROVIDER_ORDER[:5]
+CODE_P = {v["c"]: k for k, v in PROVIDERS.items()}
+ENV_AI_KEYS: Dict[str, List[str]] = {p: [k for k in dict.fromkeys(os.environ.get(n, "").strip() for n in PROVIDERS[p]["env"]) if k]
+                                     for p in ("gemini", "mistral", "openrouter", "nvidia")}
+ROUTER_KEY = "ai_router"
+_RCFG: Dict[str, Any] = {"t": 0.0, "v": None}
+_PMODELS: Dict[str, Any] = {}
+_NOJSON: Dict[str, bool] = {}
+_AI_STATS: Dict[str, Any] = {}
+_SWITCH_LOGGED: Dict[str, float] = {}
+SWITCH_LOG_EVERY = 600
+
+
+def pname(p: str) -> str:
+    return PROVIDERS.get(p, {}).get("name", p)
+
+
+def key_prov(x: Dict[str, Any]) -> str:
+    """Provider of a key saved in the bot (stored "p"; old rows: from the key's prefix)."""
+    p = str(x.get("p") or "")
+    return p if p in PROVIDERS else (key_provider(str(x.get("k") or "")) or "openai")
+
+
+def provider_keys(p: str) -> List[str]:
+    if p == "groq":
+        return groq_pool()
+    if p == "openai":
+        return openai_pool()
+    return [k for k in dict.fromkeys(ENV_AI_KEYS.get(p, []) + [x["k"] for x in db_ai_keys() if key_prov(x) == p]) if k]
+
+
+def env_key_rows() -> List[tuple]:
+    """(env name, provider, key) for keys set in Vercel."""
+    out = [(n, "groq", k) for n, k in (("GROQ_API_KEY", GROQ_API_KEY), ("GROQ_API_KEY_2", GROQ_API_KEY_2),
+                                         ("GROQ_API_KEY_3", GROQ_API_KEY_3)) if k]
+    for p in ("gemini", "mistral", "openrouter", "nvidia"):
+        for n in PROVIDERS[p]["env"]:
+            v = os.environ.get(n, "").strip()
+            if v and v in ENV_AI_KEYS.get(p, []):
+                out.append((n, p, v))
+    if OPENAI_API_KEY:
+        out.append(("OPENAI_API_KEY", "openai", OPENAI_API_KEY))
+    return out
+
+
+def router_cfg(fresh: bool = False, raw: Optional[str] = None) -> Dict[str, Any]:
+    """{"order": [providers, LIVE first], "models": {provider: pinned model}} from bot_settings (cached 60 s)."""
+    if raw is None and not fresh and _RCFG["v"] is not None and time.time() - _RCFG["t"] < 60:
+        return _RCFG["v"]
+    cfg: Dict[str, Any] = {}
+    try:
+        if raw is None:
+            raw = get_setting(ROUTER_KEY) if (SUPABASE_URL and SUPABASE_KEY) else None
+        cfg = json.loads(raw) if raw else {}
+        if not isinstance(cfg, dict):
+            cfg = {}
+    except Exception:
+        log_error("router_cfg")
+        cfg = dict(_RCFG["v"] or {})
+    order = [p for p in dict.fromkeys(cfg.get("order") or []) if p in PROVIDERS]
+    order += [p for p in PROVIDER_ORDER if p not in order]
+    models = {p: str(m) for p, m in (cfg.get("models") or {}).items() if p in PROVIDERS and m}
+    v = {"order": order, "models": models}
+    _RCFG.update(t=time.time(), v=v)
+    return v
+
+
+def save_router_cfg(order: List[str], models: Dict[str, str]) -> None:
+    order = [p for p in dict.fromkeys(order) if p in PROVIDERS]
+    order += [p for p in PROVIDER_ORDER if p not in order]
+    set_setting(ROUTER_KEY, json.dumps({"order": order, "models": models}))
+    _RCFG.update(t=time.time(), v={"order": order, "models": dict(models)})
+
+
+def ai_chain() -> List[str]:
+    """Providers that have at least one key, in the owner's order (LIVE first)."""
+    return [p for p in router_cfg()["order"] if provider_keys(p)]
+
+
+def live_provider() -> str:
+    ch = ai_chain()
+    return ch[0] if ch else ""
+
+
+def provider_state(p: str) -> str:
+    """"none" (no key) | "ok" | "limit" | "invalid" — the best of its keys."""
+    keys = provider_keys(p)
+    if not keys:
+        return "none"
+    sts = [key_state(k) for k in keys]
+    if "" in sts:
+        return "ok"
+    return "limit" if any(s != "invalid" for s in sts) else "invalid"
+
+
+STATE_WORD = {"none": "➖ key nahi", "ok": "✅", "limit": "⏳ limit", "invalid": "❌ key kharab"}
+
+
+def _is_reasoning(model: str) -> bool:
+    low = model.lower()
+    return any(x in low for x in ("gpt-oss", "deepseek-r1", "-r1", "qwen3", "qwq", "thinking", "magistral", "nemotron", "reason"))
+
+
+def _model_ok(p: str, mid: str) -> bool:
+    low = mid.lower()
+    bad = ("embed", "whisper", "tts", "guard", "rerank", "moderation", "ocr", "transcribe", "voxtral", "imagen", "veo",
+           "image", "audio", "vision", "-vl", "aqa", "learnlm", "live", "parse", "retriever", "reward", "safety", "clip",
+           "deplot", "kosmos", "fuyu", "neva", "paligemma", "computer-use", "robotics", "native", "codestral", "devstral")
+    if any(x in low for x in bad):
+        return False
+    if p == "gemini":
+        return "gemini" in low and "pro" not in low.split("/")[-1].split("-")
+    if p == "nvidia":
+        return any(x in low for x in ("instruct", "-it", "chat"))
+    return True
+
+
+def _rank(p: str, mid: str) -> tuple:
+    pref = PROVIDERS[p]["prefer"]
+    if mid in pref:
+        return (0, pref.index(mid), mid)
+    low = mid.lower()
+    size = re.search(r"(\d+)b\b", low)
+    lite = 0 if ("lite" in low or "small" in low or "mini" in low or "nano" in low) else 1
+    preview = 1 if ("preview" in low or "exp" in low) else 0
+    return (1, preview, lite, int(size.group(1)) if size else 50, low)
+
+
+def provider_models(p: str, key: str, fresh: bool = False) -> List[str]:
+    """Chat models this key can use, best first (pinned model first). From the provider's own /models, cached 6 h."""
+    pinned = router_cfg()["models"].get(p, "")
+    if p == "groq":
+        ids = groq_models(key)
+    elif p == "openai":
+        ids = [OPENAI_MODEL]
+    else:
+        ck = f"{p}:{key_id(key)}"
+        hit = _PMODELS.get(ck)
+        ids = []
+        if hit and time.time() - hit[0] < 6 * 3600 and not fresh:
+            ids = hit[1]
+        else:
+            raw = "" if fresh else (get_setting(f"aimodels3:{ck}") or "")
+            ts, _, lst = raw.partition("|")
+            if lst and ts.isdigit() and time.time() - int(ts) < 6 * 3600:
+                ids = [x for x in lst.split(",") if x]
+            else:
+                try:
+                    res = http_json(PROVIDERS[p]["base"] + "/models", "GET", None, _auth(p, key), timeout=5)
+                    data = res.get("data") if isinstance(res, dict) else None
+                    if data is None and isinstance(res, dict):
+                        data = res.get("models") or []
+                    got = []
+                    for m in data or []:
+                        mid = str(m.get("id") or m.get("name") or "").replace("models/", "")
+                        if not mid or not _model_ok(p, mid):
+                            continue
+                        if p == "openrouter":
+                            pr = m.get("pricing") or {}
+                            if not (mid.endswith(":free") or (str(pr.get("prompt")) in ("0", "0.0") and str(pr.get("completion")) in ("0", "0.0"))):
+                                continue
+                        if p == "mistral" and isinstance(m.get("capabilities"), dict) and m["capabilities"].get("completion_chat") is False:
+                            continue
+                        got.append(mid)
+                    ids = sorted(dict.fromkeys(got), key=lambda x: _rank(p, x))[:8]
+                except Exception:
+                    ids = []
+                if ids:
+                    try:
+                        set_setting(f"aimodels3:{ck}", f"{int(time.time())}|{','.join(ids)}")
+                    except Exception:
+                        log_error("aimodels3 cache")
+            if not ids:
+                ids = PROVIDERS[p]["prefer"][:3]
+            _PMODELS[ck] = (time.time(), ids)
+    return [m for m in dict.fromkeys([pinned] + list(ids)) if m]
+
+
+def drop_model(p: str, key: str, model: str) -> None:
+    if p == "groq":
+        drop_groq_model(key, model)
+        return
+    ck = f"{p}:{key_id(key)}"
+    ids = [m for m in provider_models(p, key) if m != model]
+    _PMODELS[ck] = (time.time(), ids or [m for m in PROVIDERS[p]["prefer"] if m != model][:3])
+    try:
+        set_setting(f"aimodels3:{ck}", f"{int(time.time())}|{','.join(_PMODELS[ck][1])}")
+    except Exception:
+        log_error("drop_model")
+
+
+def _auth(p: str, key: str) -> Dict[str, str]:
+    h = {"Authorization": f"Bearer {key}"}
+    if p == "openrouter":
+        h.update({"HTTP-Referer": PUBLIC_HOME, "X-Title": "filesbull"})
+    return h
+
+
+def provider_body(p: str, model: str, messages: List[Dict[str, Any]], max_tokens: int, fast: bool = False,
+                  json_mode: bool = True) -> Dict[str, Any]:
+    """The request each provider expects (all speak the OpenAI chat shape)."""
+    if p == "groq":
+        body = groq_body(model, messages, max_tokens, fast)
+        if not json_mode or _NOJSON.get(p + ":" + model):
+            body.pop("response_format", None)
+        return body
+    if p == "openai":
+        body = {"model": model, "messages": messages}
+        if model.startswith(("gpt-5", "o1", "o3", "o4")):
+            body["reasoning_effort"] = "minimal" if model.startswith("gpt-5") else "low"
             body["max_completion_tokens"] = 800
         else:
             body["max_completion_tokens"] = max_tokens
             body["temperature"] = 0.1
-        try:
-            res = http_json("https://api.openai.com/v1/chat/completions", "POST", body,
-                            {"Authorization": f"Bearer {key}"}, timeout=max(1.0, min(8.0, deadline - time.time())))
-            return res["choices"][0]["message"]["content"]
-        except Exception as exc:
-            print(f"[filesbull] openai key {mask_key(key)} error: {str(exc)[:200].replace(key, '***')}", flush=True)
-            reason = fail_reason(exc)
-            cool_key(key, 3600 if reason == "invalid" else KEY_COOLDOWN, reason)
+        if json_mode:
+            body["response_format"] = {"type": "json_object"}
+        return body
+    low = model.lower()
+    body = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": 0.1}
+    if json_mode and PROVIDERS[p]["json"] and not _NOJSON.get(p + ":" + model):
+        body["response_format"] = {"type": "json_object"}
+    if p == "gemini" and "2.5-flash" in low and "lite" not in low:
+        body["reasoning_effort"] = "none"          # 2.5 Flash thinks by default: off = faster, fewer tokens
+    if _is_reasoning(model):
+        body["max_tokens"] = max_tokens + (250 if fast else 600)
+        if "gpt-oss" in low:
+            body["reasoning_effort"] = "low"
+        if p == "openrouter":
+            body["reasoning"] = {"effort": "low", "exclude": True}
+    return body
+
+
+def strip_reasoning(text: Any) -> str:
+    """Remove a reasoning model's thinking (<think>…</think>, an unclosed <think>, ```json fences)."""
+    if isinstance(text, list):
+        text = "".join(str(x.get("text") or "") if isinstance(x, dict) else str(x) for x in text)
+    t = re.sub(r"<think>.*?</think>", "", str(text or ""), flags=re.S | re.I)
+    if re.search(r"<think>", t, re.I):
+        t = re.split(r"<think>", t, flags=re.I)[0]
+    t = re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$", "", t.strip(), flags=re.I)
+    return t.strip()
+
+
+def first_json(text: str) -> Optional[str]:
+    """The JSON in a reply: the whole text when it is JSON, else the first balanced {...} object that parses."""
+    t = (text or "").strip()
+    if not t:
+        return None
+    try:
+        json.loads(t)
+        return t
+    except Exception:
+        pass
+    start = t.find("{")
+    while start != -1:
+        depth, in_str, esc_ = 0, False, False
+        for i in range(start, len(t)):
+            ch = t[i]
+            if in_str:
+                if esc_:
+                    esc_ = False
+                elif ch == "\\":
+                    esc_ = True
+                elif ch == '"':
+                    in_str = False
+            elif ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    cand = t[start:i + 1]
+                    try:
+                        json.loads(cand)
+                        return cand
+                    except Exception:
+                        break
+        start = t.find("{", start + 1)
     return None
+
+
+def ai_err_class(exc: Exception) -> str:
+    """limit | invalid | model | badjson | server | timeout | bad_request | other"""
+    low = str(exc).lower()
+    if "http 429" in low or "rate limit" in low or "quota" in low or "resource_exhausted" in low or "http 402" in low:
+        return "limit"
+    if ("http 401" in low or "http 403" in low or "invalid api key" in low or "api key not valid" in low
+            or "api_key_invalid" in low or "unauthorized" in low or "authentication" in low):
+        return "invalid"
+    if "json_validate_failed" in low or "failed_generation" in low or "response_format" in low or "json mode" in low:
+        return "badjson"
+    if "model" in low and any(x in low for x in ("not found", "decommission", "does not exist", "not supported",
+                                                 "no access", "no endpoints", "is not a valid model", "unknown model")):
+        return "model"
+    if re.search(r"http 5\d\d", low) or "overloaded" in low or "unavailable" in low:
+        return "server"
+    if "timed out" in low or "timeout" in low or "time out" in low:
+        return "timeout"
+    if "http 400" in low or "http 404" in low or "http 422" in low:
+        return "bad_request"
+    return "other"
+
+
+def provider_call(p: str, key: str, model: str, messages: List[Dict[str, Any]], max_tokens: int, timeout: float,
+                  fast: bool = False, json_mode: bool = True) -> Dict[str, Any]:
+    """One HTTP call. Returns {"text", "usage"}; raises with the provider's own error text (key scrubbed)."""
+    body = provider_body(p, model, messages, max_tokens, fast, json_mode)
+    try:
+        res = http_json(PROVIDERS[p]["base"] + "/chat/completions", "POST", body, _auth(p, key), timeout=timeout)
+    except Exception as exc:
+        raise RuntimeError(scrub_keys(str(exc), key)) from None
+    if isinstance(res, dict) and res.get("error") and not res.get("choices"):
+        err = res["error"]
+        code = err.get("code") if isinstance(err, dict) else None
+        msg_ = err.get("message") if isinstance(err, dict) else err
+        raise RuntimeError(scrub_keys(f"HTTP {code or 500}: {msg_}", key))
+    try:
+        msg_ = res["choices"][0]["message"]
+    except Exception:
+        raise RuntimeError("empty reply (no choices)") from None
+    usage = res.get("usage") if isinstance(res, dict) else None
+    return {"text": strip_reasoning(msg_.get("content")),
+            "usage": {k: usage.get(k) for k in ("prompt_tokens", "completion_tokens", "total_tokens") if k in usage}
+            if isinstance(usage, dict) else None}
+
+
+def scrub_keys(s: str, key: str = "") -> str:
+    if key:
+        s = s.replace(key, "***")
+    return re.sub(r"gsk_[A-Za-z0-9]+|sk-[A-Za-z0-9_\-]+|AIza[0-9A-Za-z_\-]+|nvapi-[A-Za-z0-9_\-]+", "***", s)
+
+
+def _stat(p: str, ok: bool) -> None:
+    day = _AI_STATS.setdefault("day", {})
+    rec = day.setdefault(p, [0, 0])
+    rec[0 if ok else 1] += 1
+    if not _AI_STATS.get("queued"):
+        _AI_STATS["queued"] = True
+        defer(flush_ai_stats)
+
+
+def flush_ai_stats() -> None:
+    """Add this update's per-provider call counts to today's row (bot_settings aicalls:<IST day>)."""
+    _AI_STATS["queued"] = False
+    add = _AI_STATS.pop("day", {}) or {}
+    if not add:
+        return
+    k = f"aicalls:{ist_day()}"
+    try:
+        cur = json.loads(get_setting(k) or "{}")
+    except Exception:
+        cur = {}
+    for p, (ok, bad) in add.items():
+        prev = cur.get(p) if isinstance(cur.get(p), list) else [0, 0]
+        cur[p] = [int(prev[0]) + ok, int(prev[1]) + bad]
+    set_setting(k, json.dumps(cur))
+
+
+def calls_today() -> Dict[str, List[int]]:
+    try:
+        cur = json.loads(get_setting(f"aicalls:{ist_day()}") or "{}")
+    except Exception:
+        cur = {}
+    for p, (ok, bad) in (_AI_STATS.get("day") or {}).items():
+        prev = cur.get(p) if isinstance(cur.get(p), list) else [0, 0]
+        cur[p] = [int(prev[0]) + ok, int(prev[1]) + bad]
+    return {p: v for p, v in cur.items() if isinstance(v, list)}
+
+
+SWITCH_WORD = {"limit": "limit", "invalid": "key kharab", "server": "server error", "timeout": "slow/timeout",
+               "badjson": "galat jawab", "empty": "khali jawab", "model": "model nahi mila", "bad_request": "request error",
+               "other": "error", "cooling": "ruki hui"}
+
+
+def note_switch(frm: str, to: str, why: str) -> None:
+    """"🔁 AI switch: Groq → Gemini (limit)" in the Log Chat, at most once per 10 min per failing provider."""
+    now = time.time()
+    if now - _SWITCH_LOGGED.get(frm, 0) < SWITCH_LOG_EVERY:
+        return
+    _SWITCH_LOGGED[frm] = now
+    line = f"🔁 AI switch: {pname(frm)} → {pname(to) if to else 'koi backup nahi chala'} ({SWITCH_WORD.get(why, why)})"
+
+    def send() -> None:
+        try:
+            last = float((get_setting(f"aiswitch:{frm}") or "0").split("|")[0] or 0)
+        except Exception:
+            last = 0.0
+        if time.time() - last < SWITCH_LOG_EVERY:
+            return
+        set_setting(f"aiswitch:{frm}", f"{int(time.time())}|{line}")
+        try:
+            if get_setting("log_chat_id"):
+                log_chat_send(line)
+        except Exception:
+            log_error("ai switch log")
+    defer(send)
+
+
+def ai_complete(system: str, user_text: str, max_tokens: int = 150, cap: float = 9.0, fast: bool = False,
+                want_json: bool = True, only: Optional[str] = None) -> Optional[str]:
+    """THE router: ⭐ LIVE provider first, then the backups in the owner's order, same request each time.
+    One overall time cap (the webhook must answer Telegram fast). Returns the reply text (the JSON object when
+    want_json) or None when every provider failed — callers then use their local fallback."""
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user_text}]
+    _AI_LAST.clear()
+    chain = [only] if only else ai_chain()
+    deadline = time.time() + max(2.0, min(9.0, cap))
+    first_fail: Optional[tuple] = None
+    for pi, p in enumerate(chain):
+        keys = provider_keys(p)
+        usable = [k for k in keys if not key_cooling(k)]
+        if not usable:
+            # every key of this provider is resting: the last provider still gets one try (better than nothing)
+            if pi < len(chain) - 1 or not keys:
+                first_fail = first_fail or (p, "cooling")
+                continue
+            usable = keys
+        why = ""
+        prov_done = False
+        for n, key in enumerate(usable):
+            if prov_done:
+                break
+            models = provider_models(p, key)[:4 if p == "groq" else 3]
+            key_done = False
+            for model in models:
+                left = deadline - time.time()
+                if left < 1:
+                    return None
+                more = pi < len(chain) - 1
+                # leave time for a backup: the live provider gets ~65 % of what is left when a backup exists
+                tmo = max(1.0, min(7.0, left * 0.65 if more else left - 0.2))
+                t_call = time.time()
+                for attempt in range(2):
+                    try:
+                        r = provider_call(p, key, model, messages, max_tokens, tmo, fast, want_json)
+                        text = r["text"]
+                        if want_json:
+                            text = first_json(text) or ""
+                        if not text:
+                            # empty / not JSON: the same request goes to the next provider (no extra calls here)
+                            why = "empty" if not r["text"] else "badjson"
+                            _stat(p, False)
+                            key_done = prov_done = True
+                            break
+                        _stat(p, True)
+                        _AI_LAST.update(provider=p, model=model, ms=int((time.time() - t_call) * 1000), usage=r["usage"])
+                        if first_fail and first_fail[0] != p:
+                            _AI_LAST["switched_from"] = pname(first_fail[0])
+                            note_switch(first_fail[0], p, first_fail[1])
+                        return text
+                    except Exception as exc:
+                        _stat(p, False)
+                        cls = ai_err_class(exc)
+                        low = str(exc).lower()
+                        why = cls
+                        if cls in {"badjson", "bad_request"} and attempt == 0 and want_json and \
+                                ("response_format" in low or "json" in low) and p != "groq":
+                            _NOJSON[p + ":" + model] = True    # this model has no JSON mode: ask plainly, parse the JSON
+                            continue
+                        if cls == "model":
+                            drop_model(p, key, model)
+                        elif cls in {"badjson", "bad_request"}:
+                            pass
+                        else:
+                            print(f"[filesbull] {p} key {n + 1} ({mask_key(key)}) error: {scrub_keys(str(exc), key)[:160]}", flush=True)
+                            m = re.search(r"try again in (\d+)m", low)
+                            if cls == "invalid":
+                                cool_key(key, 3600, "invalid")
+                            else:
+                                cool_key(key, max(KEY_COOLDOWN, int(m.group(1)) * 60) if m else KEY_COOLDOWN, "limit")
+                            key_done = True
+                        break
+                if key_done:
+                    break
+        first_fail = first_fail or (p, why or "other")
+    if first_fail and len(chain) > 1:
+        note_switch(first_fail[0], "", first_fail[1])
+    return None
+
+
+def validate_key(p: str, key: str) -> Dict[str, Any]:
+    """New key check: a free auth check, then ONE tiny real call. {"st": ok|invalid|limit|error, "ms", "model", "err"}"""
+    free_url = {"openrouter": "/key", "nvidia": ""}.get(p, "/models")
+    if free_url:
+        try:
+            http_json(PROVIDERS[p]["base"] + free_url, "GET", None, _auth(p, key), timeout=6)
+        except Exception as exc:
+            cls = ai_err_class(exc)
+            if cls == "invalid" or "http 400" in str(exc).lower() and p == "gemini":
+                return {"st": "invalid", "err": scrub_keys(str(exc), key)[:160]}
+            if cls == "limit":
+                return {"st": "limit", "err": scrub_keys(str(exc), key)[:160]}
+            return {"st": "error", "err": scrub_keys(str(exc), key)[:160]}
+    out: Dict[str, Any] = {"st": "ok"}
+    _PMODELS.pop(f"{p}:{key_id(key)}", None)
+    models = provider_models(p, key, fresh=True) if p != "groq" else groq_models(key)
+    for model in models[:2]:
+        t0 = time.monotonic()
+        try:
+            r = provider_call(p, key, model, [{"role": "system", "content": "Reply ONLY with JSON {\"ok\":true}."},
+                                              {"role": "user", "content": "ping"}], 20, 7, True, True)
+            out.update(ms=int((time.monotonic() - t0) * 1000), model=model, reply=r["text"][:30], err=None)
+            return out
+        except Exception as exc:
+            cls = ai_err_class(exc)
+            out.update(model=model, err=scrub_keys(str(exc), key)[:160])
+            if cls == "invalid":
+                out["st"] = "invalid"
+                return out
+            if cls == "limit":
+                out["st"] = "limit"
+                return out
+    return out
 
 
 AI_SYSTEM = ("You help a Telegram bot that searches a catalog of study PDFs for Indian govt exams. "
@@ -2788,7 +3543,9 @@ def handle_private_message(message: Dict[str, Any]) -> None:
         send_text(chat_id, f"⛔ Ye command sirf admin ke liye hai.\nAapka Telegram ID: {user_id}")
         return
 
-    if not command and KEY_RE.search(text) and message.get("chat", {}).get("type") == "private":
+    if not command and message.get("chat", {}).get("type") == "private" and (
+            KEY_RE.search(text) or (is_subadmin(user_id) and MISTRAL_KEY_RE.match(text) and re.search(r"\d", text)
+                                    and re.search(r"[A-Za-z]", text) and not get_pending(user_id))):
         # An API key must never be searched, sent to the AI or written to logs.
         if is_subadmin(user_id):
             handle_admin_input(message, "addkey", None)   # owner: saved; sub-admin: deleted + refused
@@ -3344,7 +4101,8 @@ def local_admin_intent(text: str) -> Optional[Dict[str, Any]]:
             return {"action": "list_channels", "kind": kind}
     if "admin" in words and words & {"add", "jodo", "bana", "banao", "jod"}:
         return {"action": "add_admin"}
-    if words & {"key", "keys"} and words & {"ai", "api", "groq", "openai", "add", "jodo", "dikhao", "list"}:
+    if words & {"key", "keys"} and words & {"ai", "api", "groq", "openai", "add", "jodo", "dikhao", "list", "gemini",
+                                            "mistral", "openrouter", "nvidia", "backup", "live"}:
         return {"action": "ai_keys"}
     # delete one file
     if words & {"delete", "hatao", "hata", "hatado", "remove", "mitao", "mita", "nikalo"} and \
@@ -4279,6 +5037,10 @@ def setup_status() -> Dict[str, Any]:
             "GROQ_API_KEY": bool(GROQ_API_KEY),
             "GROQ_API_KEY_2": bool(GROQ_API_KEY_2),
             "GROQ_API_KEY_3": bool(GROQ_API_KEY_3),
+            "GEMINI_API_KEY": bool(ENV_AI_KEYS.get("gemini")),
+            "MISTRAL_API_KEY": bool(ENV_AI_KEYS.get("mistral")),
+            "OPENROUTER_API_KEY": bool(ENV_AI_KEYS.get("openrouter")),
+            "NVIDIA_API_KEY": bool(ENV_AI_KEYS.get("nvidia")),
         },
         "ai": ("on (" + ai_provider() + ")") if ai_provider() else "off",
         "ai_keys_in_bot": len(db_ai_keys()),
@@ -4290,6 +5052,10 @@ def setup_status() -> Dict[str, Any]:
     except Exception:
         pass
     status["ai_understand"] = "on (AI first, cache 24 h, local fallback)" if AI_UNDERSTAND else "off (local parser)"
+    try:  # multi-provider router: LIVE + backup order, per provider key count / status / calls today (never keys)
+        status["ai_providers"] = ai_providers_summary()
+    except Exception:
+        log_error("ai_providers")
     try:  # how user messages were understood: ai = one small call; cache + exact = 0 tokens; local_fallback = no AI
         status["understood_by"] = understood_counts()
         prune_understand_cache()
@@ -5404,20 +6170,52 @@ def logs_text(n: int = 15) -> List[str]:
 
 
 # ---- 🤖 AI test (owner): one tiny real call, shows ✅ or the exact error (never the key)
+def ai_providers_summary() -> Dict[str, Any]:
+    cfg = router_cfg()
+    chain = ai_chain()
+    today = calls_today()
+    out: Dict[str, Any] = {"live": chain[0] if chain else None, "backup_order": chain[1:], "providers": {}}
+    for p in cfg["order"]:
+        n = len(provider_keys(p))
+        if p not in MAIN_PROVIDERS and not n:
+            continue
+        ok, bad = (today.get(p) or [0, 0])[:2]
+        out["providers"][p] = {"keys": n, "status": provider_state(p) if n else "no key",
+                               "role": "live" if chain and chain[0] == p else (f"backup {chain.index(p)}" if p in chain else "off"),
+                               "model": cfg["models"].get(p) or "auto", "calls_today": ok, "fails_today": bad}
+    try:
+        last = [get_setting(f"aiswitch:{p}") or "" for p in chain]
+        sw = sorted((x for x in last if x), reverse=True)
+        out["last_switch"] = sw[0].split("|", 1)[1] if sw else None
+    except Exception:
+        out["last_switch"] = None
+    return out
+
+
 def ai_test_text() -> str:
-    if not ai_provider():
-        return "🤖 AI test: ❌ koi AI key nahi hai (🔑 AI Keys me jodo)."
-    p = ai_probe(True)
-    lines = ["🤖 <b>AI test</b> (ek chhoti asli call)"]
-    for k in p.get("keys", []):
-        tries = k.get("tries") or []
-        ok = [t for t in tries if t.get("ok")]
-        if ok:
-            lines.append(f"✅ {esc(k['key'])}: chal raha hai — model {esc(ok[0]['model'])}, {ok[0]['ms']} ms")
-        elif tries:
-            lines.append(f"❌ {esc(k['key'])}: " + esc(str(tries[-1].get('error') or '')[:160]))
-        else:
-            lines.append(f"• {esc(k['key'])}: {esc(str(k.get('cooling')))}")
+    """/aitest: one tiny real call to EVERY provider — ✅ + ms, or the exact error class. Never a key."""
+    pr = ai_probe(True)
+    live = pr.get("provider") or ""
+    lines = ["🤖 <b>AI test</b> (har AI ki ek chhoti asli call)",
+             f"⭐ Live: {esc(pname(live)) if live else 'koi nahi (AI OFF)'}", ""]
+    order = router_cfg()["order"]
+    for p in order:
+        rows = [k for k in pr.get("keys", []) if k.get("p") == p]
+        if not rows:
+            if p in MAIN_PROVIDERS:
+                lines.append(f"➖ {pname(p)}: key nahi (🔑 AI Keys → ➕ Key Jodo)")
+            continue
+        for k in rows:
+            label = f"{pname(p)} #{k['key'].split('#')[-1]}"
+            tries = k.get("tries") or []
+            ok = [t for t in tries if t.get("ok")]
+            if ok:
+                lines.append(f"✅ {esc(label)}: chal raha hai — model {esc(ok[0]['model'])}, {ok[0]['ms']} ms")
+            elif tries:
+                lines.append(f"❌ {esc(label)}: " + esc(str(tries[-1].get('error') or 'khali jawab')[:160]))
+            else:
+                lines.append(f"• {esc(label)}: {esc(str(k.get('cooling')))}")
+    lines.append("\nLive fail ho to upar wale order me agli AI apne-aap chalegi.")
     return "\n".join(lines)
 
 
@@ -5429,46 +6227,60 @@ def _err_class(exc: Exception, key: str = "") -> str:
     s = str(exc)
     if key:
         s = s.replace(key, "***")
-    s = re.sub(r"gsk_[A-Za-z0-9]+|sk-[A-Za-z0-9_\-]+", "***", s)
+    s = scrub_keys(s)
     m = re.match(r"HTTP (\d+)", s)
     if m:
         return s[:220]
     return (type(exc).__name__ + ": " + s)[:220]
 
 
-def ai_probe(json_mode: bool = True, all_models: bool = False) -> Dict[str, Any]:
-    """One tiny real AI call per key (first working model). Status codes / model names only."""
-    out: Dict[str, Any] = {"provider": ai_provider() or "none", "keys": []}
-    for n, key in enumerate(groq_pool(), 1):
-        row: Dict[str, Any] = {"key": f"groq #{n}", "cooling": key_state(key) or "no", "tries": []}
-        try:
-            lst = http_json("https://api.groq.com/openai/v1/models", "GET", None, {"Authorization": f"Bearer {key}"}, timeout=5)
-            row["models_listed"] = sorted(str(m.get("id")) for m in (lst.get("data") or []))
-        except Exception as exc:
-            row["models_listed"] = _err_class(exc, key)
-        _GMODELS.pop(key_id(key), None)
-        row["models_picked"] = groq_models(key)
-        for model in row["models_picked"]:
-            t0 = time.monotonic()
-            body = groq_body(model, [{"role": "system", "content": "Reply ONLY with JSON {\"ok\":true}."},
-                                     {"role": "user", "content": "ping"}], 20)
-            if not json_mode:
-                body.pop("response_format", None)
+def _probe_provider(p: str, json_mode: bool, all_models: bool) -> List[Dict[str, Any]]:
+    out = []
+    for n, key in enumerate(provider_keys(p)[:3], 1):
+        row: Dict[str, Any] = {"key": f"{p} #{n}", "p": p, "cooling": key_state(key) or "no", "tries": []}
+        if p == "groq":
             try:
-                res = http_json("https://api.groq.com/openai/v1/chat/completions", "POST", body,
-                                {"Authorization": f"Bearer {key}"}, timeout=8)
-                txt = strip_think(res["choices"][0]["message"].get("content"))[:40]
+                lst = http_json(PROVIDERS[p]["base"] + "/models", "GET", None, _auth(p, key), timeout=5)
+                row["models_listed"] = sorted(str(m.get("id")) for m in (lst.get("data") or []))
+            except Exception as exc:
+                row["models_listed"] = _err_class(exc, key)
+            _GMODELS.pop(key_id(key), None)
+            row["models_picked"] = provider_models(p, key)
+        else:
+            _PMODELS.pop(f"{p}:{key_id(key)}", None)
+            row["models_picked"] = provider_models(p, key, fresh=True)
+        for model in row["models_picked"][:4 if all_models else 3]:
+            t0 = time.monotonic()
+            try:
+                r = provider_call(p, key, model, [{"role": "system", "content": "Reply ONLY with JSON {\"ok\":true}."},
+                                                  {"role": "user", "content": "ping"}], 20, 8, True, json_mode)
+                txt = r["text"][:40]
                 row["tries"].append({"model": model, "ok": bool(txt), "ms": int((time.monotonic() - t0) * 1000), "reply": txt})
                 if txt and not all_models:
                     break
             except Exception as exc:
                 row["tries"].append({"model": model, "ok": False, "ms": int((time.monotonic() - t0) * 1000),
                                      "error": _err_class(exc, key)})
-        out["keys"].append(row)
-    for n, key in enumerate(openai_pool(), 1):
-        out["keys"].append({"key": f"openai #{n}", "cooling": key_state(key) or "no"})
+                if ai_err_class(exc) in {"invalid", "limit"}:
+                    break
+        out.append(row)
     return out
 
+
+def ai_probe(json_mode: bool = True, all_models: bool = False) -> Dict[str, Any]:
+    """One tiny real AI call per key of every provider (in parallel). Status codes / model names only."""
+    out: Dict[str, Any] = {"provider": ai_provider() or "none", "chain": ai_chain(), "keys": []}
+    provs = [p for p in router_cfg()["order"] if provider_keys(p)]
+    import concurrent.futures as _cf
+    with _cf.ThreadPoolExecutor(max_workers=max(1, len(provs))) as ex:
+        futs = {p: ex.submit(_probe_provider, p, json_mode, all_models) for p in provs}
+        for p in provs:
+            try:
+                out["keys"].extend(futs[p].result(timeout=20))
+            except Exception as exc:
+                out["keys"].append({"key": f"{p} #1", "p": p, "tries": [{"model": "?", "ok": False, "ms": 0,
+                                                                        "error": _err_class(exc)}]})
+    return out
 
 
 def naming_diag(ids: str = "") -> Dict[str, Any]:
@@ -5930,7 +6742,7 @@ def ai_understand(text: str, user_id: Optional[int], use_cache: bool = True) -> 
                 return dict(c["d"]), "cache"
         except Exception:
             pass
-    pool = groq_pool() + openai_pool()
+    pool = all_ai_keys()
     if pool and all(key_cooling(k) for k in pool):
         return None, "keys_cooling"           # every key is resting after a limit/error: answer locally, at once
     today = ist_day()
