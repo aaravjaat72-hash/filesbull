@@ -73,6 +73,10 @@ create table if not exists public.delivery_logs (
 
 alter table public.channels enable row level security;
 alter table public.books enable row level security;
+alter table public.required_channels enable row level security;
+alter table public.admins enable row level security;
+alter table public.bot_settings enable row level security;
+alter table public.delivery_logs enable row level security;
 
 -- The server uses the Supabase service-role key and does not expose these tables directly to users.
 -- Never put SUPABASE_SERVICE_ROLE_KEY in browser/client code.

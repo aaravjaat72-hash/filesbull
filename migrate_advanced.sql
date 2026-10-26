@@ -35,3 +35,11 @@ create table if not exists public.delivery_logs (
   book_title text,
   created_at timestamptz not null default now()
 );
+
+-- Lock every table for the public anon key; the bot uses the service-role key, which bypasses RLS.
+alter table public.channels enable row level security;
+alter table public.books enable row level security;
+alter table public.required_channels enable row level security;
+alter table public.admins enable row level security;
+alter table public.bot_settings enable row level security;
+alter table public.delivery_logs enable row level security;
