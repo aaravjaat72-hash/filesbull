@@ -585,7 +585,12 @@ def status_text(user_id: Optional[int]) -> str:
     for r in reqs:
         lines.append(f"• {r.get('title')}: {chat_check(r['chat_id'])}, link {'✅' if (r.get('invite_link') or r.get('username')) else '❌'}")
     try:
-        lines.append(f"\nSource channels: {len(source_channels())}")
+        srcs = source_channels()
+        lines.append(f"\nSource channels: {len(srcs)}")
+        for r in srcs:
+            lines.append(f"• {r.get('title')}: {chat_check(r['chat_id'])}")
+        if any(not chat_check(r["chat_id"]).startswith("✅") for r in srcs):
+            lines.append("⚠️ Jahan bot admin nahi hai, us channel ki nayi files index nahi hongi.")
     except Exception as exc:
         lines.append(f"\nSource channels: error {str(exc)[:80]}")
     lines.append(f"Backup: {'ON' if get_setting('backup_chat_id') else 'OFF'} | Log chat: {'ON' if get_setting('log_chat_id') else 'OFF'}")
@@ -1438,13 +1443,17 @@ def diagnostics() -> Dict[str, Any]:
             except Exception:
                 ok = False
             d["required_channels"].append({"title": r.get("title"), "bot_is_admin": ok,
-                                           "has_join_link": bool(r.get("invite_link") or r.get("username"))})
+                                           "has_join_link": bool(r.get("invite_link") or r.get("username")),
+                                           "added_at": r.get("created_at")})
     except Exception as exc:
         d["required_channels"] = "error: " + str(exc)[:60]
     try:
         srcs = source_channels()
         d["source_channels"] = len(srcs)
-        d["source_channels_bot_admin"] = sum(1 for r in srcs if chat_check(r["chat_id"]).startswith("✅"))
+        not_admin = [r.get("title") for r in srcs if not chat_check(r["chat_id"]).startswith("✅")]
+        d["source_channels_bot_admin"] = len(srcs) - len(not_admin)
+        # New posts are only delivered to the bot (and indexed) where it is admin.
+        d["source_channels_bot_not_admin"] = not_admin
     except Exception as exc:
         d["source_channels"] = "error: " + str(exc)[:60]
     d["backup_channel_set"] = bool(get_setting("backup_chat_id"))
