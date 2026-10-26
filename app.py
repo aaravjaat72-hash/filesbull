@@ -3543,6 +3543,7 @@ def deliver_renamed(chat_id: int, row: Dict[str, Any], caption: str) -> bool:
     try:
         res = telegram_upload("sendDocument", {"chat_id": chat_id, "caption": caption}, "document", name, data)
         doc = ((res or {}).get("result") or {}).get("document") or {}
+        _REQ["_dl"] = {"how": "renamed_upload", "file_name": doc.get("file_name"), "message_id": ((res or {}).get("result") or {}).get("message_id")}
         if not (res or {}).get("ok", True) or not ((res or {}).get("result") or {}).get("message_id"):
             return False
         if doc.get("file_id"):
@@ -7147,6 +7148,33 @@ def aidiag() -> Any:
             res["admin"] = out_a
         except Exception as exc:
             res["admin"] = {"error": _err_class(exc)}
+    if request.args.get("dl"):      # live check of delivery under the clean name: send to the Log Chat, read the name, delete it
+        try:
+            target = get_setting("log_chat_id")
+            rows_d = supabase("books", "GET", query="?select=*&status=eq.indexed&order=id.desc&limit=500")
+            arg = request.args.get("dl", "")
+            if arg.isdigit():
+                rows_d = [r for r in rows_d if str(r.get("id")) == arg]
+            else:
+                rows_d = [r for r in rows_d if can_rename_file(r) and not renamed_copy(r) and str(r.get("file_name") or "") !=
+                          safe_filename(str(r.get("title") or ""), str(r.get("file_name") or ""))]
+            if not target or not rows_d:
+                res["deliver"] = {"error": "no log chat" if not target else "no candidate"}
+            else:
+                r_d = rows_d[0]
+                _REQ.pop("_dl", None)
+                ok_d = deliver_renamed(int(target), r_d, delivery_caption(r_d))
+                info = dict(_REQ.get("_dl") or {}, ok=ok_d, title=r_d.get("title"), original_file_name=r_d.get("file_name"),
+                            size=human_size(r_d.get("file_size")), caption=delivery_caption(r_d), cached=bool(renamed_copy(r_d)))
+                if info.get("message_id") and request.args.get("keep") != "1":
+                    try:
+                        telegram("deleteMessage", {"chat_id": int(target), "message_id": int(info["message_id"])})
+                        info["test_message_deleted"] = True
+                    except Exception:
+                        info["test_message_deleted"] = False
+                res["deliver"] = info
+        except Exception as exc:
+            res["deliver"] = {"error": _err_class(exc)}
     if request.args.get("u"):
         try:
             txt_u = request.args.get("u", "")[:200]
