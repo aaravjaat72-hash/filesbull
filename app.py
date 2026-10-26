@@ -185,7 +185,9 @@ def register_channel(channel: Dict[str, Any]) -> Dict[str, Any]:
 def forwarded_source(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     origin = message.get("forward_origin") or {}
     if origin.get("type") == "channel":
-        return origin.get("chat") or {}
+        source = dict(origin.get("chat") or {})
+        source["message_id"] = origin.get("message_id")
+        return source
     return message.get("forward_from_chat") or None
 
 
@@ -220,7 +222,13 @@ def handle_private_message(message: Dict[str, Any]) -> None:
         try:
             register_channel(source)
             if info:
-                upsert_item(build_metadata(message, source))
+                record = build_metadata(message, source)
+                # A forwarded message has a new message_id in the bot chat. Delivery
+                # must use the original message_id from the source channel.
+                if source.get("message_id"):
+                    record["source_message_id"] = source["message_id"]
+                    record["source_link"] = message_link(source, source["message_id"])
+                upsert_item(record)
                 send_text(chat_id, f"Channel auto-add aur file index ho gayi: {source.get('title', 'source')}\nFile: {clean_text(info.get('file_name', 'file'))}")
             else:
                 send_text(chat_id, f"Channel auto-add ho gaya: {source.get('title', 'source')}\nAb is channel ki nayi files index hongi.")
