@@ -704,11 +704,28 @@ def setup_status() -> Dict[str, Any]:
         except Exception as exc:
             status["webhook"] = {"error": type(exc).__name__ + ": " + str(exc)[:120].replace(BOT_TOKEN, "***")}
     if SUPABASE_URL and SUPABASE_KEY:
-        try:
-            supabase("books", "GET", query="?select=id&limit=1")
-            status["database"] = "ok"
-        except Exception as exc:
-            status["database"] = type(exc).__name__ + ": " + str(exc)[:120]
+        # One cheap read per table/column the code uses; "missing" means schema.sql /
+        # migrate_advanced.sql has not been run in the Supabase SQL Editor yet.
+        checks = {
+            "books": "id,content_text",
+            "books.backup_columns": "backup_chat_id,backup_message_id",
+            "channels": "chat_id",
+            "required_channels": "chat_id",
+            "admins": "user_id",
+            "bot_settings": "key",
+            "delivery_logs": "id",
+        }
+        tables: Dict[str, str] = {}
+        for name, cols in checks.items():
+            try:
+                supabase(name.split(".")[0], "GET", query=f"?select={cols}&limit=1")
+                tables[name] = "ok"
+            except Exception as exc:
+                tables[name] = "missing/error: " + str(exc)[:80]
+        status["database"] = "ok" if all(v == "ok" for v in tables.values()) else "incomplete"
+        status["tables"] = tables
+    else:
+        status["database"] = "not configured (set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)"
     return status
 
 
