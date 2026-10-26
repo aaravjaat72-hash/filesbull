@@ -349,24 +349,46 @@ def send_text(chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = 
     telegram("sendMessage", payload)
 
 
+USER_MENU = [
+    {"command": "start", "description": "Bot start karein"},
+    {"command": "search", "description": "Book/file search karein"},
+    {"command": "help", "description": "Help aur instructions"},
+]
+ADMIN_MENU = USER_MENU + [
+    {"command": "addchannel", "description": "Admin: channel add karein"},
+    {"command": "channels", "description": "Admin: active channels"},
+    {"command": "removechannel", "description": "Admin: channel disable karein"},
+    {"command": "stats", "description": "Admin: indexed files count"},
+    {"command": "addadmin", "description": "Owner: sub-admin add karein"},
+    {"command": "removeadmin", "description": "Owner: sub-admin remove karein"},
+    {"command": "requirechannel", "description": "Admin: join channel set karein"},
+    {"command": "requiredchannels", "description": "Admin: join channels list"},
+    {"command": "setbackupchannel", "description": "Admin: backup chat set karein"},
+    {"command": "setlogchat", "description": "Admin: audit log chat set karein"},
+    {"command": "report", "description": "Admin: usage report"},
+    {"command": "rename", "description": "Admin: indexed file rename"},
+]
+
+
+def set_admin_menu(user_id: int) -> None:
+    try:
+        telegram("setMyCommands", {"commands": ADMIN_MENU, "scope": {"type": "chat", "chat_id": user_id}})
+    except Exception:
+        # Fails with "chat not found" until that admin has pressed Start once.
+        log_error(f"admin menu for {user_id}")
+
+
 def set_command_menu() -> None:
-    telegram("setMyCommands", {"commands": [
-        {"command": "start", "description": "Bot start karein"},
-        {"command": "search", "description": "Book/file search karein"},
-        {"command": "help", "description": "Help aur instructions"},
-        {"command": "addchannel", "description": "Admin: channel add karein"},
-        {"command": "channels", "description": "Admin: active channels"},
-        {"command": "removechannel", "description": "Admin: channel disable karein"},
-        {"command": "stats", "description": "Admin: indexed files count"},
-        {"command": "addadmin", "description": "Owner: sub-admin add karein"},
-        {"command": "removeadmin", "description": "Owner: sub-admin remove karein"},
-        {"command": "requirechannel", "description": "Admin: join channel set karein"},
-        {"command": "requiredchannels", "description": "Admin: join channels list"},
-        {"command": "setbackupchannel", "description": "Admin: backup chat set karein"},
-        {"command": "setlogchat", "description": "Admin: audit log chat set karein"},
-        {"command": "report", "description": "Admin: usage report"},
-        {"command": "rename", "description": "Admin: indexed file rename"},
-    ]})
+    # Normal users only see their own commands; admin commands are shown to admins only
+    # (as /help promises: "Admin commands menu se alag dikhengi").
+    telegram("setMyCommands", {"commands": USER_MENU})
+    admin_ids = set(ADMIN_USER_IDS)
+    try:
+        admin_ids.update(int(r["user_id"]) for r in supabase("admins", "GET", query="?select=user_id&limit=100"))
+    except Exception:
+        log_error("load sub-admins for menu")
+    for user_id in admin_ids:
+        set_admin_menu(user_id)
 
 
 def register_channel(channel: Dict[str, Any]) -> Dict[str, Any]:
@@ -539,6 +561,7 @@ def handle_admin_command(message: Dict[str, Any]) -> None:
             send_text(chat_id, "Use: /addadmin TELEGRAM_NUMERIC_ID")
             return
         supabase("admins", "POST", {"user_id": int(target), "role": "subadmin"}, "?on_conflict=user_id")
+        set_admin_menu(int(target))
         send_text(chat_id, "Sub-admin add ho gaya.")
         return
     if text.startswith("/removeadmin"):
@@ -548,6 +571,10 @@ def handle_admin_command(message: Dict[str, Any]) -> None:
         target = text[len("/removeadmin"):].strip()
         if target.isdigit():
             supabase("admins", "DELETE", query=f"?user_id=eq.{target}")
+            try:
+                telegram("deleteMyCommands", {"scope": {"type": "chat", "chat_id": int(target)}})
+            except Exception:
+                log_error("remove admin menu")
             send_text(chat_id, "Sub-admin remove ho gaya.")
         return
     if text.startswith("/requirechannel"):
