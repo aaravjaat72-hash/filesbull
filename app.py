@@ -1,7 +1,10 @@
+import hashlib
+import hmac
 import json
 import io
 import os
 import re
+import traceback
 import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional
@@ -21,6 +24,20 @@ ADMIN_USER_IDS = {
 }
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+# Telegram sends this value in the X-Telegram-Bot-Api-Secret-Token header on every
+# webhook call, so forged updates (fake "admin" messages) can be rejected.
+# Set WEBHOOK_SECRET in Vercel to choose your own; otherwise it is derived from BOT_TOKEN.
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip() or (
+    hashlib.sha256(f"filesbull-webhook:{BOT_TOKEN}".encode("utf-8")).hexdigest() if BOT_TOKEN else ""
+)
+
+
+def log_error(where: str) -> None:
+    # Printed tracebacks show up in Vercel -> Project -> Logs. Never print the token.
+    text = traceback.format_exc()
+    if BOT_TOKEN:
+        text = text.replace(BOT_TOKEN, "***")
+    print(f"[filesbull] error in {where}:\n{text}", flush=True)
 
 
 def http_json(url: str, method: str = "GET", payload: Optional[Dict[str, Any]] = None,
@@ -426,6 +443,7 @@ def handle_private_message(message: Dict[str, Any]) -> None:
     try:
         results = search_books(query)
     except Exception:
+        log_error("search")
         send_text(chat_id, "Database abhi available nahi hai. Admin se setup check karne ko kahen.")
         return
     if not results:
@@ -574,7 +592,7 @@ def handle_channel_post(message: Dict[str, Any]) -> None:
                 supabase("books", "PATCH", {"backup_chat_id": get_setting("backup_chat_id"), "backup_message_id": backup.get("message_id")}, f"?telegram_file_unique_id=eq.{urllib.parse.quote(record['telegram_file_unique_id'])}")
             audit_log(f"File indexed\nSource: {channel.get('title')}\nFile: {record.get('title')}")
     except Exception:
-        return
+        log_error("channel_post")
 
 
 def handle_group_file(message: Dict[str, Any]) -> None:
@@ -587,7 +605,7 @@ def handle_group_file(message: Dict[str, Any]) -> None:
         register_channel(chat)
         upsert_item(build_metadata(message, chat))
     except Exception:
-        return
+        log_error("group_file")
 
 
 def handle_callback(query: Dict[str, Any]) -> None:
@@ -627,22 +645,70 @@ def handle_callback(query: Dict[str, Any]) -> None:
         deliver_result(chat_id, rows[0])
 
 
+def webhook_url() -> str:
+    # Always register the production domain over https, even if a preview URL was opened.
+    host = os.environ.get("PUBLIC_URL") or os.environ.get("VERCEL_PROJECT_PRODUCTION_URL") or request.host
+    host = host.replace("https://", "").replace("http://", "").strip("/")
+    return f"https://{host}/api/webhook"
+
+
 @app.get("/")
 def health() -> Any:
     # Visiting the deployed URL once is enough to register the webhook.
     # This keeps first-time setup simple for non-technical admins.
+    registered = None
     if BOT_TOKEN:
         try:
-            public_url = request.url_root.rstrip("/") + "/api/webhook"
-            telegram("setWebhook", {"url": public_url})
+            result = telegram("setWebhook", {"url": webhook_url(), "secret_token": WEBHOOK_SECRET,
+                                             "allowed_updates": ["message", "channel_post", "callback_query"]})
+            registered = bool(result.get("ok"))
             set_command_menu()
         except Exception:
-            pass
-    return jsonify({"ok": True, "service": "telegram-book-bot"})
+            log_error("setup")
+    status = setup_status()
+    status["webhook_registered"] = registered
+    return jsonify({"ok": True, "service": "telegram-book-bot", "status": status})
+
+
+def setup_status() -> Dict[str, Any]:
+    """Names-only setup check, so a missing Vercel variable or a broken webhook is
+    visible without opening logs. Never returns secret values."""
+    status: Dict[str, Any] = {
+        "env": {
+            "BOT_TOKEN": bool(BOT_TOKEN),
+            "SUPABASE_URL": bool(SUPABASE_URL),
+            "SUPABASE_SERVICE_ROLE_KEY": bool(SUPABASE_KEY),
+            "ADMIN_USER_IDS": bool(ADMIN_USER_IDS),
+            "OPENAI_API_KEY": bool(OPENAI_API_KEY),
+        }
+    }
+    if BOT_TOKEN:
+        try:
+            info = telegram("getWebhookInfo", {}).get("result", {})
+            status["webhook"] = {
+                "url": info.get("url"),
+                "pending_updates": info.get("pending_update_count"),
+                "last_error": info.get("last_error_message"),
+                "last_error_date": info.get("last_error_date"),
+            }
+        except Exception as exc:
+            status["webhook"] = {"error": type(exc).__name__ + ": " + str(exc)[:120].replace(BOT_TOKEN, "***")}
+    if SUPABASE_URL and SUPABASE_KEY:
+        try:
+            supabase("books", "GET", query="?select=id&limit=1")
+            status["database"] = "ok"
+        except Exception as exc:
+            status["database"] = type(exc).__name__ + ": " + str(exc)[:120]
+    return status
 
 
 @app.post("/api/webhook")
 def webhook() -> Any:
+    received = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not WEBHOOK_SECRET or not hmac.compare_digest(received, WEBHOOK_SECRET):
+        # Not from Telegram, or the webhook was set without the secret:
+        # open the site's home URL once and it re-registers itself.
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
     update = request.get_json(silent=True) or {}
     try:
         if update.get("callback_query"):
@@ -660,8 +726,9 @@ def webhook() -> Any:
             else:
                 handle_private_message(message)
     except Exception:
-        # Always return 200 so Telegram does not retry a malformed/duplicate update forever.
-        pass
+        # Always return 200 so Telegram does not retry a malformed/duplicate update forever,
+        # but log the traceback so the error is visible in Vercel logs.
+        log_error("webhook")
     return jsonify({"ok": True})
 
 
