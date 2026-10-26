@@ -182,7 +182,7 @@ async def make_bot_admin(client, ent, bot_username):
 
 def invite_hash(link):
     import re
-    m = re.search(r"(?:t\.me|telegram\.me)/(?:\+|joinchat/)([A-Za-z0-9_\-]{8,})", str(link or ""))
+    m = re.search(r"(?:t\.me|telegram\.me)/(?:\+|joinchat/)([A-Za-z0-9_\-]{5,})", str(link or ""))
     return m.group(1) if m else ""
 
 
@@ -213,6 +213,8 @@ class Run:
         self.seen_u, self.seen_ns = set(), set()
         self.live_first = {}
         self.stop = ""
+        self.inbox, self.inbox_id = None, 0
+        self.inbox_alt = []          # other usable Inbox storage chats [(id, entity)], tried in order if one fails
 
     def fresh(self, files, title=""):
         """Which of these file posts are new: not known to the bot (any status) and not already sent this run."""
@@ -241,18 +243,34 @@ class Run:
         if self.budget <= 0:
             self.stop = self.stop or f"limit {self.job.get('max')} files/run, baaki agli baar"
             raise Stop()
-        try:
-            bid, mode = await send_one(self.client, self.inbox, ent, m, self.tmp, protected or bool(getattr(m, "noforwards", False)))
-        except (errors.FloodWaitError, errors.AuthKeyUnregisteredError, errors.SessionRevokedError,
-                errors.UserDeactivatedError, errors.UserDeactivatedBanError, errors.AuthKeyDuplicatedError,
-                errors.ChatAdminRequiredError, errors.ChatWriteForbiddenError):
-            raise
-        except Exception as e:      # one bad post must not block the channel forever: skip it
-            self.s["errors"][str(cid)] = f"ek file nahi gayi ({type(e).__name__})"
-            print("one file failed:", type(e).__name__)
-            return True
+        while True:
+            try:
+                bid, mode = await send_one(self.client, self.inbox, ent, m, self.tmp, protected or bool(getattr(m, "noforwards", False)))
+                break
+            except (errors.ChatAdminRequiredError, errors.ChatWriteForbiddenError):
+                # this Inbox chat refuses the userbot → the next one in 📥 Inbox storage (Aarav 10:27 PM)
+                self.s["ibad"][str(self.inbox_id)] = "userbot account post nahi kar pa raha (admin banao)"
+                if self.inbox_id in self.s["ibok"]:
+                    self.s["ibok"].remove(self.inbox_id)
+                if not self.inbox_alt:
+                    self.s["fatal"] = "userbot account Inbox storage me post nahi kar pa raha — use wahan ADMIN banao (Post Messages)"
+                    self.stop = "Inbox storage me post nahi ho paya"
+                    raise Stop()
+                self.inbox_id, self.inbox = self.inbox_alt.pop(0)
+                print("Inbox chat refused a post: using the next one")
+            except (errors.FloodWaitError, errors.AuthKeyUnregisteredError, errors.SessionRevokedError,
+                    errors.UserDeactivatedError, errors.UserDeactivatedBanError, errors.AuthKeyDuplicatedError):
+                raise
+            except Stop:
+                raise
+            except Exception as e:      # one bad post must not block the channel forever: skip it
+                self.s["errors"][str(cid)] = f"ek file nahi gayi ({type(e).__name__})"
+                print("one file failed:", type(e).__name__)
+                return True
         self.budget -= 1
         self.s["sent"] += 1
+        if self.inbox_id not in self.s["ibok"]:
+            self.s["ibok"].append(self.inbox_id)
         if lane == "bf":
             self.s["bf_sent"] += 1
         print(f"sent 1 file to the Inbox ({mode}, {lane})")
@@ -341,7 +359,8 @@ async def main_async(job):
     from telethon.sessions import StringSession
     bot = Bot(job)
     summary = {"kind": "final", "last": {}, "errors": {}, "ok_ids": [], "titles": {}, "sent": 0, "checked": 0,
-               "dupes": 0, "dup_items": [], "bf": {}, "bf_sent": 0, "flood": 0}
+               "dupes": 0, "dup_items": [], "bf": {}, "bf_sent": 0, "flood": 0,
+               "ibad": {}, "ibok": [], "ibjoined": []}
     client = TelegramClient(StringSession(job["session"]), int(job["api_id"]), job["api_hash"],
                             device_model=job.get("device") or "Filesbull Userbot", system_version="filesbull",
                             app_version="1.0", lang_code="en", system_lang_code="en", flood_sleep_threshold=0)
@@ -355,7 +374,7 @@ async def main_async(job):
             print("session is not authorized any more (logged out / revoked)")
             return summary
         me = await client.get_me()
-        summary["me"] = {"username": me.username or "", "name": " ".join(x for x in (me.first_name, me.last_name) if x)}
+        summary["me"] = {"username": me.username or "", "name": " ".join(x for x in (me.first_name, me.last_name) if x), "id": int(getattr(me, "id", 0) or 0)}
         PASS_UP = (Stop, errors.FloodWaitError, errors.AuthKeyUnregisteredError, errors.SessionRevokedError,
                    errors.UserDeactivatedError, errors.UserDeactivatedBanError, errors.AuthKeyDuplicatedError,
                    errors.ChatAdminRequiredError, errors.ChatWriteForbiddenError)
@@ -384,13 +403,43 @@ async def main_async(job):
             if setup:
                 res = bot.post("/api/userbot-done", dict({"kind": "setup"}, **setup))
                 inbox_id = int(res.get("inbox") or inbox_id or 0)
-            run.inbox_id = inbox_id
-            run.inbox = ents.get(inbox_id) if inbox_id else None
-            if inbox_id and run.inbox is None:
-                try:
-                    run.inbox = await client.get_entity(inbox_id)
-                except Exception:
-                    run.inbox = None
+            # 📥 Inbox storage may hold several chats (healthy first): the first usable one gets the files
+            cands = [int(x) for x in (job.get("inboxes") or []) if int(x)] or ([inbox_id] if inbox_id else [])
+            if inbox_id and inbox_id not in cands:
+                cands.insert(0, inbox_id)
+            links = dict(job.get("inbox_links") or {})
+            if job.get("inbox_link") and cands:
+                links.setdefault(str(cands[0]), job["inbox_link"])
+            usable = []
+            for cid in cands[:5]:
+                ent = ents.get(cid)
+                if ent is None:
+                    try:
+                        ent = await client.get_entity(cid)
+                    except Exception:
+                        ent = None
+                if ent is None and links.get(str(cid)):
+                    try:                                   # the bot's invite link to the chat the owner added
+                        ent = await join_one(client, "", links[str(cid)])
+                        if utils.get_peer_id(ent) != cid:
+                            ent = None
+                        else:
+                            ents[cid] = ent
+                            summary["ibjoined"].append(cid)
+                            print("joined an Inbox storage chat")
+                    except errors.FloodWaitError:
+                        raise
+                    except Exception as e:
+                        ent = None
+                        print("Inbox chat join failed:", type(e).__name__)
+                if ent is None:
+                    summary["ibad"][str(cid)] = "userbot account is chat me nahi (add karo)"
+                else:
+                    usable.append((cid, ent))
+            inbox_id = cands[0] if cands else 0
+            if usable:
+                run.inbox_id, run.inbox = usable[0]
+                run.inbox_alt = usable[1:]
             # 2) join new source channels (max 3 per run)
             want = {int(s["id"]): s for s in job["sources"]}
             joins = int(job.get("joins") or 3)
@@ -427,7 +476,7 @@ async def main_async(job):
                 print("no Inbox channel: nothing is forwarded")
                 return summary
             if run.inbox is None:
-                summary["fatal"] = "aapka account Inbox channel me nahi hai (ya post ka haq nahi)"
+                summary["fatal"] = "userbot account ko Inbox storage chat me add karo (channel ho to ADMIN, post on)"
                 return summary
             # 3) live posts first (all channels), then history with what is left of the shared cap
             order = []
@@ -480,7 +529,7 @@ async def main_async(job):
             summary["fatal"] = "revoked"
             print("session revoked:", type(e).__name__)
         except (errors.ChatAdminRequiredError, errors.ChatWriteForbiddenError):
-            summary["fatal"] = "aapka account Inbox channel me post nahi kar sakta (admin banao)"
+            summary["fatal"] = "userbot account Inbox storage me post nahi kar pa raha — use wahan ADMIN banao (Post Messages)"
         summary["stop"] = run.stop
         return summary
     finally:
@@ -547,7 +596,8 @@ def main():
                "paused": "userbot: paused by the owner — nothing to do",
                "missing_secrets": "userbot: TG_API_ID / TG_API_HASH missing in Vercel — nothing to do",
                "no_backup": "userbot: no Backup channel set — nothing to do",
-               "too_soon": "userbot: another run started < 8 min ago — it keeps the chain going"}.get(state, f"userbot: {state}"))
+               "too_soon": "userbot: another run started < 8 min ago — it keeps the chain going",
+               "no_inbox": "userbot: ⏸️ DB group (Inbox) not set by the owner yet — nothing is forwarded"}.get(state, f"userbot: {state}"))
         return
     bot = Bot(job)
     if not job.get("sources") and not job.get("create") and not job.get("invites"):

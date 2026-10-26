@@ -847,16 +847,16 @@ PROMPTS = {
     "rename": ("✏️ Kis file ka naam badalna hai? File ka naam/keyword bhejo (ya ID aur naya naam: 12 Lucent GK Hindi).\n"
                "(/cancel = band)", "lucent"),
     "rename_to": ("✏️ Is file ka naya naam bhejo. (/cancel = band)", "Naya naam"),
-    "ubinbox": ("📥 Userbot Inbox channel set karo:\n"
-                "1️⃣ Telegram me naya PRIVATE channel banao (jaise \"filesbull Userbot Inbox\")\n"
-                "2️⃣ Userbot wale account ko aur bot ko dono ko admin banao (Post Messages on)\n"
-                "3️⃣ Us channel ki koi post yahan FORWARD karo (ya -100... ID bhejo)\n"
-                "(/cancel = band)", "Post forward karo ya -100..."),
-    "ubalert": ("🔔 Inbox alert chat set karo (Log Chat se alag):\n"
-                "1️⃣ Naya private channel/group banao (jaise \"filesbull Inbox Alerts\")\n"
-                "2️⃣ Bot ko wahan admin banao (Post Messages on)\n"
-                "3️⃣ Uski koi post yahan FORWARD karo (ya -100... ID bhejo)\n"
-                "(/cancel = band)", "Post forward karo ya -100..."),
+    "ubinbox": ("📥 Inbox storage me chat add karo (userbot ki raw files yahan aayengi):\n"
+                "1️⃣ Telegram me naya PRIVATE group ya channel banao (jaise \"filesbull Userbot Inbox\")\n"
+                "2️⃣ @filesbull_bot ko wahan ADMIN banao (post/edit/delete), aur userbot wale account ko bhi add karo\n"
+                "3️⃣ Niche 👥 Group chuno / 📢 Channel chuno dabao — ya uski koi post yahan FORWARD karo (ya -100... ID bhejo)\n"
+                "(/cancel = band)", "Group chuno ya post forward karo"),
+    "ubalert": ("🔔 Alert storage me chat add karo (Log Chat se alag, har userbot run ki poori details):\n"
+                "1️⃣ Naya private group/channel banao (jaise \"filesbull Inbox Alerts\")\n"
+                "2️⃣ @filesbull_bot ko wahan ADMIN banao\n"
+                "3️⃣ Niche 👥 Group chuno / 📢 Channel chuno dabao — ya uski koi post yahan FORWARD karo (ya -100... ID bhejo)\n"
+                "(/cancel = band)", "Group chuno ya post forward karo"),
     "ubreview": ("✏️ Is file ka naam aur category bhejo, beech me | lagao.\nJaise: Bihar Police GK Notes | gk\n(/cancel = band)",
                  "Naam | category"),
     "addkey": ("🔑 AI ki API key yahan paste karke bhejo.\n"
@@ -1196,11 +1196,19 @@ def handle_admin_input(message: Dict[str, Any], action: str, extra: Any) -> None
                 clear_pending(user_id)
                 send_text(chat_id, "🔒 Ye sirf owner kar sakta hai.", {"inline_keyboard": [BACK_ROW]})
                 return
-            title = ub_set_chat_input(message, "inbox" if action == "ubinbox" else "alert")
+            kind = "inbox" if action == "ubinbox" else "alert"
+            got = ub_pick_chat(message, kind)
             clear_pending(user_id)
-            send_text(chat_id, (f"✅ 📥 Userbot Inbox set: {title}\nAb userbot ki saari files pehle yahan aayengi, bot unhe settle karke Backup me daalega."
-                                if action == "ubinbox" else f"✅ 🔔 Inbox alert chat set: {title}\nHar run ka hisaab ab yahan aayega (Log Chat alag rahega)."),
-                      {"inline_keyboard": [[{"text": "👤 Userbot", "callback_data": "ad:ub"}], BACK_ROW]})
+            token = set_op(user_id, {"kind": "ubchat", "which": kind, "id": got["id"], "title": got["title"]})
+            label = "📥 Inbox storage" if kind == "inbox" else "🔔 Alert storage"
+            n_old = len(ub_chat_ids(kind))
+            extra_line = ""
+            if kind == "inbox" and got.get("member") is False:
+                extra_line = "\n⚠️ Userbot account yahan nahi hai — bot invite link se use join karwayega; na ho paye to use bhi add karo."
+            send_text(chat_id, f"{label} me add karun?\n→ {got['title']}\n✅ Bot yahan admin hai." + extra_line
+                      + (f"\n(Pehle se {n_old} chat hai{'n' if n_old > 1 else ''} — ye bhi list me judega.)" if n_old else "")
+                      + ("\nUserbot ki files pehle yahan aayengi; bot naam + category deke Backup me settle karega." if kind == "inbox" else
+                         "\nHar userbot run ki poori details yahan aayengi (bot/Backup alerts Log Chat me hi)."), accept_kb(token))
         elif action == "ubreview":
             if not is_owner(user_id):
                 clear_pending(user_id)
@@ -1427,8 +1435,8 @@ def handle_admin_callback(query: Dict[str, Any], data: str, chat_id: int, user_i
 
 # ---- confirm before any remove (Aarav 5:08/5:11 PM: one confirm, ✅ Accept / ❌ Deny)
 
-DESTRUCTIVE_PREFIXES = ("rmreq:", "rmsrc:", "rmadm:", "keyrm:", "fdel:")
-DESTRUCTIVE_CMDS = {"backupoff", "logoff", "ublogout"}
+DESTRUCTIVE_PREFIXES = ("rmreq:", "rmsrc:", "rmadm:", "keyrm:", "fdel:", "ubdx:")
+DESTRUCTIVE_CMDS = {"backupoff", "logoff", "ublogout", "ubdelin", "ubdelal"}
 
 
 def is_destructive(cmd: str) -> bool:
@@ -1460,6 +1468,13 @@ def confirm_view(cmd: str) -> Any:
             name, back = "Log chat", "ad:log"
         elif cmd == "ublogout":
             name, back = "Userbot login (aapke Telegram account ka session)", "ad:ub"
+        elif cmd in ("ubdelin", "ubdelal"):
+            name, back = ("📥 Userbot DB group (Inbox)" if cmd == "ubdelin" else "🔔 Userbot alert group"), "ad:ub"
+        elif cmd.startswith("ubdx:"):
+            _, w, cid = cmd.split(":", 2)
+            kind = "inbox" if w == "in" else "alert"
+            title = next((c["title"] for c in ub_chat_list(kind) if str(c["id"]) == cid), cid)
+            name, back = (f"{'📥 Inbox storage' if kind == 'inbox' else '🔔 Alert storage'} se \"{title}\""), f"ad:ubst:{w}"
     except Exception:
         log_error("confirm_view")
     if cmd.startswith("fdel:"):
@@ -4490,6 +4505,8 @@ def handle_group_file(message: Dict[str, Any]) -> None:
         return
     if not is_admin(message.get("from", {}).get("id")):
         return
+    if str(chat.get("id")) in (str(get_setting(UB_INBOX_KEY) or "x"), str(get_setting(UB_ALERTCHAT_KEY) or "x")):
+        return
     try:
         register_channel(chat)
         index_file(build_metadata(message, chat), chat.get("id"), message.get("message_id"), str(chat.get("title") or "group"))
@@ -4510,15 +4527,16 @@ CALLBACK_PATTERNS = [
     r"ad:fixn:\d+", r"ad:cmdq:[0-9a-f]{4,16}", r"ad:op:[nyspca]:[0-9a-f]{4,16}(:\d+)?",
     r"ad:rn:\d+", r"ad:mkreq:-?\d+", r"ad:keyadd:[a-z]+", r"ad:rtl:[a-z]", r"ad:rtord:[a-z]*", r"ad:rtos:[a-z]*",
     r"ad:rtm:[a-z]", r"ad:rtms:[a-z]:(a|\d+)",
-    r"ad:(y:)?(rmreq:-?\d+|rmsrc:-?\d+|rmadm:\d+|keyrm:[0-9a-f]{4,32}|fdel:\d+|backupoff|logoff|ublogout)",
+    r"ad:(y:)?(rmreq:-?\d+|rmsrc:-?\d+|rmadm:\d+|keyrm:[0-9a-f]{4,32}|fdel:\d+|backupoff|logoff|ublogout|ubdelin|ubdelal|ubdx:[a-z]+:-?\d+)",
     r"ad:(ub|ublogin|ubrun|ubpause|ubbf|ubbfp|ubrv|ubsetin|ubsetal)", r"ad:ubbfs:-?\d+", r"ad:ubrv:\d+", r"ad:ubrf:\d+",
+    r"ad:ubst:[a-z]+", r"ad:ubdl:[a-z]+",
     r"ad:y:(rtl:[a-z]|rtos:[a-z]*|rtms:[a-z]:(a|\d+))",
 ]
 _CB_RE = re.compile("(?:" + ")|(?:".join(CALLBACK_PATTERNS) + ")")
 STALE_ADMIN = "🔄 Ye button purana hai, /admin dobara kholo"
 STALE_USER = "🔄 Ye button purana hai, /start dobara karo"
 CONFIRM_TTL = 3600      # an ✅ Accept older than this (message date) asks to start again
-OWNER_ONLY_CMDS = ("keys", "key", "rt", "bigfix", "addadm", "rmadm:", "y:keyrm:", "y:rmadm:", "y:rt", "ub", "y:ublogout")
+OWNER_ONLY_CMDS = ("keys", "key", "rt", "bigfix", "addadm", "rmadm:", "y:keyrm:", "y:rmadm:", "y:rt", "ub", "y:ublogout", "y:ubdel", "y:ubdx")
 # toast shown at once for buttons whose screen needs a few lookups; quick screens just stop the spinner
 CB_TOASTS = [("ad:status", "⏳ Status check ho raha hai..."), ("ad:keychk", "🔄 Keys check ho rahi hain..."),
              ("ad:aitest", "⏳ AI test ho raha hai..."), ("ad:report", "⏳"), ("ad:users", "⏳"), ("ad:bkold", "💾 Backup chal raha hai..."),
@@ -5895,6 +5913,15 @@ def run_op(query: Dict[str, Any], chat_id: int, user_id: int, op: Dict[str, Any]
     kind = op.get("kind")
     if kind == "ubreview":
         ub_review_apply(query, chat_id, user_id, op)
+        return
+    if kind == "ubchat":
+        clear_op(user_id)
+        if not is_owner(user_id):
+            show(chat_id, "🔒 Ye sirf owner kar sakta hai.", {"inline_keyboard": [BACK_ROW]}, query)
+            return
+        note = ub_apply_chat(str(op.get("which")), int(op["id"]), str(op.get("title") or ""))
+        show(chat_id, *ub_store_view(str(op.get("which")), f"✅ Add ho gaya: {esc(op.get('title'))}" + (f"\n{esc(note)}" if note else "")),
+             query=query, parse_mode="HTML")
         return
     if kind == "rename":
         items = op.get("items") or []
@@ -10058,12 +10085,57 @@ def _int_setting(key: str) -> Optional[int]:
         return None
 
 
+def ub_chat_ids(kind: str) -> List[int]:
+    """Aarav 10:27 PM: several chats each in 📥 Inbox storage / 🔔 Alert storage. Stored comma-separated in the same
+    setting, so the old single id reads as a list of one (migration)."""
+    raw = str(get_setting(UB_INBOX_KEY if kind == "inbox" else UB_ALERTCHAT_KEY) or "")
+    out: List[int] = []
+    for part in raw.replace(";", ",").split(","):
+        part = part.strip()
+        if part and part != "0":
+            try:
+                v = int(part)
+            except ValueError:
+                continue
+            if v not in out:
+                out.append(v)
+    return out
+
+
+def ub_set_chat_ids(kind: str, ids: List[int]) -> None:
+    key = UB_INBOX_KEY if kind == "inbox" else UB_ALERTCHAT_KEY
+    clean: List[int] = []
+    for v in ids:
+        if int(v) not in clean:
+            clean.append(int(v))
+    if clean:
+        set_setting(key, ",".join(str(v) for v in clean))
+    else:
+        ub_del(key)
+
+
+def ub_inboxes() -> List[int]:
+    """Inbox chats, healthy first (bot admin + userbot can post, as last seen), then the rest in the owner's order."""
+    ids = ub_chat_ids("inbox")
+    bad = ((ub_cur_state()[0] or {}).get("ibad") or {}) if ids[1:] else {}
+    return [v for v in ids if str(v) not in bad] + [v for v in ids if str(v) in bad]
+
+
 def ub_inbox() -> Optional[int]:
-    return _int_setting(UB_INBOX_KEY)
+    ids = ub_inboxes()
+    return ids[0] if ids else None
 
 
 def ub_alert_chat() -> Optional[int]:
-    return _int_setting(UB_ALERTCHAT_KEY)
+    ids = ub_chat_ids("alert")
+    return ids[0] if ids else None
+
+
+def ub_is_inbox(cid: Any) -> bool:
+    try:
+        return int(cid) in ub_chat_ids("inbox")
+    except (TypeError, ValueError):
+        return False
 
 
 def ub_cap() -> int:
@@ -10113,22 +10185,29 @@ def inbox_send(lines: List[str]) -> bool:
             cur = (cur + "\n" + ln) if cur else ln
     if cur:
         msgs.append(cur)
-    chat = ub_alert_chat()
+    chats: List[Optional[int]] = list(ub_chat_ids("alert")) or [_int_setting("log_chat_id")]  # none yet → the Log Chat
     ok = True
     for text in msgs[:8]:
-        if not _inbox_send_one(chat, text):
-            ok = False
+        sent = False
+        for chat in chats[:5]:                 # Aarav 10:27 PM: every chat in 🔔 Alert storage gets each alert
+            if _inbox_send_one(chat, text, hold=False):
+                sent = True
+            else:
+                ok = False
+        if not sent:
+            _UB_ALERT_HELD.append(text)
     return ok
 
 
-def _inbox_send_one(chat: Optional[int], text: str) -> bool:
+def _inbox_send_one(chat: Optional[int], text: str, hold: bool = True) -> bool:
     if chat:
         try:
             telegram("sendMessage", {"chat_id": chat, "text": text, "disable_notification": True, "disable_web_page_preview": True})
             return True
         except Exception:
             log_error("inbox alert")
-    _UB_ALERT_HELD.append(text)
+    if hold:
+        _UB_ALERT_HELD.append(text)
     return False
 
 
@@ -10481,7 +10560,7 @@ def ub_settle_now(row_id: int, st: Dict[str, Any]) -> str:
 
 
 # ---- new source channels: the userbot joins them by itself (bot not admin there)
-_INVITE_RE = re.compile(r"(?:t\.me|telegram\.me)/(?:\+|joinchat/)([A-Za-z0-9_\-]{8,})")
+_INVITE_RE = re.compile(r"(?:t\.me|telegram\.me)/(?:\+|joinchat/)([A-Za-z0-9_\-]{5,})")
 
 
 def ub_on_source_added(chat: Dict[str, Any], target: str = "") -> str:
@@ -10566,7 +10645,14 @@ def ub_job_api() -> Any:
         return jsonify({"ok": True, "state": "no_backup"})
     why = str(body.get("why") or "")
     if (why == "chain" or str(claims.get("event_name") or "") == "schedule") and time.time() - float(st.get("run_t") or 0) < UB_MIN_GAP:
-        return jsonify({"ok": True, "state": "too_soon"})       # another run started < 8 min ago; it keeps the chain going
+        return jsonify({"ok": True, "state": "too_soon"})
+    if not ub_inbox():
+        st["err"], st["noinbox_t"] = "", int(time.time())
+        ub_tell_once(st, "noinbox", "👤 Userbot ka DB group set karo: /admin → 👤 Userbot → 📥 Inbox storage → ➕ Add more\n"
+                                    "(Tab tak userbot koi file forward nahi karega — Backup me sirf settle hui files jaati hain.)")
+        ub_save_state(st)
+        flush_request()
+        return jsonify({"ok": True, "state": "no_inbox"})
     srcs = ub_sources()
     ch = st.get("ch") or {}
     run = f"{claims.get('run_id') or ''}.{claims.get('run_attempt') or ''}"
@@ -10575,12 +10661,19 @@ def ub_job_api() -> Any:
     st["run"] = {"id": run, "n": nonce, "t": now, "ev": str(claims.get("event_name") or "")}
     st["run_t"] = now
     st["rn"] = {}
-    mk = st.setdefault("mk", {})
-    create = {}
-    for kind, title, have in (("inbox", UB_INBOX_TITLE, ub_inbox()), ("alert", UB_ALERTS_TITLE, ub_alert_chat())):
-        if not have and now - float(mk.get(kind) or 0) > UB_SETUP_RETRY:
-            create[kind] = title
-            mk[kind] = now
+    create: Dict[str, str] = {}        # Aarav 10:17 PM: he adds the DB group + alert group himself (👤 Userbot screen)
+    chk = st.setdefault("ibchk", {})
+    titles = {str(c["id"]): c["title"] for c in ub_chat_list("inbox", st)}
+    for cid in ub_chat_ids("inbox")[:4]:   # can the userbot post there? (join link / promote) — at most every 6 h per chat
+        if str(cid) in (st.get("ibad") or {}) or now - int(chk.get(str(cid)) or 0) > 6 * 3600:
+            chk[str(cid)] = now
+            try:
+                note = ub_inbox_access(st, cid, titles.get(str(cid), ""))
+            except Exception:
+                log_error("ub inbox access")
+                note = ""
+            if note.startswith("⚠️"):
+                ub_tell_once(st, f"ibacc:{cid}", f"📥 Inbox storage \"{titles.get(str(cid), cid)}\": {note}")
     ub_save_state(st)
     bf_paused = ub_bf_paused()
     sources = []
@@ -10592,11 +10685,12 @@ def ub_job_api() -> Any:
                         "bf": {"cur": int(bf.get("cur") or 0), "done": bool(bf.get("done")),
                                "skip": bool(bf.get("skip")), "on": not bf_paused and not bf.get("skip") and not bf.get("done")}})
     out = {"ok": True, "state": "ready", "session": sess, "api_id": TG_API_ID, "api_hash": TG_API_HASH,
-           "backup": int(backup), "inbox": ub_inbox() or 0, "alert": ub_alert_chat() or 0, "create": create,
+           "backup": int(backup), "inbox": ub_inbox() or 0, "inboxes": ub_inboxes(), "alert": ub_alert_chat() or 0,
+           "alerts": ub_chat_ids("alert"), "inbox_links": st.get("inbox_links") or {}, "create": create,
            "bot": str(bot_info().get("username") or ""), "run": run, "k": ub_run_key(run, nonce), "max": ub_cap(),
            "first_max": UB_FIRST_RUN_MAX, "first_hours": 24, "gap": [2.0, 4.0], "device": UB_DEVICE,
            "joins": UB_JOINS_PER_RUN, "bf_scan": UB_BF_SCAN, "bf_paused": bf_paused,
-           "invites": list(st.get("plinks") or [])[:5], "sources": sources}
+           "invites": list(st.get("plinks") or [])[:5], "inbox_link": (st.get("inbox_links") or {}).get(str(ub_inbox() or 0)) or "", "sources": sources}
     flush_request()
     return jsonify(out)
 
@@ -10793,9 +10887,28 @@ def _ub_done(body: Dict[str, Any], st: Dict[str, Any]) -> Any:
         for cid, title in (body.get("titles") or {}).items():
             ch.setdefault(str(cid), {})["title"] = str(title)[:60]
         if body.get("me"):
-            st["me"] = {"username": str(body["me"].get("username") or "")[:40], "name": str(body["me"].get("name") or "")[:60]}
+            st["me"] = {"username": str(body["me"].get("username") or "")[:40], "name": str(body["me"].get("name") or "")[:60],
+                        "id": int(body["me"].get("id") or 0)}
         if int(body.get("dupes") or 0):
             ub_cnt(st, "dup", int(body["dupes"]))
+        ibad = st.setdefault("ibad", {})        # Inbox chats the userbot could not use this run (next run tries the others first)
+        for cid, why in (body.get("ibad") or {}).items():
+            if ub_is_inbox(cid):
+                if str(cid) not in ibad:
+                    inbox_alert(f"⚠️ Inbox storage {str(((st.get('chats') or {}).get('inbox') or {}).get(str(cid)) or cid)[:40]}: "
+                                f"{ub_scrub(why)[:80]} — agla Inbox chat use kiya")
+                ibad[str(cid)] = ub_scrub(why)[:80]
+                (st.get("ibchk") or {}).pop(str(cid), None)
+        for cid in (body.get("ibok") or []):
+            ibad.pop(str(cid), None)
+        for cid in (body.get("ibjoined") or [])[:4]:      # joined through the invite link → make it admin in a channel now
+            if ub_is_inbox(cid):
+                try:
+                    note = ub_inbox_access(st, int(cid))
+                    if note:
+                        inbox_alert(f"📥 Inbox storage: {note}")
+                except Exception:
+                    log_error("ub inbox promote")
         flood = int(body.get("flood") or 0)
         if flood > UB_BIG_FLOOD and get_setting(UB_CAP_KEY) != str(UB_SLOW_CAP):
             set_setting(UB_CAP_KEY, str(UB_SLOW_CAP))
@@ -10880,10 +10993,22 @@ def ub_settle_api() -> Any:
 
 
 # ---- 👤 Userbot screen (owner only)
+def ub_chat_list(kind: str, st: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """[{id, title}] for 📥 Inbox storage / 🔔 Alert storage, in the owner's order."""
+    st = st if st is not None else ub_state()
+    names = (st.get("chats") or {}).get(kind) or {}
+    first = str(((st.get("setup") or {}).get(kind) or {}).get("title") or "")
+    out = []
+    for i, cid in enumerate(ub_chat_ids(kind)):
+        out.append({"id": cid, "title": str(names.get(str(cid)) or (first if i == 0 and first else cid))[:60]})
+    return out
+
+
 def ub_chat_title(kind: str) -> str:
-    st = ub_state()
-    v = (st.get("setup") or {}).get(kind) or {}
-    return str(v.get("title") or ("set" if (ub_inbox() if kind == "inbox" else ub_alert_chat()) else ""))
+    lst = ub_chat_list(kind)
+    if not lst:
+        return ""
+    return lst[0]["title"] + (f" +{len(lst) - 1}" if len(lst) > 1 else "")
 
 
 def ub_view(note: str = "") -> Any:
@@ -10902,9 +11027,12 @@ def ub_view(note: str = "") -> Any:
         lines.append("⚠️ Vercel me TG_API_ID / TG_API_HASH nahi hain")
     if hs == "error" and st.get("err"):
         lines.append(f"Wajah: {esc(st.get('err'))}")
-    ib, al = ub_inbox(), ub_alert_chat()
-    lines.append(f"📥 Inbox: {esc(ub_chat_title('inbox')) if ib else '❌ set nahi (agle run me userbot khud banayega)'}")
-    lines.append(f"🔔 Alerts: {esc(ub_chat_title('alert')) if al else '❌ set nahi (agle run me userbot khud banayega)'}")
+    ibl, all_ = ub_chat_list("inbox", st), ub_chat_list("alert", st)
+    ib, al = bool(ibl), bool(all_)
+    lines.append("📥 Inbox: " + (esc(", ".join(c["title"] for c in ibl[:4])) + (f" +{len(ibl) - 4}" if len(ibl) > 4 else "") if ibl else "❌ set nahi"))
+    if not ib and hs != "not_logged_in":
+        lines.append("⏸️ Inbox storage me koi chat nahi — userbot abhi kuch forward nahi karega")
+    lines.append("🔔 Alerts: " + (esc(", ".join(c["title"] for c in all_[:4])) + (f" +{len(all_) - 4}" if len(all_) > 4 else "") if all_ else "❌ set nahi (alerts abhi Log Chat me)"))
     cnt = st.get("cnt") or {}
     sc = ub_status_counts()
     lines.append(f"📊 Inbox me: {sc['inbox']} · ❓ review: {sc['review']} · ✅ settled: {int(cnt.get('settled') or 0)} · ♻️ duplicate skip: {int(cnt.get('dup') or 0)}")
@@ -10941,12 +11069,72 @@ def ub_view(note: str = "") -> Any:
         kb.append([{"text": "🔄 Abhi check karo", "callback_data": "ad:ubrun"}])
     kb.append([{"text": "📚 Purani files", "callback_data": "ad:ubbf"},
                {"text": f"❓ Samajh nahi aayi files ({max(0, sc['review'])})", "callback_data": "ad:ubrv"}])
-    kb.append([{"text": "📥 Inbox channel set karo", "callback_data": "ad:ubsetin"},
-               {"text": "🔔 Inbox alert chat set karo", "callback_data": "ad:ubsetal"}])
     if hs != "not_logged_in":
         kb.append([{"text": "▶️ Resume" if hs == "paused" else "⏸️ Pause", "callback_data": "ad:ubpause"},
                    {"text": "🚪 Logout", "callback_data": "ad:ublogout"}])
+    # Aarav 10:17 + 10:27 PM: next to Logout; each opens the list of chats added there, then ➕ Add more / 🗑️ Delete
+    kb.append([{"text": f"📥 Inbox storage ({len(ibl)})", "callback_data": "ad:ubst:in"},
+               {"text": f"🔔 Alert storage ({len(all_)})", "callback_data": "ad:ubst:al"}])
     kb.append(BACK_ROW)
+    return "\n".join(lines), {"inline_keyboard": kb}
+
+
+def ub_chat_health(cid: int, me_id: int, is_inbox: bool) -> str:
+    """'✅' bot admin (and, for an Inbox chat, the userbot can post) / '⚠️ …' what is missing."""
+    bad = []
+    try:
+        b = telegram("getChatMember", {"chat_id": int(cid), "user_id": int(bot_info().get("id") or 0)}).get("result", {}) or {}
+        if b.get("status") not in ("administrator", "creator") or b.get("can_post_messages") is False:
+            bad.append("bot admin nahi")
+    except Exception:
+        bad.append("bot ko chat nahi dikh rahi")
+    if is_inbox and me_id and not bad:
+        try:
+            u = telegram("getChatMember", {"chat_id": int(cid), "user_id": me_id}).get("result", {}) or {}
+            if u.get("status") not in ("creator", "administrator", "member", "restricted"):
+                bad.append("userbot account member nahi")
+        except Exception:
+            bad.append("userbot account member nahi")
+    return "✅" if not bad else "⚠️ " + ", ".join(bad)
+
+
+def ub_store_view(kind: str, note: str = "", delete: bool = False) -> Any:
+    """📥 Inbox storage / 🔔 Alert storage (Aarav 10:27 PM): the chats already added (✅ bot admin / ⚠️ not), then
+    ➕ Add more · 🗑️ Delete (one chat at a time, each with ✅ Accept / ❌ Deny) · ⬅️ Back."""
+    prefetch_settings(UB_SETTINGS)
+    st = ub_state()
+    w = "in" if kind == "inbox" else "al"
+    lst = ub_chat_list(kind, st)
+    me_id = int((st.get("me") or {}).get("id") or 0)
+    head = ("📥 <b>Inbox storage</b> — userbot ki raw files yahan aati hain; bot inhe padhkar naam + category deke Backup me settle karta hai"
+            if kind == "inbox" else "🔔 <b>Alert storage</b> — har userbot run ki poori details (bot/Backup alerts Log Chat me hi)")
+    lines = [head, ""]
+    if note:
+        lines += [note, ""]
+    ibad = st.get("ibad") or {}
+    for i, c in enumerate(lst[:20], 1):
+        hl = ub_chat_health(c["id"], me_id, kind == "inbox") if i <= 8 else ""
+        extra = f" · ⚠️ {esc(ibad[str(c['id'])])}" if kind == "inbox" and str(c["id"]) in ibad else ""
+        first = " · ⭐ abhi yahi use ho raha" if kind == "inbox" and i == 1 and len(lst) > 1 else ""
+        lines.append(f"{i}. {esc(c['title'])} {hl}{extra}{first}".rstrip())
+    if not lst:
+        lines.append("Abhi koi chat nahi." + (" Userbot tab tak kuch forward nahi karega." if kind == "inbox" else " Alerts abhi Log Chat me aate hain."))
+    elif kind == "inbox" and len(lst) > 1:
+        lines += ["", "<i>Files pehli theek chat me jaati hain; wo na chale to agli me. Duplicate check sab chats me.</i>"]
+    elif kind == "alert" and len(lst) > 1:
+        lines += ["", "<i>Har alert sab chats me jaata hai.</i>"]
+    kb: List[List[Dict[str, str]]] = []
+    if delete and lst:
+        lines += ["", "🗑️ Kaunsi hatani hai? Tap karo (har ek pe ✅ Accept / ❌ Deny puchega)."]
+        for c in lst[:20]:
+            kb.append([{"text": f"🗑️ {c['title'][:40]}", "callback_data": f"ad:ubdx:{w}:{c['id']}"}])
+        kb.append([{"text": "⬅️ Back", "callback_data": f"ad:ubst:{w}"}])
+        return "\n".join(lines), {"inline_keyboard": kb}
+    row = [{"text": "➕ Add more" if lst else "➕ Add karo", "callback_data": "ad:ubsetin" if kind == "inbox" else "ad:ubsetal"}]
+    if lst:
+        row.append({"text": "🗑️ Delete", "callback_data": f"ad:ubdl:{w}"})
+    kb.append(row)
+    kb.append([{"text": "⬅️ Back", "callback_data": "ad:ub"}])
     return "\n".join(lines), {"inline_keyboard": kb}
 
 
@@ -11147,10 +11335,38 @@ def handle_ub_callback(query: Dict[str, Any], cmd: str, chat_id: int, user_id: i
         ask_input(chat_id, user_id, "ubreview", bid,
                   prefix=f"📄 {str(r.get('file_name') or '')[:80]} ({human_size(r.get('file_size'))}, {str(r.get('source_chat_title') or '')[:30]})\n"
                          + (f"Caption: {str(r.get('caption') or '')[:150]}\n" if r.get("caption") else "") + "\n")
-    elif cmd == "ubsetin":
-        ask_input(chat_id, user_id, "ubinbox")
-    elif cmd == "ubsetal":
-        ask_input(chat_id, user_id, "ubalert")
+    elif cmd in ("ubsetin", "ubsetal"):
+        action = "ubinbox" if cmd == "ubsetin" else "ubalert"
+        set_pending(user_id, action, None)
+        rid = 71 if cmd == "ubsetin" else 73
+        send_text(chat_id, PROMPTS[action][0], {"keyboard": [[{"text": "👥 Group chuno", "request_chat": {"request_id": rid, "chat_is_channel": False}}],
+                                                              [{"text": "📢 Channel chuno", "request_chat": {"request_id": rid + 1, "chat_is_channel": True}}]],
+                                                 "resize_keyboard": True, "one_time_keyboard": True, "input_field_placeholder": PROMPTS[action][1]})
+    elif cmd.startswith("ubst:") or cmd.startswith("ubdl:"):
+        kind = "inbox" if cmd.endswith(":in") else "alert"
+        show(chat_id, *ub_store_view(kind, delete=cmd.startswith("ubdl:")), query=query, parse_mode="HTML")
+    elif cmd.startswith("ubdx:"):                # only reached after ✅ Accept (is_destructive → one confirm each)
+        _, w, cid = cmd.split(":", 2)
+        kind = "inbox" if w == "in" else "alert"
+        title = next((c["title"] for c in ub_chat_list(kind) if str(c["id"]) == cid), cid)
+        gone = ub_remove_chat(kind, int(cid))
+        left = len(ub_chat_ids(kind))
+        note = (f"🗑️ Hata diya: {esc(title)}" if gone else "Ye chat list me nahi thi.")
+        if gone and not left:
+            note += ("\n⏸️ Inbox storage khali — userbot ab kuch forward nahi karega." if kind == "inbox" else "\nAlerts ab Log Chat me aayenge.")
+        show(chat_id, *ub_store_view(kind, note=note), query=query, parse_mode="HTML")
+    elif cmd in ("ubdelin", "ubdelal"):         # only reached after ✅ Accept (is_destructive → one confirm)
+        kind = "inbox" if cmd == "ubdelin" else "alert"
+        ub_del(UB_INBOX_KEY if kind == "inbox" else UB_ALERTCHAT_KEY)
+        st = ub_state()
+        (st.get("setup") or {}).pop(kind, None)
+        if kind == "inbox":
+            st.pop("inbox_link", None)
+            (st.get("told") or {}).pop("noinbox", None)
+        ub_save_state(st)
+        audit_log(f"🗑️ Userbot {'DB group' if kind == 'inbox' else 'alert group'} hataya · {ist_now()}")
+        show(chat_id, *ub_view("🗑️ DB group hata diya. Naya set hone tak userbot kuch forward nahi karega." if kind == "inbox" else
+                               "🗑️ Alert group hata diya. Alerts ab Log Chat me aayenge."), query=query, parse_mode="HTML")
     elif cmd == "ublogout":                 # only reached after ✅ Accept (is_destructive → one confirm)
         sess = ub_session()
         out = False
@@ -11174,24 +11390,121 @@ def handle_ub_callback(query: Dict[str, Any], cmd: str, chat_id: int, user_id: i
     return True
 
 
-def ub_set_chat_input(message: Dict[str, Any], kind: str) -> str:
-    """Owner answered 📥 Inbox / 🔔 alert prompt: forwarded post or -100 ID. Returns the chat title."""
-    text = (message.get("text") or message.get("caption") or "").strip()
-    chat = resolve_chat(message, text)
+def ub_pick_chat(message: Dict[str, Any], kind: str) -> Dict[str, Any]:
+    """Owner picked the DB group (Inbox) / alert group: forwarded post, -100 ID or the 👥/📢 picker. Checks the bot is
+    admin there (and can post). Returns {id, title, member} — member: True / False / None (unknown yet)."""
+    shared = message.get("chat_shared") or {}
+    text = str(shared.get("chat_id") or "") or (message.get("text") or message.get("caption") or "").strip()
+    try:
+        chat = resolve_chat(message if not shared else None, text)
+    except InputError:
+        raise InputError("Bot is group/channel ko dekh nahi pa raha. Pehle @" + str(bot_info().get("username") or "filesbull_bot")
+                         + " ko wahan ADMIN banao, phir dobara chuno.") from None
     member = ensure_bot_admin(chat)
     if chat.get("type") == "channel" and member.get("status") == "administrator" and member.get("can_post_messages") is False:
         raise InputError(f"Bot \"{chat.get('title', 'channel')}\" me admin hai par \"Post Messages\" permission off hai.")
-    if str(chat["id"]) in (str(get_setting("backup_chat_id") or ""), str(get_setting("log_chat_id") or "")):
-        raise InputError("Ye Backup/Log chat hai — Inbox ke liye alag channel chahiye.")
-    key = UB_INBOX_KEY if kind == "inbox" else UB_ALERTCHAT_KEY
-    set_setting(key, str(chat["id"]))
+    if str(chat["id"]) in (str(get_setting("backup_chat_id") or ""), str(get_setting("log_chat_id") or "")) or \
+            int(chat["id"]) in ub_chat_ids("inbox" if kind == "alert" else "alert"):
+        raise InputError("Ye Backup / Log / dusra userbot group hai — iske liye alag group chahiye.")
+    if int(chat["id"]) in ub_chat_ids(kind):
+        raise InputError(f"\"{chat.get('title') or chat['id']}\" pehle se {'📥 Inbox storage' if kind == 'inbox' else '🔔 Alert storage'} me hai.")
+    ub_member = None
+    me_id = int((ub_state().get("me") or {}).get("id") or 0)
+    if me_id:
+        try:
+            stt = telegram("getChatMember", {"chat_id": chat["id"], "user_id": me_id}).get("result", {}).get("status")
+            ub_member = stt in ("creator", "administrator", "member", "restricted")
+        except Exception:
+            ub_member = False
+    return {"id": int(chat["id"]), "title": str(chat.get("title") or chat["id"])[:60], "member": ub_member, "type": chat.get("type")}
+
+
+def ub_apply_chat(kind: str, cid: int, title: str) -> str:
+    """✅ Accept: ADD the chat to 📥 Inbox storage / 🔔 Alert storage (several allowed). Inbox: when the userbot account
+    is not in it yet it joins by itself through the bot's invite link; in a channel the bot makes it admin so it can
+    post. Returns a note for the owner."""
+    ids = ub_chat_ids(kind)
+    if int(cid) not in ids:
+        ids.append(int(cid))
+    ub_set_chat_ids(kind, ids)
     st = ub_state()
-    st.setdefault("setup", {})[kind] = {"title": str(chat.get("title") or "")[:60], "t": int(time.time()), "by": "owner"}
-    st.setdefault("told", {}).pop(f"setup:{kind}", None)
+    st.setdefault("chats", {}).setdefault(kind, {})[str(int(cid))] = title[:60]
+    if len(ids) == 1:
+        st.setdefault("setup", {})[kind] = {"title": title[:60], "t": int(time.time()), "by": "owner"}
+    note = ""
+    if kind == "inbox":
+        (st.get("told") or {}).pop("noinbox", None)
+        (st.get("ibad") or {}).pop(str(int(cid)), None)
+        note = ub_inbox_access(st, int(cid), title)
     ub_save_state(st)
     if kind == "alert":
-        inbox_alert("🔔 filesbull Inbox alerts yahan aayenge.")
-    return str(chat.get("title") or chat["id"])
+        _inbox_send_one(int(cid), "🔔 filesbull userbot alerts ab yahan aayenge: har run ki poori details.", hold=False)
+    elif get_setting(UB_SESS_KEY) and not ub_paused():
+        ub_dispatch("inbox storage added")
+    audit_log(f"{'📥 Userbot Inbox storage' if kind == 'inbox' else '🔔 Userbot Alert storage'} add: {title[:60]} · {ist_now()}")
+    return note
+
+
+def ub_inbox_access(st: Dict[str, Any], cid: int, title: str = "") -> str:
+    """Make sure the userbot account can post in an Inbox chat: not a member → the bot's invite link (the runner joins);
+    a channel member without post rights → the bot promotes it (needs 'Add admins'). Returns a note ('' = fine)."""
+    me_id = int((st.get("me") or {}).get("id") or 0)
+    links = st.setdefault("inbox_links", {})
+    res: Dict[str, Any] = {"status": "left"}
+    if me_id:                                 # account id unknown until its first run → a link, the runner joins if needed
+        try:
+            res = telegram("getChatMember", {"chat_id": int(cid), "user_id": me_id}).get("result", {}) or {}
+        except Exception:
+            res = {"status": "left"}
+    status = res.get("status")
+    if status == "creator" or (status == "administrator" and res.get("can_post_messages") is not False):
+        links.pop(str(cid), None)
+        return ""
+    ctype = ""
+    try:
+        ctype = str(telegram("getChat", {"chat_id": int(cid)}).get("result", {}).get("type") or "")
+    except Exception:
+        ctype = ""
+    if status in ("member", "restricted", "administrator"):
+        links.pop(str(cid), None)
+        if ctype != "channel":
+            return ""                                 # a group member can post
+        try:
+            telegram("promoteChatMember", {"chat_id": int(cid), "user_id": me_id, "can_post_messages": True,
+                                           "can_edit_messages": True, "can_delete_messages": False})
+            return "👤 Userbot account ko is channel me admin (post) bana diya."
+        except Exception:
+            return "⚠️ Userbot account ko is channel me ADMIN banao (Post Messages on) — tabhi wo files daal payega."
+    link = None
+    try:
+        link = make_join_link({"id": int(cid)})
+    except Exception:
+        link = None
+    if link:
+        links[str(cid)] = link
+        return ("👤 Userbot account abhi yahan nahi hai — agle run me invite link se khud join karega"
+                + (", phir bot use admin banayega." if ctype == "channel" else "."))
+    return "⚠️ Userbot account ko bhi yahan add karo" + (" aur ADMIN banao (post)." if ctype == "channel" else ".")
+
+
+def ub_remove_chat(kind: str, cid: int) -> bool:
+    ids = ub_chat_ids(kind)
+    if int(cid) not in ids:
+        return False
+    ids.remove(int(cid))
+    ub_set_chat_ids(kind, ids)
+    st = ub_state()
+    title = str(((st.get("chats") or {}).get(kind) or {}).pop(str(int(cid)), "") or cid)
+    if not ids:
+        (st.get("setup") or {}).pop(kind, None)
+    if kind == "inbox":
+        (st.get("inbox_links") or {}).pop(str(int(cid)), None)
+        (st.get("ibad") or {}).pop(str(int(cid)), None)
+        if not ids:
+            (st.get("told") or {}).pop("noinbox", None)
+    ub_save_state(st)
+    audit_log(f"🗑️ Userbot {'Inbox storage' if kind == 'inbox' else 'Alert storage'} se hataya: {title[:60]} · {ist_now()}")
+    return True
 
 
 def ub_health_info() -> Dict[str, Any]:
@@ -11217,7 +11530,13 @@ def ub_health_info() -> Dict[str, Any]:
             "last_run": ub_t(lr["t"]) if lr.get("t") else None, "last_saved": lr.get("saved"),
             "today": int(td.get("n") or 0) if td.get("d") == ist_day() else 0,
             "error": (st.get("err") or None) if ub_health() == "error" else None,
-            "inbox": ub_chat_title("inbox") or None, "alert_chat": ub_chat_title("alert") or None,
+            "inbox": (ub_chat_title("inbox") or "set") if ub_inbox() else "not_set",
+            "alert_chat": (ub_chat_title("alert") or "set") if ub_alert_chat() else "not_set (Log Chat pe)",
+            "inbox_chats": [dict(title=c["title"], usable=str(c["id"]) not in (st.get("ibad") or {}),
+                                 **({"problem": str((st.get("ibad") or {})[str(c["id"])])} if str(c["id"]) in (st.get("ibad") or {}) else {}))
+                            for c in ub_chat_list("inbox", st)],
+            "alert_chats": [c["title"] for c in ub_chat_list("alert", st)],
+            "inbox_count": len(ub_chat_ids("inbox")), "alert_count": len(ub_chat_ids("alert")),
             "counts": {"inbox": sc["inbox"], "review": sc["review"], "settled": int(cnt.get("settled") or 0),
                        "dupes_skipped": int(cnt.get("dup") or 0)},
             "cap": ub_cap(), "backfill": {"paused": ub_bf_paused(), "channels": bfo},
@@ -11252,7 +11571,7 @@ def ub_diag() -> Any:
             out["files"] = [{"id": r["id"], "title": r.get("title"), "orig": r.get("file_name"), "status": r.get("status"),
                              "cat": book_category(r, cm), "src": r.get("source_chat_title"), "size": r.get("file_size"),
                              "where": "backup" if str(r.get("backup_chat_id")) == str(get_setting("backup_chat_id")) else
-                                      ("inbox" if str(r.get("backup_chat_id")) == str(ub_inbox()) else "other")} for r in rows]
+                                      ("inbox" if ub_is_inbox(r.get("backup_chat_id")) else "other")} for r in rows]
         except Exception as exc:
             out["files"] = "error: " + type(exc).__name__
     if request.args.get("ping") == "1":
