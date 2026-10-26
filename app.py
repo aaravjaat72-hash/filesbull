@@ -816,14 +816,15 @@ def admin_menu(user_id: Optional[int] = None) -> Dict[str, Any]:
     ] + ([[{"text": "👤 Userbot", "callback_data": "ad:ub"}]] if (user_id is None or is_owner(user_id)) else []) + [
         [{"text": "🩺 Status", "callback_data": "ad:status"}, {"text": "❓ Admin Help", "callback_data": "ad:help"}],
         [{"text": search_mode_label(user_id), "callback_data": "ad:smode"}],
+    ] + ([[{"text": agent_label(), "callback_data": "ad:agent"}]] if (user_id is None or is_owner(user_id)) else []) + [
         [{"text": "🔍 Search Menu", "callback_data": "ad:usermenu"}],
     ]}
 
 
 ADMIN_PANEL_TEXT = ("⚙️ <b>Admin Panel</b>\n\n"
                     "Niche se kaam chuno 👇\n"
-                    "🤖 <i>Bolke bhi kaam karwa sakte ho, jaise: \"polity ka naam politics kr do\", "
-                    "\"sari files backup kro\". Search ke liye book ka naam likho (ya shuru me ? lagao).</i>")
+                    "🤖 <i>AI agent mode: bas likho kya karna hai, jaise: \"polity ka naam politics kr do\", "
+                    "\"userbot pause karo\", \"status batao\". Search ke liye: \"search karo lucent\" / \"lucent ki files do\" (ya shuru me ? lagao).</i>")
 
 # Prompts for buttons that need input. The admin answers with a reply (ForceReply) or just
 # sends the next message within 15 minutes (pending state in bot_settings).
@@ -1324,6 +1325,9 @@ def handle_admin_callback(query: Dict[str, Any], data: str, chat_id: int, user_i
             send_text(chat_id, "Ye sirf owner hata sakta hai.", {"inline_keyboard": [BACK_ROW]})
             return
         show(chat_id, *confirm_view(cmd), query=query)
+        return
+    if cmd == "agent":
+        agent_toggle(query, chat_id, user_id)
         return
     if cmd.startswith("ub") and handle_ub_callback(query, cmd, chat_id, user_id):
         return                 # 👤 Userbot screen / login link / check now / pause / logout (after Accept)
@@ -4250,7 +4254,12 @@ def handle_private_message(message: Dict[str, Any]) -> None:
     if is_private and not command and is_subadmin(user_id):
         # Admin free text: a whitelisted admin action (preview + ✅ Accept) or a search.
         try:
-            routed = admin_text(chat_id, user, query)
+            if not agent_on() and is_owner(user_id) and AGENT_ON_RE.search(query.lower()):
+                set_setting(AGENT_KEY, "on")
+                audit_log(f"🤖 AI agent mode ON · {actor_label(user_id)} · {ist_now()}")
+                send_text(chat_id, "🤖 AI agent mode ON — ab plain msg = AI se baat. Search: \"search karo X\".", admin_menu(user_id))
+                return
+            routed = agent_text(chat_id, user, query) if agent_on() else admin_text(chat_id, user, query)
         except InputError as exc:
             send_text(chat_id, f"❌ Nahi hua: {exc}", {"inline_keyboard": [BACK_ROW]})
             return
@@ -4533,7 +4542,7 @@ CALLBACK_PATTERNS = [
     r"ad:(y:)?(rmreq:-?\d+|rmsrc:-?\d+|rmadm:\d+|keyrm:[0-9a-f]{4,32}|fdel:\d+|backupoff|logoff|ublogout|ubdelin|ubdelal|ubdx:[a-z]+:-?\d+)",
     r"ad:(ub|ublogin|ubrun|ubpause|ubbf|ubbfp|ubrv|ubsetin|ubsetal)", r"ad:ubbfs:-?\d+", r"ad:ubrv:\d+", r"ad:ubrf:\d+",
     r"ad:ubst:[a-z]+", r"ad:ubdl:[a-z]+",
-    r"ad:y:(rtl:[a-z]|rtos:[a-z]*|rtms:[a-z]:(a|\d+))",
+    r"ad:y:(rtl:[a-z]|rtos:[a-z]*|rtms:[a-z]:(a|\d+))", r"ad:agent",
 ]
 _CB_RE = re.compile("(?:" + ")|(?:".join(CALLBACK_PATTERNS) + ")")
 STALE_ADMIN = "🔄 Ye button purana hai, /admin dobara kholo"
@@ -5914,6 +5923,9 @@ def apply_renames(items: List[Any], cats: Optional[Dict[str, str]] = None, budge
 
 def run_op(query: Dict[str, Any], chat_id: int, user_id: int, op: Dict[str, Any]) -> None:
     kind = op.get("kind")
+    if kind == "agent":
+        agent_run_op(query, chat_id, user_id, op)
+        return
     if kind == "ubreview":
         ub_review_apply(query, chat_id, user_id, op)
         return
@@ -6630,6 +6642,7 @@ def setup_status() -> Dict[str, Any]:
         "ai_keys_in_bot": len(db_ai_keys()),
         "ai_naming": "on" if ai_naming_on() else "off",
         "admin_commands": "on",
+        "agent_mode": "on" if agent_on() else "off",
     }
     try:  # how new files got their names: clean + local_text cost 0 tokens, ai = one small call each
         status["named_by"] = named_by_counts()
@@ -7941,6 +7954,21 @@ def aidiag() -> Any:
                              "key_terms": [k for k in u["keywords"] if is_key_term(k)]}
         except Exception as exc:
             res["search"] = {"error": _err_class(exc)}
+    if request.args.get("agent"):  # 🤖 agent mode dry run: route + the AI's tool choice, NOTHING is executed or sent
+        try:
+            txt_g = request.args.get("agent", "")[:300]
+            oid = min(ADMIN_USER_IDS) if ADMIN_USER_IDS else 0
+            q = explicit_search(txt_g)
+            loc = None if q else local_admin_intent(txt_g)
+            out_g: Dict[str, Any] = {"text": txt_g, "search": q, "local": (loc or {}).get("action"), "agent_on": agent_on()}
+            if not q and request.args.get("noai") != "1":
+                g = agent_ask_ai(oid, txt_g)
+                out_g["ai"] = g
+                out_g["provider"] = dict(_AI_LAST)
+                out_g["tool_known"] = bool(g and (g.get("tool") == "none" or g.get("tool") in AGENT_TOOLS))
+            res["agent"] = out_g
+        except Exception as exc:
+            res["agent"] = {"error": _err_class(exc)}
     if request.args.get("a"):      # admin command reading: local rules → AI → merged filters, + matching files in the live DB
         try:
             txt_a = request.args.get("a", "")[:300]
@@ -11782,6 +11810,568 @@ def webhook() -> Any:
 
 
 _BOOT_MS = [int((time.time() - _BOOT_T0) * 1000)]
+
+
+# ================================================================ 🤖 AI AGENT MODE (Aarav 10:35 PM Oct 26)
+# Admin private chat: a plain message is NEVER a file search. Search only when he asks ("search karo X",
+# "X ki files do", "X ki details do", "/search X", "? X"). Everything else = short Hinglish AI chat that can
+# run any admin button/command as a TOOL — every tool calls the SAME code path the button/command uses.
+# Read-only tools run at once; every change shows ONE [✅ Accept] [❌ Deny] (either the button's own confirm
+# screen, or the agent's confirm whose Accept runs the button path). No bulk delete, Inbox copies are never
+# deleted, hide stays recoverable, secrets are never shown and keys are never taken in chat.
+AGENT_KEY = "agent_mode"
+AGENT_MEM_TURNS = 10
+AGENT_MEM_TTL = 3 * 3600
+AGENT_DAILY = int(os.environ.get("AGENT_AI_DAILY", "300") or 300)
+
+# name: k = read (runs at once) | flow (the button's own path asks Accept/Deny or for input) | change (agent asks
+# Accept/Deny first); cb = the button's callback_data (a template with {id}); act = run_admin_action action;
+# fn = a small helper below; own = owner only; d = what it does (for the AI).
+AGENT_TOOLS: Dict[str, Dict[str, Any]] = {
+    "panel": {"k": "read", "cb": "ad:panel", "d": "Admin Panel menu dikhao"},
+    "help": {"k": "read", "cb": "ad:help", "d": "admin help"},
+    "status": {"k": "read", "cb": "ad:status", "d": "🩺 Status / debug (channels, backup, log, AI)"},
+    "report": {"k": "read", "cb": "ad:report", "d": "📊 Report: files/users counts"},
+    "users": {"k": "read", "cb": "ad:users", "d": "👥 Users summary"},
+    "settings": {"k": "read", "fn": "settings", "d": "saari settings ek jagah (agent mode, search mode, AI naming, backup, log, userbot)"},
+    "files": {"k": "read", "act": "list_files", "d": "files ki list; args.text = filter words (subject/type/channel/size/date) e.g. 'polity pdf'"},
+    "categories": {"k": "read", "act": "categories", "d": "categories + counts"},
+    "search": {"k": "read", "fn": "search", "d": "file search; args.query. SIRF tab jab owner ne khud search/dhoondo/files do/details do bola ho"},
+    "file_details": {"k": "read", "fn": "file_details", "d": "ek file ki details + menu; args.find = naam ya id"},
+    "send_file": {"k": "read", "fn": "send_file", "d": "file owner ko bhejo; args.find"},
+    "sources": {"k": "read", "cb": "ad:srclist", "d": "📋 Source channels list"},
+    "join_channels": {"k": "read", "cb": "ad:reqlist", "d": "📋 Join (required) channels list"},
+    "admins": {"k": "read", "cb": "ad:admins", "d": "👮 Admins list"},
+    "backup_view": {"k": "read", "cb": "ad:backup", "d": "💾 Backup channel screen"},
+    "log_view": {"k": "read", "cb": "ad:log", "d": "📝 Log Chat screen"},
+    "log_test": {"k": "read", "cb": "ad:logtest", "d": "Log Chat test message"},
+    "logs": {"k": "read", "act": "logs", "own": True, "d": "last log lines"},
+    "ai_keys": {"k": "read", "cb": "ad:keys", "own": True, "d": "🔑 AI keys status (masked) — keys sirf is screen se judti hain"},
+    "keys_check": {"k": "read", "cb": "ad:keychk", "own": True, "d": "🔄 saari AI keys check"},
+    "ai_test": {"k": "read", "cb": "ad:aitest", "d": "🤖 /aitest — AI chal raha hai?"},
+    "ai_naming_view": {"k": "read", "cb": "ad:ainame", "d": "🤖 AI Naming screen"},
+    "userbot": {"k": "read", "cb": "ad:ub", "own": True, "d": "👤 Userbot status screen"},
+    "userbot_run": {"k": "read", "cb": "ad:ubrun", "own": True, "d": "userbot check abhi chalao (nayi files)"},
+    "inbox_storage": {"k": "read", "cb": "ad:ubst:in", "own": True, "d": "📥 Inbox storage chats list"},
+    "alert_storage": {"k": "read", "cb": "ad:ubst:al", "own": True, "d": "🔔 Alert storage chats list"},
+    "backfill": {"k": "read", "cb": "ad:ubbf", "own": True, "d": "📚 Purani files (history) progress"},
+    "review_files": {"k": "read", "cb": "ad:ubrv", "own": True, "d": "❓ Samajh nahi aayi files list"},
+    # flows: the button's own screen asks Accept/Deny (or asks for the missing input) — exactly one confirm
+    "rename": {"k": "flow", "act": "rename", "d": "file ka naam badlo; args.find, args.to"},
+    "bulk_rename": {"k": "flow", "act": "bulk_rename", "d": "sab naamo me shabd badlo; args.find, args.to"},
+    "move_category": {"k": "flow", "act": "move_category", "d": "file ki category badlo; args.find, args.to"},
+    "hide_file": {"k": "flow", "act": "delete_file", "d": "file chhupao (search/list se hatao, wapas la sakte ho); args.find — ek file"},
+    "add_source": {"k": "flow", "act": "add_channel", "x": {"kind": "source"}, "d": "source channel jodo; args.target (@username / t.me link / -100 id)"},
+    "add_join_channel": {"k": "flow", "act": "add_channel", "x": {"kind": "join"}, "d": "join (required) channel jodo; args.target"},
+    "remove_source": {"k": "flow", "fn": "remove_source", "d": "source channel hatao; args.find = channel naam"},
+    "remove_join_channel": {"k": "flow", "fn": "remove_join", "d": "join channel hatao; args.find"},
+    "remove_admin": {"k": "flow", "fn": "remove_admin", "own": True, "d": "sub-admin hatao; args.find = id ya naam"},
+    "add_admin": {"k": "flow", "cb": "ad:addadm", "own": True, "d": "naya sub-admin jodo (id puchega)"},
+    "backup_set": {"k": "flow", "cb": "ad:setbackup", "d": "Backup channel set karo (channel puchega)"},
+    "backup_off": {"k": "flow", "cb": "ad:backupoff", "d": "Backup channel band karo"},
+    "backup_old": {"k": "flow", "act": "backup_old", "d": "purani files Backup me copy karo"},
+    "log_set": {"k": "flow", "cb": "ad:setlog", "d": "Log Chat set karo (chat puchega)"},
+    "log_off": {"k": "flow", "cb": "ad:logoff", "d": "Log Chat band karo"},
+    "log_backfill": {"k": "flow", "act": "log_backfill", "d": "ab tak ki saari updates Log Chat me bhejo"},
+    "fix_names": {"k": "flow", "act": "fix_names", "d": "AI se purane naam theek karo (preview + Accept)"},
+    "big_names": {"k": "flow", "cb": "ad:bigfix", "own": True, "d": "20 MB se badi files ke naam theek"},
+    "restart": {"k": "flow", "act": "restart", "d": "bot restart"},
+    "ai_naming_on": {"k": "flow", "act": "ai_naming", "x": {"on": True}, "d": "AI naming chalu"},
+    "ai_naming_off": {"k": "flow", "act": "ai_naming", "x": {"on": False}, "d": "AI naming band"},
+    "ai_live": {"k": "flow", "act": "ai_keys", "own": True, "d": "AI provider LIVE banao; args.provider (groq/gemini/mistral/openrouter/nvidia)"},
+    "add_key": {"k": "flow", "cb": "ad:keyadd", "own": True, "d": "nayi AI key jodne ka screen (key chat me kabhi nahi)"},
+    "inbox_add": {"k": "flow", "cb": "ad:ubsetin", "own": True, "d": "📥 Inbox storage me chat jodo (picker)"},
+    "alert_add": {"k": "flow", "cb": "ad:ubsetal", "own": True, "d": "🔔 Alert storage me chat jodo (picker)"},
+    "inbox_remove": {"k": "flow", "fn": "store_remove", "x": {"kind": "inbox"}, "own": True, "d": "Inbox storage list se ek chat hatao (files kabhi delete nahi); args.find"},
+    "alert_remove": {"k": "flow", "fn": "store_remove", "x": {"kind": "alert"}, "own": True, "d": "Alert storage se ek chat hatao; args.find"},
+    "review_name": {"k": "flow", "fn": "review_name", "own": True, "d": "review wali file ka naam + category set karo; args.find"},
+    "userbot_login": {"k": "flow", "cb": "ad:ublogin", "own": True, "d": "userbot login link"},
+    "userbot_logout": {"k": "flow", "cb": "ad:ublogout", "own": True, "d": "userbot logout"},
+    # changes whose button acts at once → the agent asks ✅ Accept / ❌ Deny first, Accept runs the button path
+    "userbot_pause": {"k": "change", "fn": "ub_toggle", "x": {"what": "live", "on": False}, "own": True, "d": "userbot forward roko"},
+    "userbot_resume": {"k": "change", "fn": "ub_toggle", "x": {"what": "live", "on": True}, "own": True, "d": "userbot forward chalu"},
+    "backfill_pause": {"k": "change", "fn": "ub_toggle", "x": {"what": "bf", "on": False}, "own": True, "d": "purani files (history) roko"},
+    "backfill_resume": {"k": "change", "fn": "ub_toggle", "x": {"what": "bf", "on": True}, "own": True, "d": "purani files chalu"},
+    "backfill_skip": {"k": "change", "fn": "bf_skip", "own": True, "d": "ek channel ki purani files skip / wapas; args.find = channel"},
+    "unhide_file": {"k": "change", "fn": "unhide", "d": "chhupi file wapas lao; args.find"},
+    "search_mode_on": {"k": "change", "act": "search_mode", "x": {"on": True}, "d": "Search Mode ON (har msg search)"},
+    "search_mode_off": {"k": "change", "act": "search_mode", "x": {"on": False}, "d": "Search Mode OFF"},
+    "agent_off": {"k": "change", "fn": "agent_off", "own": True, "d": "AI agent mode band (purana tareeka)"},
+    "button": {"k": "flow", "fn": "button", "d": "koi bhi admin button dabao; args.data = callback_data (Accept wale nahi)"},
+}
+# buttons that change something the moment they're tapped (no confirm screen of their own)
+AGENT_DIRECT_CHANGE = ("ad:ubpause", "ad:ubbfp", "ad:ubbfs:", "ad:smode", "ad:agent", "ad:ainame:on", "ad:ainame:off",
+                       "ad:mkreq:", "ad:rtl:", "ad:rtos:", "ad:rtms:")
+AGENT_ON_RE = re.compile(r"\b(?:ai\s*)?agent\s*(?:mode)?\s*(?:on|chalu|start|shuru)\b")
+AGENT_PRONOUN_RE = re.compile(r"\b(usko|usse|use|uska|uski|uske|isko|ise|isse|iska|iski|iske|unko|inko|unka|inka|wo|vo|woh|voh|"
+                              r"wahi|vahi|yahi|same|last|pichli|pichhli|pichla|upar\s+wali|upar\s+wala|it|that|this)\b", re.I)
+SEARCH_VERB = r"(?:search|serch|sarch|find|dhoond\w*|dhund\w*|dhoondh\w*|dhundh\w*|khoj\w*|talash)"
+_DO = r"(?:karo|kro|kr|kar|krdo|kardo|kar\s*do|kr\s*do|krke|kijiye|kijie|do|de|dedo|dena|dijiye)"
+_EXPLICIT_RES = [
+    re.compile(r"^" + SEARCH_VERB + r"\s+(?:" + _DO + r"\s+)?(?:ki|ka|ke|for|:)?\s*(.+)$", re.I),
+    re.compile(r"^(.+?)\s+(?:ko\s+|ki\s+files?\s+|ke\s+liye\s+)?" + SEARCH_VERB + r"(?:\s+" + _DO + r")?(?:\s+(?:do|de|dena|bhai|please|pls))?\s*[.!?]*$", re.I),
+    re.compile(r"^(.+?)\s+(?:ki|ka|ke|wali|vali|wala|vala|wale)\s+(?:sari\s+|saari\s+|sab\s+|sabhi\s+)?(?:files?|pdfs?|books?|"
+               r"details?|detail|jankari|info|file)\s+(?:do|de|dedo|dena|dijiye|dikhao|dikha|dikhado|batao|btao|bta|bata|bhejo|bhej|"
+               r"bhejdo|chahiye|chaiye|chahie|send|lao)\b.*$", re.I),
+    re.compile(r"^(?:details?|jankari|info)\s+(?:do|dikhao|batao|btao|bhejo)\s*:?\s*(.+)$", re.I),
+    re.compile(r"^(?:files?|pdfs?|books?)\s+(?:do|bhejo|dikhao)\s*:?\s*(.+)$", re.I),
+]
+
+
+def agent_on() -> bool:
+    try:
+        return (get_setting(AGENT_KEY) or "on") != "off"
+    except Exception:
+        return True
+
+
+def agent_label() -> str:
+    return "🤖 AI agent mode: ON" if agent_on() else "🤖 AI agent mode: OFF"
+
+
+def explicit_search(text: str) -> Optional[str]:
+    """The search words when the admin clearly asked for a search / file lookup, else None (= AI chat)."""
+    raw = _strip_q(text)
+    low = raw.lower()
+    for p in SEARCH_PREFIXES:
+        if low.startswith(p) and raw[len(p):].strip():
+            rest = re.sub(r"^(?:" + _DO + r")\b\s*(?:ki|ka|ke|for|:)?\s*", "", raw[len(p):].strip(), flags=re.I).strip()
+            return rest or None
+    for rx in _EXPLICIT_RES:
+        m = rx.match(raw)
+        if m:
+            q = _strip_q(re.sub(r"^(?:mujhe|muje|bhai|please|pls|zara|jara)\s+", "", m.group(1), flags=re.I))
+            q = re.sub(r"\s+(?:ko|ki|ka|ke|wali|vali|file|files|pdf)$", "", q, flags=re.I).strip()
+            if q and q.lower() not in {"karo", "kro", "kr", "file", "files", "kuch", "koi", "ye", "yeh", "wo", "vo"}:
+                return q
+    return None
+
+
+def asks_search(text: str) -> bool:
+    return bool(re.search(r"\b(?:" + SEARCH_VERB + r"|details?|jankari|files?|pdfs?|books?|bhej\w*)\b", text or "", re.I))
+
+
+# ---- short chat memory (last ~10 turns) so "usko hata do" works
+def agent_mem(user_id: int) -> List[Dict[str, Any]]:
+    try:
+        raw = get_setting(f"agmem:{user_id}")
+        data = json.loads(raw) if raw else {}
+    except Exception:
+        return []
+    if not isinstance(data, dict) or time.time() - float(data.get("ts") or 0) > AGENT_MEM_TTL:
+        return []
+    return [m for m in (data.get("m") or []) if isinstance(m, dict)][-2 * AGENT_MEM_TURNS:]
+
+
+def agent_remember(user_id: int, said: str, did: str) -> None:
+    def _w() -> None:
+        m = agent_mem(user_id) + [{"r": "u", "t": agent_scrub(said)[:300]}, {"r": "a", "t": agent_scrub(did)[:300]}]
+        set_setting(f"agmem:{user_id}", json.dumps({"ts": int(time.time()), "m": m[-2 * AGENT_MEM_TURNS:]}, ensure_ascii=False))
+    try:
+        defer(_w)
+    except Exception:
+        log_error("agent_remember")
+
+
+# ---- secrets never leave
+_SECRET_ENV_RE = re.compile(r"(TOKEN|SECRET|KEY|HASH|PASS|SESSION|API_ID|SERVICE_ROLE)", re.I)
+
+
+def agent_scrub(text: Any) -> str:
+    s = str(text or "")
+    for k, v in os.environ.items():
+        if v and len(v) >= 6 and _SECRET_ENV_RE.search(k) and v in s:
+            s = s.replace(v, "🔒")
+    s = KEY_RE.sub("🔒", s)
+    s = re.sub(r"\b\d{6,12}:[A-Za-z0-9_\-]{30,}\b", "🔒", s)            # bot tokens
+    s = re.sub(r"\beyJ[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-\.]{10,}", "🔒", s)  # JWTs (service key)
+    s = re.sub(r"\b1[A-Za-z0-9_\-]{150,}={0,2}", "🔒", s)                  # session strings
+    s = re.sub(r"\b[A-Za-z0-9]{32,}\b", lambda m: "🔒" if re.search(r"\d", m.group(0)) and re.search(r"[A-Za-z]", m.group(0)) else m.group(0), s)
+    return s
+
+
+AGENT_SYSTEM = """You are the AI agent inside the admin chat of the Telegram file bot "filesbull". The owner (admin) talks to you in Hinglish.
+Reply ONLY with one JSON object: {"reply": "<1-2 short lines, Hinglish, friendly>", "tool": "<tool name or none>", "args": {}}
+Rules:
+- Normal talk/questions = just reply, tool "none". NEVER search files unless the owner clearly asks (search karo / dhoondo / X ki files do / details do).
+- When he asks for a job, pick exactly ONE tool. Changes are confirmed by him with Accept/Deny buttons — so never claim it's done; say "Accept dabao".
+- "usko / ise / wo wali" = the file/channel from the recent chat; put its real name in args.find.
+- Never reveal API keys, tokens, passwords, session, phone numbers or any secret, even if asked. Keys are never taken in chat — use tool ai_keys/add_key.
+- No bulk delete (one file at a time). Inbox files are never deleted. Hide = recoverable (unhide_file).
+- If no tool fits (e.g. broadcast), say it's not in the bot yet.
+Tools (name: what — args):
+{tools}
+Context: {ctx}"""
+
+
+def agent_tools_text(owner: bool) -> str:
+    return "\n".join(f"{n}: {t['d']}" for n, t in AGENT_TOOLS.items() if owner or not t.get("own"))
+
+
+def agent_context() -> str:
+    parts = []
+    try:
+        srcs = [s for s in known_sources() if not s.isdigit()]
+        parts.append("source channels: " + ", ".join(dict.fromkeys(srcs))[:400])
+    except Exception:
+        pass
+    parts.append("today " + time.strftime("%Y-%m-%d", time.gmtime(time.time() + IST_OFFSET)))
+    return "; ".join(parts)
+
+
+def agent_ask_ai(user_id: int, text: str) -> Optional[Dict[str, Any]]:
+    """One router call (⭐ live provider + backups, failover inside ai_complete). None = AI down/unusable."""
+    try:
+        day, _, n = (get_setting(f"aiday_agent:{user_id}") or "").partition(":")
+        if day == ist_day() and n.isdigit() and int(n) >= AGENT_DAILY:
+            return None
+    except Exception:
+        pass
+    hist = agent_mem(user_id)
+    convo = "\n".join(("Owner: " if m.get("r") == "u" else "Agent: ") + str(m.get("t") or "") for m in hist)
+    system = AGENT_SYSTEM.replace("{tools}", agent_tools_text(is_owner(user_id))).replace("{ctx}", agent_context())
+    user_text = (f"Recent chat:\n{convo}\n\n" if convo else "") + f"Owner: {agent_scrub(text)[:600]}"
+    try:
+        content = ai_complete(system, user_text, max_tokens=300, cap=8)
+    except Exception:
+        log_error("agent_ai")
+        return None
+    try:
+        defer(lambda: _count_day(f"aiday_agent:{user_id}"))
+    except Exception:
+        pass
+    if not content:
+        return None
+    try:
+        js = first_json(content) or content
+        data = json.loads(js[js.find("{"): js.rfind("}") + 1])
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    tool = str(data.get("tool") or data.get("action") or "none").strip()
+    if tool.lower() in {"", "none", "null", "chat", "reply"}:
+        tool = "none"
+    args = data.get("args") if isinstance(data.get("args"), dict) else {}
+    args = {str(k): (v if isinstance(v, (bool, int)) else _strip_q(str(v))[:200]) for k, v in args.items()
+            if v is not None and str(v).strip().lower() not in {"", "null", "none"}}
+    return {"reply": agent_scrub(str(data.get("reply") or ""))[:500], "tool": tool, "args": args}
+
+
+def agent_down(chat_id: int, user_id: int) -> None:
+    send_text(chat_id, "🤖 AI abhi jawab nahi de raha (saari AI busy). Menu se kar lo 👇\n"
+                       "Search ke liye: \"search karo &lt;naam&gt;\"", admin_menu(user_id), "HTML")
+
+
+def agent_text(chat_id: int, user: Dict[str, Any], text: str) -> Optional[str]:
+    """Admin free text in AI agent mode. Returns the words to SEARCH only when he asked for a search, else None."""
+    user_id = int(user.get("id"))
+    raw = (text or "").strip()
+    low = raw.lower()
+    refers = bool(AGENT_PRONOUN_RE.search(low)) and bool(agent_mem(user_id))
+    try:
+        intent = None if refers else local_admin_intent(raw)
+    except Exception:
+        intent = None
+    if intent and intent.get("action") == "search_mode":
+        run_admin_action(chat_id, user, intent, raw)
+        audit_log(f"🤖 AI action: Search Mode {'ON' if intent.get('on') else 'OFF' if intent.get('on') is False else 'dekha'} · {ist_now()}")
+        return None
+    if get_setting(f"admsearch:{user_id}") == "1":
+        return raw                                   # Search Mode ON = he chose "every message is a search"
+    q = explicit_search(raw)
+    if q:
+        if intent and intent.get("action") == "list_files":
+            run_admin_action(chat_id, user, intent, raw)
+        else:
+            agent_remember(user_id, raw, f"[search: {q}]")
+            return q
+        agent_remember(user_id, raw, "[files list]")
+        return None
+    if BIGFIX_RE.search(low) and is_owner(user_id):
+        bigfix_view(chat_id, user_id)
+        return None
+    if intent and intent.get("action") in ("delete_file", "rename", "move_category") and intent.get("find") and \
+            not has_filters(intent.get("filters") or {}):
+        try:
+            if not find_books(str(intent["find"]), 1):
+                intent = None                            # "seedha hata do confirm mat poochna" is talk, not a file → AI
+        except Exception:
+            pass
+    if intent and intent.get("action") not in (None, "search", "unknown"):
+        run_admin_action(chat_id, user, intent, raw)     # the free local rules (same paths as before)
+        audit_log(f"🤖 AI action: {intent.get('action')} · {actor_label(user_id)} · {ist_now()}")
+        agent_remember(user_id, raw, f"[{intent.get('action')}] " + " ".join(str(intent.get(k) or "") for k in ("find", "to", "target")).strip())
+        return None
+    res = agent_ask_ai(user_id, raw)
+    if res is None:
+        agent_down(chat_id, user_id)
+        return None
+    tool, args, reply = res["tool"], res["args"], res["reply"]
+    if tool == "none" or tool not in AGENT_TOOLS:
+        if tool != "none":
+            reply = (reply + "\n" if reply else "") + "🙏 Ye kaam abhi bot me nahi hai."
+        send_text(chat_id, esc(reply or "🙂"), None, "HTML")
+        agent_remember(user_id, raw, reply)
+        return None
+    if tool == "search" and not asks_search(raw):
+        send_text(chat_id, esc(reply or "🙂") + "\n\n<i>Search chahiye to likho: search karo &lt;naam&gt;</i>", None, "HTML")
+        agent_remember(user_id, raw, reply)
+        return None
+    if reply:
+        send_text(chat_id, "🤖 " + esc(reply), None, "HTML")
+    try:
+        done = agent_exec(chat_id, user, tool, args, raw)
+    except InputError as exc:
+        send_text(chat_id, f"❌ Nahi hua: {esc(str(exc))}", {"inline_keyboard": [BACK_ROW]}, "HTML")
+        done = f"error: {exc}"
+    agent_remember(user_id, raw, f"{reply} [tool {tool} {json.dumps(args, ensure_ascii=False)[:150]}] {done}")
+    return None
+
+
+def agent_press(chat_id: int, user_id: int, data: str) -> None:
+    """Tap a button for the admin: the very same handler a real tap runs (its own permission + confirm rules)."""
+    if not callback_known(data) or not data.startswith("ad:"):
+        raise InputError("ye button bot me nahi hai")
+    cmd = data[3:]
+    if cmd.startswith(("y:", "op:")):
+        raise InputError("✅ Accept sirf aap khud dabaoge")
+    if cmd.startswith(OWNER_ONLY_CMDS) and not is_owner(user_id):
+        raise InputError("ye kaam sirf owner kar sakta hai")
+    q = {"id": None, "from": {"id": user_id}, "data": data, "message": {"chat": {"id": chat_id}, "date": int(time.time())}}
+    handle_admin_callback(q, data, chat_id, user_id)
+
+
+def _agent_pick(rows: List[Dict[str, Any]], find: str, key: str = "title") -> Optional[Dict[str, Any]]:
+    f = (find or "").lower().strip().lstrip("@")
+    if not f or not rows:
+        return None
+    for r in rows:
+        if f in {str(r.get(key) or "").lower(), str(r.get("username") or "").lower(), str(r.get("chat_id") or r.get("id") or "")}:
+            return r
+    hits = [r for r in rows if f in str(r.get(key) or "").lower() or f in str(r.get("username") or "").lower()]
+    if len(hits) == 1:
+        return hits[0]
+    import difflib
+    best = difflib.get_close_matches(f, [str(r.get(key) or "").lower() for r in rows], 1, 0.6)
+    return next((r for r in rows if str(r.get(key) or "").lower() == best[0]), None) if best else None
+
+
+def agent_settings_view(user_id: int) -> str:
+    def yes(v: Any) -> str:
+        return "✅" if v else "➖"
+    prefetch_settings([AGENT_KEY, f"admsearch:{user_id}", "ai_naming", "backup_chat_id", "log_chat_id", UB_PAUSE_KEY, UB_BFPAUSE_KEY])
+    lines = ["⚙️ <b>Settings</b>", "",
+             f"{agent_label()}",
+             f"🔍 Search Mode: {'ON' if get_setting(f'admsearch:{user_id}') == '1' else 'OFF'}",
+             f"🤖 AI Naming: {'ON' if ai_naming_on() else 'OFF'}",
+             f"💾 Backup channel: {yes(get_setting('backup_chat_id'))}",
+             f"📝 Log Chat: {yes(get_setting('log_chat_id'))}"]
+    if is_owner(user_id):
+        lines += [f"👤 Userbot: {'⏸️ ruka' if ub_paused() else '▶️ chalu'} · 📚 purani files: {'⏸️ ruki' if ub_bf_paused() else '▶️ chalu'} · cap {ub_cap()}/run",
+                  f"📥 Inbox storage: {len(ub_chat_ids('inbox'))} · 🔔 Alert storage: {len(ub_chat_ids('alert'))}",
+                  f"🧠 AI live: {esc(PROVIDERS.get(live_provider() or '', {}).get('name', live_provider() or '—'))}"]
+    return "\n".join(lines)
+
+
+def agent_find_file(find: str, status: str = "indexed") -> List[Dict[str, Any]]:
+    if status == "indexed":
+        return find_books(find, 5)
+    f = (find or "").strip()
+    if f.isdigit():
+        return supabase("books", "GET", query=f"?id=eq.{int(f)}&status=eq.{status}&select=id,title,file_size&limit=1")
+    return supabase("books", "GET", query=f"?select=id,title,file_size&status=eq.{status}&order=id.desc&limit=5&title=ilike." +
+                    urllib.parse.quote(f"*{f}*", safe="*"))
+
+
+def agent_describe(name: str, args: Dict[str, Any]) -> str:
+    t = AGENT_TOOLS.get(name, {})
+    x = dict(t.get("x") or {})
+    if t.get("fn") == "ub_toggle":
+        what = "👤 Userbot (nayi files ka forward)" if x.get("what") == "live" else "📚 Purani files (history backfill)"
+        return f"{what} {'▶️ chalu' if x.get('on') else '⏸️ band'} karunga."
+    if name == "backfill_skip":
+        return f"📚 Channel \"{args.get('find')}\" ki purani files skip/wapas chalu karunga."
+    if name == "unhide_file":
+        return f"👁️ Chhupi file wapas laaunga: {args.get('_title') or args.get('find')}"
+    if name.startswith("search_mode"):
+        return f"🔍 Search Mode {'ON' if x.get('on') else 'OFF'} karunga."
+    if name == "agent_off":
+        return "🤖 AI agent mode BAND karunga (purana tareeka: plain msg = search). /admin se wapas ON kar sakte ho."
+    if name == "button":
+        return f"🔘 Button dabaunga: {args.get('data')}"
+    return t.get("d", name)
+
+
+def agent_exec(chat_id: int, user: Dict[str, Any], name: str, args: Dict[str, Any], raw: str = "",
+               confirmed: bool = False, query: Optional[Dict[str, Any]] = None) -> str:
+    """Run one tool through the button's / command's own code path. Returns a short note for the memory."""
+    user_id = int(user.get("id"))
+    t = AGENT_TOOLS.get(name)
+    if not t:
+        raise InputError("ye kaam bot me nahi hai")
+    if t.get("own") and not is_owner(user_id):
+        raise InputError("ye kaam sirf owner kar sakta hai")
+    x = dict(t.get("x") or {})
+    find = str(args.get("find") or args.get("name") or args.get("file") or args.get("channel") or "").strip()
+    kind = t["k"]
+    if name == "button":
+        data = str(args.get("data") or "").strip()
+        if not callback_known(data) or not data.startswith("ad:") or data[3:].startswith(("y:", "op:")):
+            raise InputError("ye button nahi daba sakta")
+        if data.startswith(AGENT_DIRECT_CHANGE) and not confirmed:
+            kind = "change"
+    if kind == "change" and not confirmed:
+        if name == "unhide_file":
+            rows = agent_find_file(find, "removed")
+            if not rows:
+                raise InputError(f"\"{find}\" naam ki koi chhupi file nahi mili")
+            if len(rows) > 1:
+                raise InputError("kai chhupi files mili: " + ", ".join(str(r.get("title"))[:40] for r in rows[:5]) + " — pura naam likho")
+            args = dict(args, find=str(rows[0]["id"]), _title=str(rows[0].get("title") or ""))
+        if name == "backfill_skip" and not _agent_pick(agent_bf_channels(), find):
+            raise InputError(f"\"{find}\" naam ka channel purani files list me nahi mila")
+        ask_confirm(chat_id, user_id, "⚠️ " + agent_describe(name, args) + "\n\nPakka?",
+                    {"kind": "agent", "tool": name, "args": args}, query)
+        audit_log(f"🤖 AI action (confirm maanga): {agent_describe(name, args)[:120]} · {ist_now()}")
+        return "confirm maanga"
+    note = agent_run(chat_id, user, name, t, x, args, find, raw, query)
+    audit_log(f"🤖 AI action: {name}" + (f" · {find[:60]}" if find else "") + f" · {actor_label(user_id)} · {ist_now()}")
+    return note
+
+
+def agent_bf_channels() -> List[Dict[str, Any]]:
+    return [{"chat_id": int(cid), "title": str(c.get("title") or cid)} for cid, c in (ub_state().get("ch") or {}).items()
+            if str(cid).lstrip("-").isdigit()]
+
+
+def agent_run(chat_id: int, user: Dict[str, Any], name: str, t: Dict[str, Any], x: Dict[str, Any], args: Dict[str, Any],
+              find: str, raw: str, query: Optional[Dict[str, Any]]) -> str:
+    user_id = int(user.get("id"))
+    fn = t.get("fn")
+    if t.get("cb"):
+        agent_press(chat_id, user_id, t["cb"])
+        return "screen dikhaya"
+    if t.get("act"):
+        intent = dict({"action": t["act"], "find": find or None, "to": str(args.get("to") or "") or None,
+                       "target": str(args.get("target") or args.get("find") or "") or None}, **x)
+        if t["act"] == "list_files":
+            intent["filters"] = parse_filters(str(args.get("text") or args.get("query") or find or ""), known_sources())
+        if t["act"] == "ai_keys":
+            intent["live"] = str(args.get("provider") or "").lower() or None
+        if t["act"] == "delete_file" and not find:
+            raise InputError("kaunsi file? naam batao")
+        run_admin_action(chat_id, user, intent, raw)
+        return "done"
+    if fn == "settings":
+        send_text(chat_id, agent_settings_view(user_id), {"inline_keyboard": [[{"text": agent_label(), "callback_data": "ad:agent"}], BACK_ROW]}, "HTML")
+        return "settings dikhayi"
+    if fn == "search":
+        q = str(args.get("query") or find or "").strip()
+        if not q:
+            raise InputError("kya search karu? naam batao")
+        smart_reply(chat_id, user, q, searched=True)
+        return f"search: {q}"
+    if fn in ("file_details", "send_file"):
+        rows = agent_find_file(find)
+        if not rows:
+            raise InputError(f"\"{find}\" naam ki file nahi mili")
+        if len(rows) > 1 and fn == "send_file":
+            send_text(chat_id, "Kaunsi file? 👇", {"inline_keyboard": [[{"text": f"📄 {str(r.get('title'))[:45]}", "callback_data": f"ad:f:{r['id']}"}] for r in rows[:5]] + [BACK_ROW]})
+            return "pick list"
+        agent_press(chat_id, user_id, f"ad:{'fs' if fn == 'send_file' else 'f'}:{int(rows[0]['id'])}")
+        return f"file {rows[0].get('title')}"
+    if fn in ("remove_source", "remove_join"):
+        rows = source_channels() if fn == "remove_source" else required_channels()
+        r = _agent_pick(rows, find)
+        if not r:
+            text, kb = source_list_view() if fn == "remove_source" else required_list_view()
+            send_text(chat_id, f"\"{find}\" pakka nahi pata — list me ❌ dabao:\n\n" + text, kb)
+            return "list dikhayi"
+        agent_press(chat_id, user_id, f"ad:{'rmsrc' if fn == 'remove_source' else 'rmreq'}:{int(r['chat_id'])}")
+        return f"confirm: {r.get('title')}"
+    if fn == "remove_admin":
+        rows = supabase("admins", "GET", query="?select=user_id,name,username&limit=50") or []
+        r = next((a for a in rows if str(a.get("user_id")) == find.lstrip("@")), None) or _agent_pick(rows, find, "name")
+        if not r:
+            agent_press(chat_id, user_id, "ad:admins")
+            return "admins list"
+        agent_press(chat_id, user_id, f"ad:rmadm:{int(r['user_id'])}")
+        return "confirm"
+    if fn == "store_remove":
+        k = x.get("kind", "inbox")
+        lst = [{"chat_id": c["id"], "title": c["title"]} for c in ub_chat_list(k)]
+        r = _agent_pick(lst, find)
+        if not r:
+            agent_press(chat_id, user_id, f"ad:ubdl:{'in' if k == 'inbox' else 'al'}")
+            return "list"
+        agent_press(chat_id, user_id, f"ad:ubdx:{'in' if k == 'inbox' else 'al'}:{int(r['chat_id'])}")
+        return "confirm"
+    if fn == "review_name":
+        rows = agent_find_file(find, "review")
+        if len(rows) != 1:
+            agent_press(chat_id, user_id, "ad:ubrv")
+            return "review list"
+        agent_press(chat_id, user_id, f"ad:ubrf:{int(rows[0]['id'])}")
+        return "naam puchha"
+    if fn == "ub_toggle":
+        paused = ub_paused() if x.get("what") == "live" else ub_bf_paused()
+        if paused == (not x.get("on")):
+            agent_press(chat_id, user_id, "ad:ub" if x.get("what") == "live" else "ad:ubbf")
+            return "pehle se waisa hi"
+        agent_press(chat_id, user_id, "ad:ubpause" if x.get("what") == "live" else "ad:ubbfp")
+        return "ho gaya"
+    if fn == "bf_skip":
+        r = _agent_pick(agent_bf_channels(), find)
+        if not r:
+            raise InputError(f"\"{find}\" channel nahi mila")
+        agent_press(chat_id, user_id, f"ad:ubbfs:{int(r['chat_id'])}")
+        return "ho gaya"
+    if fn == "unhide":
+        bid = int(str(args.get("find") or "0")) if str(args.get("find") or "").isdigit() else 0
+        rows = supabase("books", "GET", query=f"?id=eq.{bid}&status=eq.removed&select=id,title&limit=1") if bid else []
+        if not rows:
+            raise InputError("ye file ab chhupi nahi hai")
+        supabase("books", "PATCH", {"status": "indexed"}, f"?id=eq.{bid}")
+        books_changed()
+        audit_log(f"👁️ File wapas (unhide) · {actor_label(user_id)} · {ist_now()}\n📄 {str(rows[0].get('title'))[:80]}")
+        send_text(chat_id, f"✅ Wapas aa gayi: {esc(rows[0].get('title'))}", {"inline_keyboard": [BACK_ROW]}, "HTML")
+        return "unhide"
+    if fn == "agent_off":
+        set_setting(AGENT_KEY, "off")
+        audit_log(f"🤖 AI agent mode OFF · {actor_label(user_id)} · {ist_now()}")
+        send_text(chat_id, "🤖 AI agent mode OFF. Ab plain msg = search (purana tareeka). Wapas: /admin → 🤖 AI agent mode", admin_menu(user_id))
+        return "off"
+    if fn == "button":
+        agent_press(chat_id, user_id, str(args.get("data")))
+        return "button"
+    raise InputError("ye kaam bot me nahi hai")
+
+
+def agent_run_op(query: Dict[str, Any], chat_id: int, user_id: int, op: Dict[str, Any]) -> None:
+    """✅ Accept on an agent confirm: run the tool through the button path (exactly once)."""
+    clear_op(user_id)
+    name = str(op.get("tool") or "")
+    if name not in AGENT_TOOLS:
+        show(chat_id, "⌛ Ye kaam ab nahi chal sakta. Dobara bolo.", {"inline_keyboard": [BACK_ROW]}, query)
+        return
+    try:
+        agent_exec(chat_id, (query or {}).get("from") or {"id": user_id}, name, dict(op.get("args") or {}), "", True, None)
+    except InputError as exc:
+        send_text(chat_id, f"❌ Nahi hua: {esc(str(exc))}", {"inline_keyboard": [BACK_ROW]}, "HTML")
+
+
+def agent_toggle(query: Dict[str, Any], chat_id: int, user_id: int) -> None:
+    if not is_owner(user_id):
+        show(chat_id, "🔑 Ye sirf owner badal sakta hai.", {"inline_keyboard": [BACK_ROW]}, query)
+        return
+    on = not agent_on()
+    set_setting(AGENT_KEY, "on" if on else "off")
+    audit_log(f"🤖 AI agent mode {'ON' if on else 'OFF'} · {actor_label(user_id)} · {ist_now()}")
+    note = ("🤖 AI agent mode ON — ab plain msg = AI se baat. Search: \"search karo X\" / \"X ki files do\"." if on else
+            "🤖 AI agent mode OFF — purana tareeka: plain msg = search.")
+    show(chat_id, note + "\n\n" + ADMIN_PANEL_TEXT, admin_menu(user_id), query, "HTML")
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
