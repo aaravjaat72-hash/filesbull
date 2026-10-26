@@ -3916,6 +3916,80 @@ def setup_status() -> Dict[str, Any]:
     return status
 
 
+# ================================================================ AI diagnostics (no keys ever shown)
+DIAG_TOKEN_SHA256 = "4d4e81e91187974473b09468e5c04a92865425fe8b02960c1359de6abdb68f41"
+
+
+def _err_class(exc: Exception, key: str = "") -> str:
+    s = str(exc)
+    if key:
+        s = s.replace(key, "***")
+    s = re.sub(r"gsk_[A-Za-z0-9]+|sk-[A-Za-z0-9_\-]+", "***", s)
+    m = re.match(r"HTTP (\d+)", s)
+    if m:
+        return s[:220]
+    return (type(exc).__name__ + ": " + s)[:220]
+
+
+def ai_probe(json_mode: bool = True) -> Dict[str, Any]:
+    """One tiny real AI call per key (first working model). Status codes / model names only."""
+    out: Dict[str, Any] = {"provider": ai_provider() or "none", "keys": []}
+    models = [m for m in dict.fromkeys([GROQ_MODEL, "llama-3.1-8b-instant", "llama-3.3-70b-versatile"]) if m]
+    for n, key in enumerate(groq_pool(), 1):
+        row: Dict[str, Any] = {"key": f"groq #{n}", "cooling": key_state(key) or "no", "tries": []}
+        for model in models:
+            t0 = time.monotonic()
+            body: Dict[str, Any] = {"model": model, "max_tokens": 20, "temperature": 0,
+                                    "messages": [{"role": "system", "content": "Reply ONLY with JSON {\"ok\":true}."},
+                                                 {"role": "user", "content": "ping"}]}
+            if json_mode:
+                body["response_format"] = {"type": "json_object"}
+            try:
+                res = http_json("https://api.groq.com/openai/v1/chat/completions", "POST", body,
+                                {"Authorization": f"Bearer {key}"}, timeout=8)
+                txt = str(res["choices"][0]["message"]["content"])[:40]
+                row["tries"].append({"model": model, "ok": True, "ms": int((time.monotonic() - t0) * 1000), "reply": txt})
+                break
+            except Exception as exc:
+                row["tries"].append({"model": model, "ok": False, "ms": int((time.monotonic() - t0) * 1000),
+                                     "error": _err_class(exc, key)})
+        out["keys"].append(row)
+    for n, key in enumerate(openai_pool(), 1):
+        out["keys"].append({"key": f"openai #{n}", "cooling": key_state(key) or "no"})
+    return out
+
+
+
+def naming_diag(ids: str = "") -> Dict[str, Any]:
+    rows = supabase("books", "GET", query="?select=id,title,caption,file_name&status=eq.indexed&order=id&limit=5")
+    items = [{"i": n, "caption": r.get("caption"), "file": r.get("file_name"), "old": r.get("title")} for n, r in enumerate(rows, 1)]
+    payload = [{"i": x["i"], "caption": re.sub(r"\s+", " ", str(x.get("caption") or ""))[:300],
+                "file": str(x.get("file") or "")[:150]} for x in items]
+    t0 = time.monotonic()
+    raw = ai_complete(AI_NAME_SYSTEM, json.dumps(payload, ensure_ascii=False), max_tokens=min(1800, 50 + 45 * len(items)), cap=9)
+    out: Dict[str, Any] = {"ms": int((time.monotonic() - t0) * 1000), "raw": (raw or "")[:1500], "items": payload}
+    out["guarded"] = ai_titles(items, cap=9)
+    return out
+
+
+@app.get("/api/aidiag")
+def aidiag() -> Any:
+    tok = request.args.get("t", "")
+    if not tok or not hmac.compare_digest(hashlib.sha256(tok.encode()).hexdigest(), DIAG_TOKEN_SHA256):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    _REQ_T0[0] = time.monotonic()
+    res: Dict[str, Any] = {"ok": True, "build": os.environ.get("VERCEL_GIT_COMMIT_SHA", "")[:7]}
+    res["probe_json"] = ai_probe(True)
+    if request.args.get("plain") == "1":
+        res["probe_plain"] = ai_probe(False)
+    if request.args.get("name") == "1":
+        try:
+            res["naming"] = naming_diag(request.args.get("ids", ""))
+        except Exception as exc:
+            res["naming"] = {"error": _err_class(exc)}
+    return jsonify(res)
+
+
 @app.after_request
 def build_header(response: Any) -> Any:
     # Which commit is serving (lets a deploy be verified without opening the home page).
