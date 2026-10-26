@@ -1275,6 +1275,21 @@ suggest best achi acchi achhi sabse konsi kaunsi kounsi konsa kaunsa kon kaun si
 which what taiyari tayari taiyaari preparation prepare exam exams paper ke liye
 मुझे मुझको चाहिए चाहिये एक की का के को दो दे दीजिए है हैं हूँ कोई कुछ भी क्या बुक किताब पुस्तक पीडीएफ फाइल में से और या
 """.split())
+# Generic praise / filler (Aarav 6:40 PM: "Mujhe mere liye ek bdhiya si book do" searched "bdhiya")
+GENERIC_WORDS = set("""
+badhiya badhia bdhiya bdiya badiya badhiyaa bdhia acha accha achha acchha achhi acchi achi ache acche achhe
+best top good nice mast zabardast jabardast sahi shandar important imp useful kaam kam aayi aaye wali wala wale
+vali vala vale liye lie liya si sa se recommend suggest suggestion bata batao btao dikhao dikha koi kuch kuchh
+book books pdf pdfs file files notes kitab kitaab kitabe kitaben padhne padhai study
+""".split())
+BOOK_ASK_WORDS = {"book", "books", "kitab", "kitaab", "kitabe", "kitaben", "pdf", "pdfs", "notes", "recommend", "suggest",
+                  "suggestion", "badhiya", "badhia", "bdhiya", "bdiya", "badiya", "best", "top", "important", "imp", "useful"}
+PRAISE_WORDS = {"acha", "accha", "achha", "acchha", "achhi", "acchi", "achi", "ache", "acche", "achhe", "good", "nice", "mast",
+                "zabardast", "jabardast", "sahi", "shandar"}
+GIVE_WORDS = {"do", "de", "dedo", "dena", "dijiye", "bhejo", "bhej", "bhejdo", "chahiye", "chaiye", "chahie", "send", "give", "batao", "bata"}
+FILLER = FILLER | {w for w in GENERIC_WORDS if w not in {"notes", "book", "books", "pdf", "pdfs", "file", "files"}} | \
+    {"liye", "lie", "si", "sa", "wali", "wala", "wale", "vali", "vala", "dedo", "de", "do", "bhejo", "ek", "mere", "mujhe", "please", "bhai", "sir"}
+
 
 MORE_WORDS = {"aur", "or", "hor", "dusri", "dusra", "dusre", "doosri", "doosra", "doosre", "alag", "alg", "anya",
               "more", "next", "another", "other", "others", "baki", "baaki", "bachi", "aage", "agla", "agli",
@@ -1327,11 +1342,15 @@ ALIAS_GROUPS = [
     {"reasoning", "tark", "तर्कशक्ति", "रीजनिंग"},
     {"english", "angreji", "angrezi", "अंग्रेजी"},
     {"hindi", "हिंदी", "हिन्दी"},
-    {"gk", "gs", "सामान्य ज्ञान", "samanya gyan"},
+    {"gk", "gs", "सामान्य ज्ञान", "samanya gyan", "general knowledge", "general studies", "static gk", "सामान्य अध्ययन"},
+    {"gd", "ssc gd", "जीडी", "constable gd"},
+    {"ntpc", "rrb ntpc", "एनटीपीसी"},
+    {"cgl", "ssc cgl"},
+    {"chsl", "ssc chsl"},
     {"computer", "कंप्यूटर", "कम्प्यूटर"},
     {"railway", "rrb", "रेलवे"},
     {"police", "पुलिस", "constable"},
-    {"army", "agniveer", "अग्निवीर", "सेना"},
+    {"army", "agniveer", "agnipath", "अग्निवीर", "अग्निपथ", "सेना"},
     {"current", "करंट"},
 ]
 ALIASES: Dict[str, set] = {}
@@ -1397,23 +1416,28 @@ def understand(text: str) -> Dict[str, Any]:
         result["intent"] = "empty"
         return result
     vocab_hit = any(t in EXAM_WORDS or t in SUBJECT_WORDS for t in tokens)
+    # "kuch accha sa do", "recommend karo koi badhiya kitab": a request for a book, not a thanks / greeting
+    book_ask = any(t in BOOK_ASK_WORDS for t in tokens) or \
+        (any(t in PRAISE_WORDS for t in tokens) and any(t in GIVE_WORDS for t in tokens))
     if not vocab_hit and (any(p in low for p in OFF_PHRASES) or any(t in OFF_WORDS for t in tokens)):
         result["intent"] = "off_topic"
         return result
-    if all(t in GREET_WORDS or t in FILLER for t in tokens) and any(t in GREET_WORDS for t in tokens):
+    if not book_ask and all(t in GREET_WORDS or t in FILLER for t in tokens) and any(t in GREET_WORDS for t in tokens):
         result["intent"] = "greeting"
         return result
     if len(tokens) <= 2 and not vocab_hit and any(_close_greet(t) for t in tokens) and \
             all(_close_greet(t) or t in GREET_WORDS or t in FILLER for t in tokens):
         result["intent"] = "greeting"     # "Jello", "helo bhai", "hlo"
         return result
-    if all(t in THANK_WORDS or t in FILLER for t in tokens) and any(t in THANK_WORDS for t in tokens):
+    if not book_ask and all(t in THANK_WORDS or t in FILLER for t in tokens) and any(t in THANK_WORDS for t in tokens):
         result["intent"] = "thanks"
         return result
     more = any(t in MORE_WORDS for t in tokens)
     keywords = []
     for t in tokens:
         if t in FILLER or t in MORE_WORDS or t in REF_WORDS or t in GREET_WORDS and t not in EXAM_WORDS:
+            continue
+        if t in GENERIC_WORDS and t not in TYPE_WORDS and t not in EXAM_WORDS and t not in SUBJECT_WORDS:
             continue
         if t in LANG_WORDS:
             result["lang"] = LANG_WORDS[t]
@@ -1767,8 +1791,16 @@ def ai_interpret(text: str, ctx: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 # ---- search (database only)
 
+def _term_in(term: str, text: str) -> bool:
+    """Short latin terms (gd, gk, gs, ca) must be whole words — "gs" inside "things" is not GS (Aarav 6:40 PM:
+    "Gd gk dedo" returned "Physics all Formulas X grp NDA")."""
+    if len(term) <= 3 and term.isascii():
+        return re.search(r"(?<![a-z0-9])" + re.escape(term) + r"(?![a-z0-9])", text) is not None
+    return term in text
+
+
 def search_rows(keywords: List[str], lang: Optional[str] = None, types: Optional[List[str]] = None,
-                strict: bool = True) -> List[Dict[str, Any]]:
+                strict: bool = True, require_all: bool = False) -> List[Dict[str, Any]]:
     """Matching rows, best first. Each keyword counts once even with its aliases (itihas = history).
     strict: when some files match EVERY keyword ("ssc gd gk hindi"), only those are returned;
     otherwise files matching any keyword, best first."""
@@ -1786,22 +1818,22 @@ def search_rows(keywords: List[str], lang: Optional[str] = None, types: Optional
     primary = [normalize(k) for k in keywords if normalize(k)]
     words = list(dict.fromkeys(primary + sorted(t for g in groups for t in g if len(t) > 1 or t.isdigit())))[:20]
     filters = ",".join(f"{col}.ilike.*{word}*" for word in words
-                       for col in ("title", "caption", "keywords", "content_text", "source_chat_title"))
+                       for col in ("title", "caption", "keywords", "content_text", "source_chat_title", "file_name"))
     rows = supabase("books", "GET", query=(
-        "?select=id,title,caption,keywords,content_text,source_chat_title,language"
+        "?select=id,title,caption,keywords,content_text,source_chat_title,language,file_name"
         "&status=eq.indexed&limit=300&or=" + urllib.parse.quote(f"({filters})", safe="(),.*")
     ))
     scored = []
     for row in rows:
-        head = normalize(" ".join(str(row.get(k) or "") for k in ("title", "caption", "keywords", "source_chat_title")))
+        head = normalize(" ".join(str(row.get(k) or "") for k in ("title", "caption", "keywords", "source_chat_title", "file_name")))
         body = normalize(str(row.get("content_text") or ""))
         score = 0.0
         hits = 0
         for g in groups:
-            if any(term in head for term in g):
+            if any(_term_in(term, head) for term in g):
                 score += 3
                 hits += 1
-            elif any(term in body for term in g):
+            elif any(_term_in(term, body) for term in g):
                 score += 1
                 hits += 1
         if not score:
@@ -1819,6 +1851,8 @@ def search_rows(keywords: List[str], lang: Optional[str] = None, types: Optional
     out = [row for _, row in scored]
     if strict and len(groups) > 1 and any(r.get("_all") for r in out):
         out = [r for r in out if r.get("_all")]
+    if require_all:
+        out = [r for r in out if r.get("_all")]      # weak partial matches are not results
     return out
 
 
@@ -1845,9 +1879,11 @@ def results_markup(rows: List[Dict[str, Any]], more_left: int) -> Dict[str, Any]
 
 
 def send_results(chat_id: int, user_id: Optional[int], ctx: Dict[str, Any], keywords: List[str],
-                 lang: Optional[str], types: Optional[List[str]], raw: str, note: str = "") -> bool:
+                 lang: Optional[str], types: Optional[List[str]], raw: str, note: str = "",
+                 require_all: bool = False, rows: Optional[List[Dict[str, Any]]] = None) -> bool:
     """Search + show page 1. Returns False when nothing was found (nothing sent)."""
-    rows = search_rows(keywords, lang, types)
+    if rows is None:
+        rows = search_rows(keywords, lang, types, require_all=require_all)
     note_user(None, searches=1)
     if not rows:
         return False
@@ -1957,11 +1993,19 @@ def smart_reply(chat_id: int, user: Dict[str, Any], text: str, searched: bool = 
                 return
             send_no_results(chat_id, kw[0])
             return
-        ask_question(chat_id, user_id, ctx, "subject", [], None)
+        generic_reply(chat_id, user_id)          # "ek badhiya si book do" → subjects + most-taken files, no search
         return
-    if send_results(chat_id, user_id, ctx, keywords, lang, types, text):
+    if send_results(chat_id, user_id, ctx, keywords, lang, types, text, require_all=True):
         return
-    # Nothing found locally: ask the AI once (typos, long sentences), within the limits.
+    fuzzy = fuzzy_rows(keywords)
+    if fuzzy and send_results(chat_id, user_id, ctx, keywords, lang, types, text, rows=fuzzy):
+        return
+    key_terms = [k for k in keywords if is_key_term(k)]
+    if key_terms:
+        # Local parsing understood it (lucent, gd, gk…) and it is truly not there → no AI tokens.
+        not_found_reply(chat_id, user, keywords)
+        return
+    # No known word at all (typos, long sentences): ask the AI once, within the limits.
     if ai_budget_ok(user_id, ctx):
         ans = ai_interpret(text, ctx)
         ai_spend(user_id, ctx)
@@ -1974,13 +2018,13 @@ def smart_reply(chat_id: int, user: Dict[str, Any], text: str, searched: bool = 
                 show_more(chat_id, user_id, ctx)
                 return
             if ans["keywords"] and ans["keywords"] != keywords and \
-                    send_results(chat_id, user_id, ctx, ans["keywords"], ans["lang"] or lang, types, text):
+                    send_results(chat_id, user_id, ctx, ans["keywords"], ans["lang"] or lang, types, text, require_all=True):
                 return
             if ans["ask"]:
                 ask_question(chat_id, user_id, ctx, "exam" if keywords else "subject", keywords, lang,
                              "🤔 " + esc(ans["ask"]))
                 return
-    send_no_results(chat_id, " ".join(keywords) or text)
+    not_found_reply(chat_id, user, keywords or [text])
 
 
 def handle_guided_callback(query: Dict[str, Any], data: str, chat_id: int) -> None:
@@ -5389,6 +5433,16 @@ def aidiag() -> Any:
     res["probe_json"] = ai_probe(True, request.args.get("all") == "1")
     if request.args.get("plain") == "1":
         res["probe_plain"] = ai_probe(False)
+    if request.args.get("q"):
+        try:
+            u = understand(request.args.get("q", ""))
+            rows = search_rows(u["keywords"], u["lang"], u["types"], require_all=True) if u["keywords"] else []
+            fz = fuzzy_rows(u["keywords"]) if u["keywords"] and not rows else []
+            res["search"] = {"intent": u["intent"], "keywords": u["keywords"], "results": [str(r.get("title"))[:60] for r in rows[:8]],
+                             "n": len(rows), "fuzzy": [str(r.get("title"))[:60] for r in fz[:5]],
+                             "key_terms": [k for k in u["keywords"] if is_key_term(k)]}
+        except Exception as exc:
+            res["search"] = {"error": _err_class(exc)}
     if request.args.get("logtest") == "1":
         try:
             res["logtest"] = log_test()
@@ -5526,6 +5580,119 @@ def log_test_text(res: Dict[str, Any]) -> str:
     return (f"❌ Log Chat me message nahi gaya.\nWajah: {res.get('reason')}\n" + (f"({kind}: {res.get('title')})\n" if res.get("title") else "") +
             "\nGroup ho to: bot ko group me add karo → admin banao (Send Messages on).\n"
             "Channel ho to: bot admin + Post Messages on.\nAasaan tarika: us group me /setlogchat bhejo — wahi group Log Chat ban jayega.")
+
+
+
+# ---- user search understanding (Aarav 6:40 PM, a user "Yash"): generic asks, truly-missing books, relevance
+
+def is_key_term(k: str) -> bool:
+    k = normalize(k)
+    return k in EXAM_WORDS or k in SUBJECT_WORDS or k in ALIASES
+
+
+def fuzzy_rows(keywords: List[str]) -> List[Dict[str, Any]]:
+    """Spelling-tolerant match on file names ("lusent" → Lucent): every keyword ≥4 letters must closely match a word
+    of the title / original file name (short ones exactly). Cheap: one query, no AI."""
+    import difflib
+    kws = [normalize(k) for k in keywords if normalize(k)]
+    if not kws or not any(len(k) >= 4 for k in kws):
+        return []
+    try:
+        rows = supabase("books", "GET", query="?select=id,title,file_name,caption&status=eq.indexed&order=id.desc&limit=3000")
+    except Exception:
+        return []
+    out = []
+    for r in rows:
+        words = set(re.findall(r"[a-z0-9]+|[\u0900-\u097F]+", normalize(" ".join(str(r.get(c) or "") for c in ("title", "file_name", "caption")))))
+        if not words:
+            continue
+        ok = True
+        for k in kws:
+            g = set(ALIASES.get(k, {k})) | {k}
+            if any(x in words for x in g):
+                continue
+            if len(k) >= 4 and difflib.get_close_matches(k, list(words), n=1, cutoff=0.8):
+                continue
+            ok = False
+            break
+        if ok:
+            out.append(r)
+    return out[:30]
+
+
+def top_categories(n: int = 6) -> List[Any]:
+    try:
+        rows = category_rows()
+    except Exception:
+        return []
+    counts: Dict[str, int] = {}
+    for r in rows:
+        counts[r["_cat"]] = counts.get(r["_cat"], 0) + 1
+    order = sorted((s for s in counts if s != "other"), key=lambda s: (-counts[s], cat_label(s)))[:n]
+    return [(s, counts[s]) for s in order]
+
+
+def category_buttons(n: int = 6) -> List[Any]:
+    kb: List[Any] = []
+    row: List[Any] = []
+    for slug, c in top_categories(n):
+        row.append({"text": f"{cat_emoji(slug)} {cat_label(slug)} ({c})", "callback_data": f"cat:{slug}:1"})
+        if len(row) == 2:
+            kb.append(row)
+            row = []
+    if row:
+        kb.append(row)
+    return kb
+
+
+def most_taken(n: int = 5) -> List[Dict[str, Any]]:
+    try:
+        logs = supabase("delivery_logs", "GET", query="?select=book_id&order=created_at.desc&limit=1000")
+    except Exception:
+        return []
+    counts: Dict[int, int] = {}
+    for x in logs:
+        if x.get("book_id"):
+            counts[int(x["book_id"])] = counts.get(int(x["book_id"]), 0) + 1
+    ids = [i for i, _ in sorted(counts.items(), key=lambda kv: -kv[1])[:n * 2]]
+    if not ids:
+        return []
+    try:
+        rows = supabase("books", "GET", query=f"?id=in.({','.join(str(i) for i in ids)})&status=eq.indexed&select=id,title")
+    except Exception:
+        return []
+    by = {int(r["id"]): r for r in rows}
+    return [by[i] for i in ids if i in by][:n]
+
+
+def generic_reply(chat_id: int, user_id: Optional[int]) -> None:
+    kb = category_buttons(6)
+    top = most_taken(5)
+    text = "📚 Kis subject/exam ki chahiye?\nNiche category chuno, ya naam likho (jaise: lucent, ssc gd gk)."
+    if top:
+        text += "\n\n🔥 Sabse zyada li gayi files:"
+        kb += [[{"text": f"🔥 {str(r.get('title') or 'Untitled')[:42]}", "callback_data": f"book:{r['id']}"}] for r in top]
+    if not kb:
+        kb = [[{"text": label, "callback_data": f"g:s:{val}"}] for label, val in SUBJECT_BUTTONS[:6]]
+    send_text(chat_id, text, {"inline_keyboard": kb})
+
+
+def not_found_reply(chat_id: int, user: Dict[str, Any], keywords: List[str]) -> None:
+    q = " ".join(k for k in keywords if k).strip()[:60] or "ye"
+    uid = user.get("id")
+    kb = category_buttons(6)
+    if uid and is_subadmin(uid):
+        send_no_results(chat_id, q)
+        return
+    try:
+        who = user_label({"first_name": user.get("first_name"), "last_name": user.get("last_name"),
+                          "username": user.get("username")}) if (user.get("first_name") or user.get("username")) else f"user {uid}"
+        audit_log(f"🔎 Missing request: {q} ({who}) · {ist_now()} IST")
+    except Exception:
+        log_error("missing log")
+    send_text(chat_id, f"😕 {q[:1].upper() + q[1:]} abhi nahi hai. Admin ko bata diya ✅\n\n"
+                       + ("Ye categories dekh lo 👇" if kb else "Thodi der baad dobara try karna."),
+              {"inline_keyboard": kb} if kb else None)
 
 
 
