@@ -33,6 +33,10 @@ GROQ_MODEL = os.environ.get("GROQ_MODEL", "").strip()
 AI_TURNS_PER_CHAT = 4          # AI calls per user per conversation (conversation = 30 min context)
 AI_DAILY_PER_USER = int(os.environ.get("AI_DAILY_PER_USER", "12") or 12)
 AI_DAILY_TOTAL = int(os.environ.get("AI_DAILY_LIMIT", "2000") or 2000)
+AI_UNDERSTAND = os.environ.get("AI_UNDERSTAND", "1").strip().lower() not in {"0", "off", "false", "no"}
+AI_UNDERSTAND_PER_USER = int(os.environ.get("AI_UNDERSTAND_DAILY", "40") or 40)   # fresh AI readings per user per IST day
+AI_UNDERSTAND_CAP = 4.0          # seconds; then the local parser answers
+UNDERSTAND_CACHE_TTL = 24 * 3600
 AI_RANK = os.environ.get("AI_RANK", "").strip().lower() in {"1", "true", "on", "yes"}
 # Owner IDs from Vercel env. Accept any separator/format people paste:
 # "123,456", "123 456", '"123"', "[123]", "@123", "-123", newlines...
@@ -785,6 +789,12 @@ def status_text(user_id: Optional[int]) -> str:
         nb = named_by_counts()
         lines.append(f"🏷️ Naam kaise bane: saaf naam {nb['clean']} · page padhke {nb['local_text']} (dono 0 token) · "
                      f"AI {nb['ai']} · fallback {nb['fallback']}")
+    except Exception:
+        pass
+    try:
+        ub = understood_counts()
+        lines.append(f"🧠 Msg kaise samjhe: AI {ub['ai']} · cache {ub['cache']} (0 token) · bina AI (fallback) {ub['local_fallback']}"
+                     f" · seedha naam {ub['exact']} (0 token)")
     except Exception:
         pass
     lines.append("\nNote: admins par join gate lagu nahi hota. Gate test karne ke liye dusre (normal) account se /start karo.")
@@ -1659,14 +1669,17 @@ def drop_groq_model(key: str, model: str) -> None:
         log_error("drop_groq_model")
 
 
-def groq_body(model: str, messages: List[Dict[str, Any]], max_tokens: int) -> Dict[str, Any]:
+def groq_body(model: str, messages: List[Dict[str, Any]], max_tokens: int, fast: bool = False) -> Dict[str, Any]:
     """Request body per model family. gpt-oss models think before answering: with a small max_tokens the
-    thinking eats the budget, the JSON comes out empty and Groq answers 400 json_validate_failed (seen live)."""
+    thinking eats the budget, the JSON comes out empty and Groq answers 400 json_validate_failed (seen live).
+    fast=True (the per-message understanding call): the shortest think the model allows, a small extra budget."""
     body: Dict[str, Any] = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": 0.1,
                             "response_format": {"type": "json_object"}}
     if "gpt-oss" in model:
         body["reasoning_effort"] = "low"
-        body["max_tokens"] = max_tokens + 600
+        body["max_tokens"] = max_tokens + (250 if fast else 600)
+    elif fast and "qwen3" in model:
+        body["reasoning_effort"] = "none"
     return body
 
 
@@ -1675,8 +1688,12 @@ def strip_think(text: Any) -> str:
     return t
 
 
-def ai_complete(system: str, user_text: str, max_tokens: int = 150, cap: float = 9.0) -> Optional[str]:
+_AI_LAST: Dict[str, Any] = {}   # model / ms / usage of the last successful call (diag only, never keys)
+
+
+def ai_complete(system: str, user_text: str, max_tokens: int = 150, cap: float = 9.0, fast: bool = False) -> Optional[str]:
     messages = [{"role": "system", "content": system}, {"role": "user", "content": user_text}]
+    _AI_LAST.clear()
     pool = groq_pool()
     usable = [k for k in pool if not key_cooling(k)] or pool
     # One overall time cap, however many keys there are: the webhook must answer Telegram fast,
@@ -1687,12 +1704,17 @@ def ai_complete(system: str, user_text: str, max_tokens: int = 150, cap: float =
             if time.time() > deadline - 1:
                 return None
             try:
+                t_call = time.time()
                 res = http_json("https://api.groq.com/openai/v1/chat/completions", "POST",
-                                groq_body(model, messages, max_tokens), {"Authorization": f"Bearer {key}"},
+                                groq_body(model, messages, max_tokens, fast), {"Authorization": f"Bearer {key}"},
                                 timeout=max(1.0, min(7.0, deadline - time.time())))
                 content = strip_think(res["choices"][0]["message"].get("content"))
                 if not content:
                     continue
+                usage = res.get("usage") if isinstance(res, dict) else None
+                _AI_LAST.update(provider="groq", model=model, ms=int((time.time() - t_call) * 1000),
+                                usage={k: usage.get(k) for k in ("prompt_tokens", "completion_tokens", "total_tokens")
+                                       if isinstance(usage, dict) and k in usage} if isinstance(usage, dict) else None)
                 return content
             except Exception as exc:
                 low = str(exc).lower()
@@ -1951,9 +1973,28 @@ def ask_question(chat_id: int, user_id: Optional[int], ctx: Dict[str, Any], kind
 
 
 def smart_reply(chat_id: int, user: Dict[str, Any], text: str, searched: bool = False) -> None:
-    """searched=True: an admin already tapped 🔍 Search — just search, never ask again."""
+    """Every free-text search message (users, and admins' searches). Aarav 6:44 PM Oct 26: "ai phle understand
+    krega fir uske liye book search hogi" — one small AI reading first (cached 24 h), then the search with what it
+    understood; the free local parser is the fallback whenever the AI is not available, slow or limited."""
     user_id = user.get("id")
     u = understand(text)
+    ctx = load_ctx(user_id)
+    if not is_follow_up(u, ctx):
+        try:
+            if ai_first_reply(chat_id, user, text, u, ctx, searched):
+                return
+        except Exception:
+            log_error("ai_first")
+            count_understood("local_fallback")
+    smart_reply_local(chat_id, user, text, searched, u=u, allow_ai=not AI_UNDERSTAND, ctx=ctx)
+
+
+def smart_reply_local(chat_id: int, user: Dict[str, Any], text: str, searched: bool = False,
+                      u: Optional[Dict[str, Any]] = None, allow_ai: bool = False,
+                      ctx: Optional[Dict[str, Any]] = None) -> None:
+    """The free local parser (e497af1 rules). searched=True: an admin already tapped 🔍 Search — never ask again."""
+    user_id = user.get("id")
+    u = u or understand(text)
     intent = u["intent"]
     if intent == "greeting":
         send_text(chat_id, greeting_msg(user), None, "HTML")
@@ -1964,7 +2005,7 @@ def smart_reply(chat_id: int, user: Dict[str, Any], text: str, searched: bool = 
     if intent in {"off_topic", "empty"}:
         offtopic_reply(chat_id, user, text, searched)
         return
-    ctx = load_ctx(user_id)
+    ctx = ctx if ctx is not None else load_ctx(user_id)
     if intent == "more":
         show_more(chat_id, user_id, ctx)
         return
@@ -2005,8 +2046,9 @@ def smart_reply(chat_id: int, user: Dict[str, Any], text: str, searched: bool = 
         # Local parsing understood it (lucent, gd, gk…) and it is truly not there → no AI tokens.
         not_found_reply(chat_id, user, keywords)
         return
-    # No known word at all (typos, long sentences): ask the AI once, within the limits.
-    if ai_budget_ok(user_id, ctx):
+    # No known word at all (typos, long sentences): ask the AI once, within the limits — only when the
+    # AI-first reading is switched off (AI_UNDERSTAND=0); otherwise the AI was already tried for this message.
+    if allow_ai and ai_budget_ok(user_id, ctx):
         ans = ai_interpret(text, ctx)
         ai_spend(user_id, ctx)
         save_ctx(user_id, ctx)
@@ -4201,6 +4243,7 @@ def diagnostics() -> Dict[str, Any]:
         pass
     try:
         d["named_by"] = named_by_counts()          # clean / local_text = 0 tokens; ai = one small call; fallback
+        d["understood_by"] = understood_counts()   # user msgs: ai = one small call; cache / exact = 0 tokens; local_fallback
         d["categories_auto"] = sorted(cat_registry())
         _REQ.pop("_catreg", None)
     except Exception:
@@ -4229,6 +4272,12 @@ def setup_status() -> Dict[str, Any]:
     }
     try:  # how new files got their names: clean + local_text cost 0 tokens, ai = one small call each
         status["named_by"] = named_by_counts()
+    except Exception:
+        pass
+    status["ai_understand"] = "on (AI first, cache 24 h, local fallback)" if AI_UNDERSTAND else "off (local parser)"
+    try:  # how user messages were understood: ai = one small call; cache + exact = 0 tokens; local_fallback = no AI
+        status["understood_by"] = understood_counts()
+        prune_understand_cache()
     except Exception:
         pass
     if GROQ_KEYS:
@@ -5443,6 +5492,30 @@ def aidiag() -> Any:
                              "key_terms": [k for k in u["keywords"] if is_key_term(k)]}
         except Exception as exc:
             res["search"] = {"error": _err_class(exc)}
+    if request.args.get("u"):
+        try:
+            txt_u = request.args.get("u", "")[:200]
+            t_u = time.time()
+            d_u, src_u = ai_understand(txt_u, None, use_cache=request.args.get("nocache") != "1")
+            res["understand"] = {"text": txt_u, "source": src_u, "json": d_u, "ms": int((time.time() - t_u) * 1000),
+                                 "exact_skip": exact_name_hit(txt_u),
+                                 "model": _AI_LAST.get("model") if src_u == "ai" else None,
+                                 "usage": _AI_LAST.get("usage") if src_u == "ai" else None}
+            if d_u:
+                sets_u, _, lang_u = understanding_term_sets(d_u)
+                res["understand"]["term_sets"] = sets_u
+                hit = []
+                for kws in sets_u:
+                    rows = search_rows(kws, lang_u, None, require_all=True)
+                    if rows:
+                        hit = [str(r.get("title"))[:60] for r in rows[:5]]
+                        res["understand"]["matched_set"] = kws
+                        break
+                res["understand"]["results"] = hit
+                res["understand"]["label"] = understanding_label(d_u)
+            res["understood_by"] = understood_counts()
+        except Exception as exc:
+            res["understand"] = {"error": _err_class(exc)}
     if request.args.get("logtest") == "1":
         try:
             res["logtest"] = log_test()
@@ -5677,7 +5750,7 @@ def generic_reply(chat_id: int, user_id: Optional[int]) -> None:
     send_text(chat_id, text, {"inline_keyboard": kb})
 
 
-def not_found_reply(chat_id: int, user: Dict[str, Any], keywords: List[str]) -> None:
+def not_found_reply(chat_id: int, user: Dict[str, Any], keywords: List[str], understood: str = "") -> None:
     q = " ".join(k for k in keywords if k).strip()[:60] or "ye"
     uid = user.get("id")
     kb = category_buttons(6)
@@ -5687,12 +5760,288 @@ def not_found_reply(chat_id: int, user: Dict[str, Any], keywords: List[str]) -> 
     try:
         who = user_label({"first_name": user.get("first_name"), "last_name": user.get("last_name"),
                           "username": user.get("username")}) if (user.get("first_name") or user.get("username")) else f"user {uid}"
-        audit_log(f"🔎 Missing request: {q} ({who}) · {ist_now()} IST")
+        audit_log(f"🔎 Missing request: {q} ({who}) · {ist_now()} IST" + (f"\n🤖 {understood}" if understood else ""))
     except Exception:
         log_error("missing log")
     send_text(chat_id, f"😕 {q[:1].upper() + q[1:]} abhi nahi hai. Admin ko bata diya ✅\n\n"
                        + ("Ye categories dekh lo 👇" if kb else "Thodi der baad dobara try karna."),
               {"inline_keyboard": kb} if kb else None)
+
+
+
+# ================================================================ v10: AI understands first, then the search (Aarav 6:44 PM Oct 26)
+# "Bhai ai phle understand krega fir uske liye book search hogi." Every non-command free-text search message:
+#   1) one small AI reading (cheapest model of the key's own list, tiny prompt, ≤150 answer tokens, 4 s cap)
+#      → {intent, subject, exam, book, topic, keywords}; cached 24 h by normalised text (repeats cost 0 tokens);
+#      a 1-word exact file/category name skips the AI;
+#   2) the search with what it understood + the alias map + the e497af1 relevance rules (every term must match);
+#   3) AI down / slow / limited → the free local parser (e497af1), never an AI error to users.
+
+UNDERSTAND_SYSTEM = (
+    "You read messages sent to a Telegram bot that searches study PDFs for Indian govt exams. Messages are "
+    "Hindi/Hinglish/English with typos. Reply ONLY with JSON: "
+    '{"intent":"search|recommend|greeting|other","subject":null,"exam":null,"book":null,"topic":null,"keywords":[]}. '
+    "search = asks for a subject/exam/book/topic; recommend = wants some good book but names no subject/exam/book; "
+    "greeting = hi/hello only; other = thanks, chat, not about study files. exam = full name (gd -> \"SSC GD\", "
+    "ntpc -> \"RRB NTPC\"). subject like \"GK\", \"Maths\", \"History\". book = a title only if the user names one "
+    "(lucent -> \"Lucent GK\"). keywords = 1-4 words likely in a file name, spelling fixed, no filler words "
+    "(do, dedo, chahiye, book, pdf, bhai). Never invent books.")
+UNDERSTOOD_BY = ("ai", "cache", "local_fallback", "exact")
+_UCACHE: Dict[str, Any] = {}
+_UNDERSTAND_INTENTS = {"search", "recommend", "greeting", "other"}
+_THANK_STRONG = {"thanks", "thank", "thanku", "thankyou", "thnx", "thx", "ty", "shukriya", "dhanyawad", "dhanyavad",
+                 "dhanyvad", "शुक्रिया", "धन्यवाद"}
+_EXAM_PREFIX = {"ssc", "rrb", "upsc", "exam", "exams", "bharti", "recruitment"}
+
+
+def is_follow_up(u: Dict[str, Any], ctx: Dict[str, Any]) -> bool:
+    """Replies to the bot's own last answer ("aur dikhao", the exam it just asked for, "iski english wali") need
+    the conversation, not a fresh reading — they stay on the local path that holds the context."""
+    kws = u.get("keywords") or []
+    if u.get("intent") == "more":
+        return True
+    if ctx.get("ask") and ctx.get("pending") and kws and len(kws) <= 3 and \
+            all(k in EXAM_WORDS or k in SUBJECT_WORDS for k in kws):
+        return True
+    return bool(not kws and u.get("ref") and ctx.get("q") and (u.get("lang") or u.get("types")))
+
+
+def understand_key(text: str) -> str:
+    return " ".join(tokenize(text))[:200]
+
+
+def count_understood(src: str) -> None:
+    if src not in UNDERSTOOD_BY:
+        return
+    try:
+        d = json.loads(get_setting("understood_by") or "{}")
+    except Exception:
+        d = {}
+    d[src] = int(d.get(src) or 0) + 1
+    try:
+        set_setting("understood_by", json.dumps(d, separators=(",", ":")))
+    except Exception:
+        log_error("understood_by")
+
+
+def understood_counts() -> Dict[str, int]:
+    try:
+        d = json.loads(get_setting("understood_by") or "{}")
+    except Exception:
+        d = {}
+    return {k: int(d.get(k) or 0) for k in UNDERSTOOD_BY}
+
+
+def exact_name_hit(text: str) -> bool:
+    """One word that already IS a file or category name ("lucent", "history", "polity") — the local search finds it
+    exactly, so the AI call is skipped (pure cost saving)."""
+    toks = [t for t in tokenize(text) if t]
+    if len(toks) != 1:
+        return False
+    w = toks[0]
+    if len(w) < 2 or w in FILLER or w in STRONG_GREET or w in THANK_WORDS or w in OFF_WORDS:
+        return False
+    if is_key_term(w) or w in CAT_SYNONYMS or known_category(w):
+        return True
+    try:
+        rows = supabase("books", "GET", query="?select=id&status=eq.indexed&limit=1&title=ilike." + urllib.parse.quote(w))
+        return bool(rows)
+    except Exception:
+        return False
+
+
+def clean_understanding(data: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(data, dict):
+        return None
+    intent = str(data.get("intent") or "").strip().lower()
+    intent = {"book": "search", "find": "search", "recommendation": "recommend", "greet": "greeting",
+              "off_topic": "other", "offtopic": "other", "thanks": "other"}.get(intent, intent)
+    if intent not in _UNDERSTAND_INTENTS:
+        return None
+    out: Dict[str, Any] = {"intent": intent}
+    for f in ("subject", "exam", "book", "topic"):
+        v = data.get(f)
+        if isinstance(v, list):
+            v = " ".join(str(x) for x in v if isinstance(x, (str, int)))
+        v = re.sub(r"\s+", " ", str(v)).strip() if isinstance(v, (str, int)) and str(v).strip().lower() not in {"", "null", "none"} else None
+        out[f] = v[:40] if v else None
+    kws = []
+    for k in (data.get("keywords") or [])[:6] if isinstance(data.get("keywords"), list) else []:
+        if isinstance(k, (str, int)) and str(k).strip():
+            kws.append(re.sub(r"\s+", " ", str(k)).strip()[:30])
+    out["keywords"] = kws[:4]
+    return out
+
+
+def understanding_label(d: Dict[str, Any]) -> str:
+    """What the AI understood, for logs / diag: "exam SSC GD · subject GK"."""
+    parts = [f"{f} {d[f]}" for f in ("book", "exam", "subject", "topic") if d.get(f)]
+    if d.get("keywords"):
+        parts.append("words " + ", ".join(d["keywords"]))
+    return f"{d.get('intent')}: " + (" · ".join(parts) if parts else "—")
+
+
+def ai_understand(text: str, user_id: Optional[int], use_cache: bool = True) -> tuple:
+    """(understanding, "ai" | "cache") or (None, reason). Never raises, never shows anything."""
+    key = understand_key(text)
+    if not key:
+        return None, "empty"
+    ck = "aiu:" + hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+    if use_cache:
+        hit = _UCACHE.get(ck)
+        if hit and time.time() - hit[0] < UNDERSTAND_CACHE_TTL:
+            return dict(hit[1]), "cache"
+        try:
+            raw = get_setting(ck)
+            if raw:
+                c = json.loads(raw)
+                if time.time() - float(c.get("t") or 0) < UNDERSTAND_CACHE_TTL and isinstance(c.get("d"), dict):
+                    _UCACHE[ck] = (float(c["t"]), c["d"])
+                    return dict(c["d"]), "cache"
+        except Exception:
+            log_error("aiu cache read")
+    if not ai_provider():
+        return None, "no_key"
+    pool = groq_pool() + openai_pool()
+    if pool and all(key_cooling(k) for k in pool):
+        return None, "keys_cooling"           # every key is resting after a limit/error: answer locally, at once
+    today = ist_day()
+    for k, cap in ((f"aiuday:{user_id}", AI_UNDERSTAND_PER_USER), ("aiday:all", AI_DAILY_TOTAL)):
+        if k.endswith(":None"):
+            continue
+        day, _, n = (get_setting(k) or "").partition(":")
+        if day == today and n.isdigit() and int(n) >= cap:
+            return None, "daily_limit"
+    content = ai_complete(UNDERSTAND_SYSTEM, "Message: " + text.strip()[:200], max_tokens=150,
+                          cap=AI_UNDERSTAND_CAP, fast=True)
+    for k in ([f"aiuday:{user_id}"] if user_id else []) + ["aiday:all"]:
+        try:
+            day, _, n = (get_setting(k) or "").partition(":")
+            set_setting(k, f"{today}:{int(n) + 1 if day == today and n.isdigit() else 1}")
+        except Exception:
+            log_error("aiu spend")
+    if not content:
+        return None, "ai_failed"
+    try:
+        d = clean_understanding(json.loads(content[content.find("{"): content.rfind("}") + 1]))
+    except Exception:
+        d = None
+    if not d:
+        return None, "bad_json"
+    now = time.time()
+    _UCACHE[ck] = (now, d)
+    if len(_UCACHE) > 500:
+        for old in sorted(_UCACHE, key=lambda x: _UCACHE[x][0])[:100]:
+            _UCACHE.pop(old, None)
+    try:
+        supabase("bot_settings", "POST", {"key": ck, "updated_at": now_iso(), "value": json.dumps(
+            {"t": int(now), "q": key[:80], "d": d}, ensure_ascii=False, separators=(",", ":"))}, "?on_conflict=key")
+    except Exception:
+        log_error("aiu cache write")
+    return dict(d), "ai"
+
+
+_UPRUNE = {"t": 0.0}
+
+
+def prune_understand_cache() -> None:
+    """Drop cached readings older than a day (runs at most hourly, from GET / — the keepalive)."""
+    if time.time() - _UPRUNE["t"] < 3600:
+        return
+    _UPRUNE["t"] = time.time()
+    cutoff = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - UNDERSTAND_CACHE_TTL - 3600))
+    try:
+        supabase("bot_settings", "DELETE", query=f"?key=like.aiu%3A*&updated_at=lt.{cutoff}")
+    except Exception:
+        log_error("aiu prune")
+
+
+def _terms(value: Any) -> tuple:
+    """Search words of one AI field through the same rules as the local parser: (keywords, lang)."""
+    if not value:
+        return [], None
+    u = understand(" ".join(value) if isinstance(value, list) else str(value))
+    return [k for k in u["keywords"] if k not in FILLER], u["lang"]
+
+
+def understanding_term_sets(d: Dict[str, Any]) -> tuple:
+    """Keyword sets to try, most specific first. Every set must match fully (e497af1: never unrelated files).
+    Subject / topic / book words are never dropped; only an exam prefix like "ssc" in "ssc gd" may go."""
+    lang = None
+    structured: List[str] = []
+    for f in ("book", "exam", "subject", "topic"):
+        t, lg = _terms(d.get(f))
+        lang = lang or lg
+        structured += [x for x in t if x not in structured]
+    kw, lg = _terms(d.get("keywords"))
+    lang = lang or lg
+    book, _ = _terms(d.get("book"))
+
+    def no_prefix(ws: List[str]) -> List[str]:
+        rest = [w for w in ws if w not in _EXAM_PREFIX]
+        return rest if rest and any(w in EXAM_WORDS for w in rest) and len(rest) < len(ws) else ws
+
+    sets: List[List[str]] = []
+    for s in (structured, no_prefix(structured), book, book[:1] if len(book) > 1 and book[0] not in EXAM_WORDS else [],
+              kw, no_prefix(kw)):
+        s = s[:5]
+        if s and s not in sets:
+            sets.append(s)
+    return sets, structured, lang
+
+
+def ai_first_reply(chat_id: int, user: Dict[str, Any], text: str, u: Dict[str, Any], ctx: Dict[str, Any],
+                   searched: bool = False) -> bool:
+    """True when the message was answered from the AI's reading; False → the local parser answers."""
+    if not AI_UNDERSTAND:
+        return False
+    if exact_name_hit(text):
+        count_understood("exact")
+        return False
+    d, src = ai_understand(text, user.get("id"))
+    if not d:
+        count_understood("local_fallback")
+        return False
+    if act_on_understanding(chat_id, user, text, d, u, ctx, searched):
+        count_understood(src)
+        return True
+    count_understood("local_fallback")
+    return False
+
+
+def act_on_understanding(chat_id: int, user: Dict[str, Any], text: str, d: Dict[str, Any], u: Dict[str, Any],
+                         ctx: Dict[str, Any], searched: bool = False) -> bool:
+    user_id = user.get("id")
+    intent = d["intent"]
+    local_key = [k for k in u.get("keywords") or [] if is_key_term(k)]
+    sets, structured, ai_lang = understanding_term_sets(d)
+    if intent == "greeting" and not local_key and not structured:
+        send_text(chat_id, greeting_msg(user), None, "HTML")
+        return True
+    if intent == "other" and not local_key and not structured:
+        if u.get("intent") == "thanks" or set(u.get("tokens") or tokenize(text)) & _THANK_STRONG:
+            send_text(chat_id, THANKS_MSG)
+        else:
+            offtopic_reply(chat_id, user, text, searched)
+        return True
+    if intent == "recommend" and not structured:
+        generic_reply(chat_id, user_id)          # "ek bdhiya si book do" → subjects + most-taken files
+        return True
+    if not sets:
+        return False                              # nothing searchable understood ("hindi ki book") → local rules
+    lang, types = u.get("lang") or ai_lang, u.get("types") or []
+    for kws in sets:
+        rows = search_rows(kws, lang, types, require_all=True)
+        if rows:
+            return send_results(chat_id, user_id, ctx, kws, lang, types, text, rows=rows)
+    for kws in sets[:3]:
+        fz = fuzzy_rows(kws)
+        if fz:
+            return send_results(chat_id, user_id, ctx, kws, lang, types, text, rows=fz)
+    label = d.get("book") or " ".join(dict.fromkeys(x for x in (d.get("exam"), d.get("subject"), d.get("topic")) if x)) \
+        or " ".join(sets[0])
+    not_found_reply(chat_id, user, [label], understood=f"AI samjha ({understanding_label(d)}) · msg: “{text.strip()[:80]}”")
+    return True
 
 
 
