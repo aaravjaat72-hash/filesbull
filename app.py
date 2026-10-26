@@ -1222,8 +1222,9 @@ def handle_admin_callback(query: Dict[str, Any], data: str, chat_id: int, user_i
     data = legacy.get(data, data)
     cmd = data[3:]
     # the settings most admin screens read, fetched in ONE round trip (was one DB call each)
-    prefetch_settings([f"admsearch:{user_id}", f"pending:{user_id}", "log_chat_id", "backup_chat_id", "ai_naming",
-                       LOGCHAT_STATUS_KEY] + (["ainame_cursor", "ainame_queue"] if cmd == "ainame" else []))
+    if cmd in ("panel", "smode", "usermenu", "backup", "log", "logtest", "ainame", "cmdq") or cmd.startswith("cmdq:"):
+        prefetch_settings([f"admsearch:{user_id}", f"pending:{user_id}", "log_chat_id", "backup_chat_id", "ai_naming",
+                           LOGCHAT_STATUS_KEY] + (["ainame_cursor", "ainame_queue"] if cmd == "ainame" else []))
     _conf = cmd.startswith("y:")
     _rc = cmd[2:] if _conf else cmd
     if _rc.startswith(("rt", "keyadd")) and handle_router_callback(query, _rc, _conf, chat_id, user_id):
