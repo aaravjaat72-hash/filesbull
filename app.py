@@ -1,3 +1,5 @@
+import time as _t0mod
+_BOOT_T0 = _t0mod.time()
 import base64
 import hashlib
 import hmac
@@ -67,6 +69,29 @@ def log_error(where: str) -> None:
     print(f"[filesbull] error in {where}:\n{text}", flush=True)
 
 
+# ---- diagnostics: per-call timing trace + dry run (used only by /api/cbdiag; off for real updates)
+_DIAG: Dict[str, Any] = {"on": False, "dry": False, "t0": 0.0, "calls": [], "sent": []}
+_TG_READ = {"getMe", "getChat", "getChatMember", "getFile", "getWebhookInfo", "getChatMemberCount", "getMyCommands",
+            "getChatAdministrators"}
+
+
+def diag_label(url: str, method: str) -> str:
+    if "api.telegram.org" in url:
+        return "tg:" + url.rsplit("/", 1)[-1].split("?")[0]
+    if SUPABASE_URL and url.startswith(SUPABASE_URL):
+        rest = url[len(SUPABASE_URL) + 9:]
+        tbl = rest.split("?")[0]
+        m = re.search(r"key=eq\.([^&]+)", rest)
+        return f"db:{method} {tbl}" + (f" {urllib.parse.unquote(m.group(1)).split(':')[0]}" if m else "")
+    return "ext:" + urllib.parse.urlparse(url).netloc
+
+
+def http_send(url: str, method: str, body: Optional[bytes], headers: Dict[str, str], timeout: float) -> Dict[str, Any]:
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
 def http_json(url: str, method: str = "GET", payload: Optional[Dict[str, Any]] = None,
               headers: Optional[Dict[str, str]] = None, timeout: float = 20) -> Dict[str, Any]:
     body = None
@@ -77,10 +102,9 @@ def http_json(url: str, method: str = "GET", payload: Optional[Dict[str, Any]] =
         final_headers.update(headers)
     if payload is not None:
         body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=body, headers=final_headers, method=method)
+    t_call = time.monotonic()
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
-            return json.loads(response.read().decode("utf-8"))
+        return http_send(url, method, body, final_headers, timeout)
     except urllib.error.HTTPError as exc:
         # Surface the API's own reason (e.g. Telegram "Bad Request: chat not found",
         # Supabase "column ... does not exist") instead of a bare "HTTP Error 400".
@@ -101,11 +125,21 @@ def http_json(url: str, method: str = "GET", payload: Optional[Dict[str, Any]] =
         except Exception:
             reason = exc.reason
         raise RuntimeError(f"HTTP {exc.code}: {str(reason)[:300]}") from None
+    finally:
+        if _DIAG["on"]:
+            _DIAG["calls"].append([int((t_call - _DIAG["t0"]) * 1000), int((time.monotonic() - t_call) * 1000), diag_label(url, method)])
 
 
 def telegram(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is not configured")
+    if _DIAG["dry"] and method not in _TG_READ:
+        _DIAG["sent"].append({"ms": int((time.monotonic() - _DIAG["t0"]) * 1000), "m": method,
+                              "text": str(payload.get("text") or payload.get("caption") or "")[:160],
+                              "alert": bool(payload.get("show_alert")),
+                              "cb": [b.get("callback_data") for row in ((payload.get("reply_markup") or {}).get("inline_keyboard") or [])
+                                     for b in row if b.get("callback_data")]})
+        return {"ok": True, "result": {"message_id": 1, "chat": {"id": payload.get("chat_id")}}}
     return http_json(f"{TG_API}/{method}", "POST", payload)
 
 
@@ -114,6 +148,9 @@ def supabase(path: str, method: str = "GET", payload: Any = None,
     if not SUPABASE_URL or not SUPABASE_KEY:
         raise RuntimeError("Supabase environment variables are not configured")
     url = f"{SUPABASE_URL}/rest/v1/{path}{query}"
+    if _DIAG["dry"] and method != "GET":
+        _DIAG["sent"].append({"ms": int((time.monotonic() - _DIAG["t0"]) * 1000), "m": f"db:{method} {path}"})
+        return []
     headers = {
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
@@ -6361,6 +6398,9 @@ def telegram_upload(method: str, fields: Dict[str, Any], file_field: str, filena
         if v is None:
             continue
         parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode("utf-8"))
+    if _DIAG["dry"]:
+        _DIAG["sent"].append({"ms": int((time.monotonic() - _DIAG["t0"]) * 1000), "m": method + " (upload)"})
+        return {"ok": True, "result": {"message_id": 1}}
     fn = filename.replace('"', "'")
     parts.append((f"--{boundary}\r\nContent-Disposition: form-data; name=\"{file_field}\"; filename=\"{fn}\"\r\n"
                   "Content-Type: application/octet-stream\r\n\r\n").encode("utf-8") + data + b"\r\n")
@@ -7292,6 +7332,61 @@ def aidiag() -> Any:
         except Exception as exc:
             res["naming"] = {"error": _err_class(exc)}
     return jsonify(res)
+
+
+_INST: Dict[str, Any] = {"born": time.time(), "reqs": 0}
+
+
+@app.before_request
+def _count_request() -> None:
+    _INST["reqs"] += 1
+
+
+def run_cb_diag(data: str, uid: int, msg_text: str = "") -> Dict[str, Any]:
+    """Run one button tap through handle_callback with nothing sent (Telegram writes + DB writes recorded only)."""
+    query = {"id": "diag", "data": data, "from": {"id": uid, "first_name": "Diag", "is_bot": False},
+             "message": {"message_id": 1, "date": int(time.time()), "chat": {"id": uid, "type": "private"}, "text": msg_text}}
+    _REQ.clear()
+    _LOG_QUEUE.clear()
+    _DIAG.update(on=True, dry=True, t0=time.monotonic(), calls=[], sent=[])
+    _REQ_T0[0] = _DIAG["t0"]
+    err = None
+    try:
+        handle_callback(query)
+    except Exception as exc:
+        err = _err_class(exc)
+    t_view = int((time.monotonic() - _DIAG["t0"]) * 1000)
+    try:
+        flush_request()
+    except Exception as exc:
+        err = err or ("flush: " + _err_class(exc))
+    total = int((time.monotonic() - _DIAG["t0"]) * 1000)
+    sent, calls = list(_DIAG["sent"]), list(_DIAG["calls"])
+    _DIAG.update(on=False, dry=False)
+    ans = next((s for s in sent if s["m"] == "answerCallbackQuery"), None)
+    view = next((s for s in sent if s["m"] in ("editMessageText", "sendMessage", "sendDocument", "copyMessage")), None)
+    return {"cb": data, "answer_ms": ans["ms"] if ans else None, "answer_text": ans["text"] if ans else None,
+            "answers": sum(1 for s in sent if s["m"] == "answerCallbackQuery"),
+            "view_ms": view["ms"] if view else None, "view": (view["m"] + ": " + view["text"][:90]) if view else None,
+            "buttons": (view or {}).get("cb", [])[:40], "handler_ms": t_view, "total_ms": total, "error": err,
+            "db_calls": sum(1 for c in calls if c[2].startswith("db:")), "tg_calls": sum(1 for c in calls if c[2].startswith("tg:")),
+            "ext_calls": [c for c in calls if c[2].startswith("ext:")], "slow": sorted(calls, key=lambda c: -c[1])[:6],
+            "sent": [s["m"] for s in sent]}
+
+
+@app.get("/api/cbdiag")
+def cbdiag() -> Any:
+    """Owner-free live timing of button taps: GET /api/cbdiag?t=<diag token>&cb=ad:panel&cb=ad:files:1[&as=user]."""
+    tok = request.args.get("t", "")
+    if not tok or not hmac.compare_digest(hashlib.sha256(tok.encode()).hexdigest(), DIAG_TOKEN_SHA256):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    t_req = time.monotonic()
+    uid = 1 if request.args.get("as") == "user" else (min(ADMIN_USER_IDS) if ADMIN_USER_IDS else 1)
+    inst = {"first_request_on_instance": _INST["reqs"] <= 1, "instance_age_s": int(time.time() - _INST["born"]),
+            "boot_ms": _BOOT_MS[0], "requests_on_instance": _INST["reqs"]}
+    out = [run_cb_diag(cb[:64], uid, request.args.get("msg", "")) for cb in request.args.getlist("cb")[:25]]
+    return jsonify({"ok": True, "build": os.environ.get("VERCEL_GIT_COMMIT_SHA", "")[:7], "instance": inst, "taps": out,
+                    "request_ms": int((time.monotonic() - t_req) * 1000)})
 
 
 @app.after_request
@@ -8734,6 +8829,8 @@ def webhook() -> Any:
     flush_request()
     return jsonify({"ok": True})
 
+
+_BOOT_MS = [int((time.time() - _BOOT_T0) * 1000)]
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
