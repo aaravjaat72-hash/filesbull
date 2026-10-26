@@ -5,6 +5,7 @@ import io
 import os
 import re
 import traceback
+import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional
@@ -49,8 +50,18 @@ def http_json(url: str, method: str = "GET", payload: Optional[Dict[str, Any]] =
     if payload is not None:
         body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=body, headers=final_headers, method=method)
-    with urllib.request.urlopen(req, timeout=20) as response:
-        return json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=20) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        # Surface the API's own reason (e.g. Telegram "Bad Request: chat not found",
+        # Supabase "column ... does not exist") instead of a bare "HTTP Error 400".
+        try:
+            detail = json.loads(exc.read().decode("utf-8", "replace"))
+            reason = detail.get("description") or detail.get("message") or detail.get("error") or str(detail)
+        except Exception:
+            reason = exc.reason
+        raise RuntimeError(f"HTTP {exc.code}: {str(reason)[:300]}") from None
 
 
 def telegram(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
