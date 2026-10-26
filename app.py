@@ -22,6 +22,18 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5-mini")
+# Smart chat AI: Groq (free, OpenAI-compatible) first, OpenAI as fallback. The AI only turns a
+# user's message into search keywords/filters; every result still comes from the database.
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
+GROQ_API_KEY_2 = os.environ.get("GROQ_API_KEY_2", "").strip()
+GROQ_API_KEY_3 = os.environ.get("GROQ_API_KEY_3", "").strip()
+# Backup keys: if key 1 is rate-limited / invalid / down, key 2 (then 3) takes over at once.
+GROQ_KEYS = [k for k in dict.fromkeys([GROQ_API_KEY, GROQ_API_KEY_2, GROQ_API_KEY_3]) if k]
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "").strip()
+AI_TURNS_PER_CHAT = 4          # AI calls per user per conversation (conversation = 30 min context)
+AI_DAILY_PER_USER = int(os.environ.get("AI_DAILY_PER_USER", "12") or 12)
+AI_DAILY_TOTAL = int(os.environ.get("AI_DAILY_LIMIT", "2000") or 2000)
+AI_RANK = os.environ.get("AI_RANK", "").strip().lower() in {"1", "true", "on", "yes"}
 # Owner IDs from Vercel env. Accept any separator/format people paste:
 # "123,456", "123 456", '"123"', "[123]", "@123", "-123", newlines...
 ADMIN_USER_IDS = {
@@ -40,13 +52,14 @@ WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip() or (
 def log_error(where: str) -> None:
     # Printed tracebacks show up in Vercel -> Project -> Logs. Never print the token.
     text = traceback.format_exc()
-    if BOT_TOKEN:
-        text = text.replace(BOT_TOKEN, "***")
+    for secret in (BOT_TOKEN, OPENAI_API_KEY, SUPABASE_KEY, *GROQ_KEYS):
+        if secret:
+            text = text.replace(secret, "***")
     print(f"[filesbull] error in {where}:\n{text}", flush=True)
 
 
 def http_json(url: str, method: str = "GET", payload: Optional[Dict[str, Any]] = None,
-              headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+              headers: Optional[Dict[str, str]] = None, timeout: float = 20) -> Dict[str, Any]:
     body = None
     final_headers = {"Content-Type": "application/json"}
     if headers:
@@ -55,7 +68,7 @@ def http_json(url: str, method: str = "GET", payload: Optional[Dict[str, Any]] =
         body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=body, headers=final_headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=20) as response:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         # Surface the API's own reason (e.g. Telegram "Bad Request: chat not found",
@@ -138,13 +151,43 @@ def set_setting(key: str, value: str) -> None:
     supabase("bot_settings", "POST", {"key": key, "value": value}, "?on_conflict=key")
 
 
+# ---- per-request buffers: user tracking + log-chat lines are written ONCE at the end of
+# each webhook call (one read + one write per user, one log message per update) so a busy
+# bot does not hammer Supabase or hit Telegram's per-chat rate limit.
+_LOG_QUEUE: List[str] = []
+_REQ: Dict[str, Any] = {}
+
+
 def audit_log(text: str) -> None:
+    """Queue a line for the 📝 Log Chat; sent batched at the end of the update."""
+    if text:
+        _LOG_QUEUE.append(text)
+
+
+def flush_logs() -> None:
+    lines = [x for x in _LOG_QUEUE if x]
+    _LOG_QUEUE.clear()
+    if not lines:
+        return
     target = get_setting("log_chat_id")
-    if target:
+    if not target:
+        return
+    chunk = ""
+    chunks = []
+    for line in lines:
+        if len(chunk) + len(line) > 3500:
+            chunks.append(chunk)
+            chunk = ""
+        chunk = (chunk + "\n\n" + line) if chunk else line
+    if chunk:
+        chunks.append(chunk)
+    for part in chunks[:3]:
         try:
-            telegram("sendMessage", {"chat_id": int(target), "text": text})
+            telegram("sendMessage", {"chat_id": int(target), "text": part, "disable_web_page_preview": True,
+                                     "disable_notification": True})
         except Exception:
-            pass
+            log_error("log chat")
+            return
 
 
 def backup_message(source_chat_id: int, source_message_id: int) -> Optional[Dict[str, Any]]:
@@ -435,10 +478,12 @@ def gate_blocks(user_id: Optional[int], chat_id: int) -> bool:
     reqs = required_channels()
     missing = missing_required(user_id, reqs)
     if missing:
+        note_user(None, verified=False)
         send_join_gate(chat_id, missing, left=was_verified(user_id), total=len(reqs))
         return True
     if reqs:
         mark_verified(user_id)
+        note_user(None, verified=True)
     return False
 
 
@@ -480,9 +525,11 @@ def admin_menu() -> Dict[str, Any]:
         [{"text": "➕ Source Channel Jodo", "callback_data": "ad:addsrc"}],
         [{"text": "📋 Source Channels", "callback_data": "ad:srclist"}],
         [{"text": "💾 Backup Channel", "callback_data": "ad:backup"}, {"text": "📝 Log Chat", "callback_data": "ad:log"}],
-        [{"text": "👮 Admins", "callback_data": "ad:admins"}, {"text": "✏️ File Rename", "callback_data": "ad:rename"}],
-        [{"text": "📊 Report", "callback_data": "ad:report"}, {"text": "🩺 Status", "callback_data": "ad:status"}],
-        [{"text": "❓ Admin Help", "callback_data": "ad:help"}, {"text": "🔍 Search Menu", "callback_data": "ad:usermenu"}],
+        [{"text": "💾 Backup: purani files bhi", "callback_data": "ad:bkold"}],
+        [{"text": "👥 Users", "callback_data": "ad:users"}, {"text": "👮 Admins", "callback_data": "ad:admins"}],
+        [{"text": "✏️ File Rename", "callback_data": "ad:rename"}, {"text": "📊 Report", "callback_data": "ad:report"}],
+        [{"text": "🩺 Status", "callback_data": "ad:status"}, {"text": "❓ Admin Help", "callback_data": "ad:help"}],
+        [{"text": "🔍 Search Menu", "callback_data": "ad:usermenu"}],
     ]}
 
 
@@ -497,10 +544,16 @@ PROMPTS = {
                "(Pehle bot ko us channel me admin banao. /cancel = band)", "@channelusername"),
     "addsrc": ("➕ Source channel: channel ka @username, t.me/... link ya -100... ID bhejo, ya us channel ki koi post forward karo.\n"
                "(Bot us channel me admin hona chahiye. /cancel = band)", "@channelusername"),
-    "setbackup": ("💾 Backup channel: private channel ka -100... ID / @username bhejo, ya uski koi post forward karo.\n"
-                  "(Bot wahan admin hona chahiye. /cancel = band)", "-1001234567890"),
-    "setlog": ("📝 Log chat: group/channel ka -100... ID / @username bhejo, ya uski post forward karo. \"me\" bhejo to logs isi chat me aayenge.\n"
-               "(/cancel = band)", "-1001234567890 ya me"),
+    "setbackup": ("💾 Backup channel set karo:\n"
+                  "1️⃣ Telegram me naya PRIVATE channel banao (jaise \"Files Bull Backup\")\n"
+                  "2️⃣ Channel → Administrators → Add Admin → bot chuno → \"Post Messages\" on → Save\n"
+                  "3️⃣ Us channel ki koi bhi post yahan FORWARD karo (ya -100... ID bhejo)\n"
+                  "(/cancel = band)", "Post forward karo ya -100..."),
+    "setlog": ("📝 Log Chat (user track) set karo:\n"
+               "1️⃣ Naya private channel/group banao (jaise \"Files Bull Users\")\n"
+               "2️⃣ Bot ko wahan admin banao (Post Messages on)\n"
+               "3️⃣ Uski koi post yahan FORWARD karo (ya -100... ID bhejo). \"me\" bhejo to logs isi chat me aayenge.\n"
+               "(/cancel = band)", "Post forward karo ya me"),
     "addadmin": ("👮 Naye admin ka Telegram numeric ID bhejo (wo bot me /myid bhejkar dekh sakta hai), ya uska koi message forward karo.\n"
                  "(/cancel = band)", "123456789"),
     "rename": ("✏️ Kis file ka naam badalna hai? File ka naam/keyword bhejo (ya ID aur naya naam: 12 Lucent GK Hindi).\n"
@@ -673,7 +726,7 @@ def report_text() -> str:
         req = len(required_channels())
         src = len(source_channels())
         return (f"📊 Report\nIndexed files: {files}\nFiles bheji gayi (total): {logs}\nAaj bheji gayi: {today_logs}\n"
-                f"Join channels: {req}\nSource channels: {src}\nAI ranking: {'ON' if OPENAI_API_KEY else 'OFF'}\n"
+                f"Join channels: {req}\nSource channels: {src}\nSmart AI: {'ON (' + ai_provider() + ')' if ai_provider() else 'OFF (GROQ_API_KEY nahi)'}\n"
                 f"Backup: {'ON' if get_setting('backup_chat_id') else 'OFF'}\nLog chat: {'ON' if get_setting('log_chat_id') else 'OFF'}")
     except Exception as exc:
         return f"Report nahi ban payi: {str(exc)[:200]}"
@@ -713,14 +766,16 @@ ADMIN_HELP = (
     "➕ Source Channel Jodo — is channel ki nayi files apne-aap index hongi\n"
     "📋 Source Channels — list, ❌ se hatao\n"
     "💾 Backup Channel — har nayi file ki copy yahan, source fail ho to yahan se bhejega\n"
-    "📝 Log Chat — file index/delivery ke logs\n"
+    "💾 Backup: purani files bhi — pehle ki files bhi backup (20-20 karke)\n"
+    "📝 Log Chat — naya user, kisne kaunsi file li, nayi file (user track)\n"
+    "👥 Users — kitne users, aaj active, top 10; /user ID se details\n"
     "👮 Admins — sub-admin jodo/hatao (sirf owner)\n"
     "✏️ File Rename — file ka search naam badlo\n"
     "📊 Report — files aur delivery count\n"
     "🩺 Status — aapka ID, role, channels me bot admin hai ya nahi\n\n"
     "Commands bhi chalti hain: /admin, /requirechannel @ch, /removerequired @ch, /addchannel @ch, /removechannel @ch, "
     "/channels, /requiredchannels, /setbackupchannel, /setlogchat, /addadmin ID, /removeadmin ID, /rename ID naam, "
-    "/report, /stats, /status, /myid, /cancel\n"
+    "/report, /stats, /status, /user ID, /backupold, /myid, /cancel\n"
     "Kisi channel ki post bot ko forward karoge to wo source channel ban jayega."
 )
 
@@ -764,16 +819,30 @@ def handle_admin_input(message: Dict[str, Any], action: str, extra: Any) -> None
                 if src.get("message_id"):
                     record["source_message_id"] = src["message_id"]
                     record["source_link"] = message_link(src, src["message_id"])
-                upsert_item(record)
+                index_file(record, chat_id, message.get("message_id"), str(src.get("title") or "forward"))
                 note += f"\n📄 Ye file bhi save ho gayi: {clean_text(info.get('file_name', 'file'))}"
             send_text(chat_id, f"✅ Source channel jud gaya: {chat.get('title')}\n{note}",
                       {"inline_keyboard": [[{"text": "📋 Source Channels", "callback_data": "ad:srclist"}], BACK_ROW]})
         elif action == "setbackup":
             chat = resolve_chat(message, text)
-            ensure_bot_admin(chat)
+            member = ensure_bot_admin(chat)
+            if chat.get("type") == "channel" and member.get("status") == "administrator" and member.get("can_post_messages") is False:
+                raise InputError(f"Bot \"{chat.get('title', 'channel')}\" me admin hai par \"Post Messages\" permission off hai. Use on karke dobara bhejo.")
+            try:
+                telegram("sendMessage", {"chat_id": chat["id"], "text": "✅ Files Bull backup channel set ho gaya. Bot ki saari files yahan ek-ek baar (bina duplicate) save hongi.",
+                                         "disable_notification": True})
+            except Exception as exc:
+                raise InputError("Bot is channel me message nahi bhej pa raha.\n" + friendly_tg_error(exc)) from None
             set_setting("backup_chat_id", str(chat["id"]))
             clear_pending(user_id)
-            send_text(chat_id, f"✅ Backup channel set: {chat.get('title')}\nNayi indexed files ki copy yahan jayegi.", {"inline_keyboard": [BACK_ROW]})
+            try:
+                pending_n = count_rows("books", backup_pending_query(chat["id"]))
+            except Exception:
+                pending_n = 0
+            kb = [[{"text": f"💾 Backup: purani files bhi ({pending_n})", "callback_data": "ad:bkold"}]] if pending_n else []
+            send_text(chat_id, f"✅ Backup channel set: {chat.get('title')}\nAb har nayi file ek baar yahan save hogi (duplicate nahi)."
+                               + (f"\n\nPurani {pending_n} files bhi save karni hain? Niche dabao 👇" if pending_n else ""),
+                      {"inline_keyboard": kb + [BACK_ROW]})
         elif action == "setlog":
             if text.lower() in {"me", "yahan", "yaha", "here"}:
                 chat = {"id": chat_id, "title": "Ye chat"}
@@ -861,11 +930,22 @@ def handle_admin_callback(query: Dict[str, Any], data: str, chat_id: int, user_i
         except InputError as exc:
             send_text(chat_id, f"❌ Nahi hua: {exc}", {"inline_keyboard": [BACK_ROW]})
     elif cmd == "backup":
-        show(chat_id, *setting_view("backup_chat_id", "💾 Backup Channel", "ad:setbackup", "ad:backupoff",
-                                    "Har nayi indexed file ki copy is private channel me jayegi; source se file na jaye to yahan se bheji jayegi."), query=query)
+        text, kb = setting_view("backup_chat_id", "💾 Backup Channel", "ad:setbackup", "ad:backupoff",
+                                "Bot ki har file ki ek copy is private channel me (bina duplicate). Source se file na jaye to yahan se bheji jayegi.")
+        if get_setting("backup_chat_id"):
+            kb["inline_keyboard"].insert(1, [{"text": "💾 Backup: purani files bhi", "callback_data": "ad:bkold"}])
+        show(chat_id, text, kb, query=query)
+    elif cmd == "bkold":
+        try:
+            telegram("answerCallbackQuery", {"callback_query_id": query.get("id"), "text": "💾 Backup chal raha hai..."})
+        except Exception:
+            pass
+        show(chat_id, *backup_old_view(), query=query)
+    elif cmd == "users":
+        show(chat_id, users_view(), {"inline_keyboard": [[{"text": "🔄 Refresh", "callback_data": "ad:users"}], BACK_ROW]}, query)
     elif cmd == "log":
-        show(chat_id, *setting_view("log_chat_id", "📝 Log Chat", "ad:setlog", "ad:logoff",
-                                    "File index hone aur file bhejne ke logs yahan aayenge."), query=query)
+        show(chat_id, *setting_view("log_chat_id", "📝 Log Chat (User Track)", "ad:setlog", "ad:logoff",
+                                    "Naya user aaya, kisne kaunsi file li, nayi file save hui — sab yahan aayega."), query=query)
     elif cmd in {"setbackup", "setlog"}:
         ask_input(chat_id, user_id, cmd)
     elif cmd in {"backupoff", "logoff"}:
@@ -902,6 +982,880 @@ def handle_admin_callback(query: Dict[str, Any], data: str, chat_id: int, user_i
         show(chat_id, ADMIN_HELP, {"inline_keyboard": [BACK_ROW]}, query)
     else:
         show(chat_id, ADMIN_PANEL_TEXT, admin_menu(), query, "HTML")
+
+
+# ================================================================ smart chat (cheap first, AI second)
+# Every private text goes through understand() first (free, local). Only when that cannot
+# decide does the bot ask the AI — at most AI_TURNS_PER_CHAT times per conversation and
+# AI_DAILY_PER_USER times a day per user. Chit-chat never reaches the AI.
+
+IST_OFFSET = 19800
+CTX_TTL = 1800
+PAGE = 8
+
+HINT_LINE = ("Book ke baare me batao: 📚 kaunsi book, 🎯 kis exam ke liye, 🌐 Hindi ya English?\n"
+             "Jaise: <b>SSC GD GK Hindi</b>")
+OFFTOPIC_MSG = "🙏 Main sirf books / PDF dhoondhne me madad karta hu.\n\n" + HINT_LINE
+THANKS_MSG = "🙏 Khushi hui! Aur koi book chahiye to bas naam likh do 📚"
+NO_CONTEXT_MORE_MSG = "🤔 Pehle batao kaunsi book chahiye.\n\n" + HINT_LINE
+ALL_SHOWN_MSG = ("✅ <b>Is search ki saari files dikha di</b>\n\n"
+                 "Kuch aur chahiye? Book ka naam / exam / subject likho 📚")
+ASK_SUBJECT_MSG = ("📚 <b>Kis subject ki book chahiye?</b>\n"
+                   "<i>Button dabao ya naam likho (jaise: Lucent GK, SSC GD Maths)</i>")
+
+
+def greeting_msg(user: Optional[Dict[str, Any]]) -> str:
+    return f"👋 <b>Namaste {first_name(user)}!</b>\n\n" + HINT_LINE
+
+
+def ask_exam_msg(label: str) -> str:
+    return (f"📚 <b>{esc(label.title())} ki books</b> — kis exam ke liye chahiye? 🎯\n"
+            "<i>Button dabao ya exam ka naam likho</i>")
+
+
+FILLER = set("""
+mujhe muje mjhe mujhko mujko hume humein hamein hame mere mera meri mai main mein me ko ki ka ke kaa kii se par pe
+chahiye chaiye chahie chahiya chaahiye chahye chiye cahiye chahta chahti chahte chahiyee
+ek 1 h hai hain he hu hun hoon ho hoga hogi tha thi hy hn hi
+do de dedo dijiye dijie dena dedena dedijiye diya dijiyega dedijie bhejo bhejdo bhejiye bhej send give
+milegi milega mil milta milti sakti sakta sakte skti skta skte kar karo kare karna kardo krdo kro kr
+kya kia kiya koi kuch kuchh kuj kuchch bhi
+please plz pls plzz plss bhai bro sir ji yaar yar bhaiya bhaiyya dost madam mam
+book books kitab kitaab kitabe kitaben pustak pdf pdfs file files link
+wali wala vala vali wale vale waali waala
+ye yeh is iss isko iski iska iske isme ise isse usse uski uska uske usme wo woh vo voh
+the a an of for to and i my need want any some please
+raha rahi rahe rha rhi rhe padhu padhna padhne padh liye lie batao bata btao bataiye btaiye
+suggest best achi acchi achhi sabse konsi kaunsi kounsi konsa kaunsa kon kaun si sa se
+which what taiyari tayari taiyaari preparation prepare exam exams paper ke liye
+मुझे मुझको चाहिए चाहिये एक की का के को दो दे दीजिए है हैं हूँ कोई कुछ भी क्या बुक किताब पुस्तक पीडीएफ फाइल में से और या
+""".split())
+
+MORE_WORDS = {"aur", "or", "hor", "dusri", "dusra", "dusre", "doosri", "doosra", "doosre", "alag", "alg", "anya",
+              "more", "next", "another", "other", "others", "baki", "baaki", "bachi", "aage", "agla", "agli",
+              "agle", "aur bhi", "dikhao", "dikhaiye", "dikha", "dusari", "दूसरी", "दूसरा", "अलग", "और"}
+REF_WORDS = {"isse", "iski", "iska", "iske", "isme", "ise", "ye", "yeh", "wahi", "usi", "same", "wali", "wala",
+             "vala", "vali", "wale", "vale"}
+STRONG_GREET = ["hi", "hii", "hiii", "hello", "helo", "hlo", "hey", "heyy", "namaste", "namaskar", "pranam",
+                "salam", "gm", "hlw", "hellow", "namastey"]
+GREET_WORDS = set(STRONG_GREET) | {"ram", "radhe", "jai", "hind", "good", "morning", "evening", "night", "afternoon",
+                                   "gn", "sup", "yo", "assalam", "alaikum", "walekum", "kaise", "kese", "kaisa",
+                                   "haal", "chaal", "sab", "badhiya", "theek", "start", "there", "bot", "jii"}
+THANK_WORDS = {"thanks", "thank", "thanku", "thankyou", "thnx", "thx", "ty", "shukriya", "dhanyawad", "dhanyavad",
+               "ok", "okay", "okk", "okey", "thik", "theek", "accha", "acha", "achha", "nice", "great", "done", "hmm",
+               "hm", "k", "mast", "badhiya", "super", "awesome", "you", "u", "so", "much", "very", "bahut", "dil",
+               "se", "👍", "🙏", "❤️", "got", "it", "mil", "gaya", "gayi"}
+OFF_WORDS = {"joke", "jokes", "chutkula", "chutkule", "shayari", "shayri", "gana", "gaana", "song", "songs", "movie",
+             "movies", "film", "picture", "game", "games", "love", "pyar", "pyaar", "gf", "bf", "girlfriend",
+             "boyfriend", "shadi", "shaadi", "timepass", "bore", "boring", "mazak", "mazaak", "weather", "mausam",
+             "cricket", "ipl", "recharge", "paisa", "paise", "money", "earn", "kamai", "hack", "khana", "khaya",
+             "neend", "instagram", "insta", "facebook", "dating", "flirt", "age", "umar", "single", "crush", "sexy"}
+OFF_PHRASES = ("kaun ho", "kon ho", "tum kaun", "tum kon", "aap kaun", "aap kon", "kya kar rahe", "kya kr rhe",
+               "kya kar rhe", "kya haal", "kaisa hai", "naam kya", "tumhara naam", "aapka naam", "who are you",
+               "what is your name", "kha se ho", "kahan se ho", "kaha se ho")
+
+EXAM_WORDS = {"ssc", "gd", "cgl", "chsl", "mts", "cpo", "steno", "je", "railway", "rrb", "ntpc", "alp", "rpf",
+              "group", "police", "constable", "si", "daroga", "army", "agniveer", "airforce", "navy", "upsc", "ias",
+              "ips", "pcs", "uppsc", "bpsc", "rpsc", "mppsc", "bank", "banking", "ibps", "sbi", "po", "clerk",
+              "rbi", "ctet", "tet", "reet", "uptet", "teacher", "teaching", "nda", "cds", "afcat", "crpf", "bsf",
+              "cisf", "itbp", "ssb", "patwari", "lekhpal", "vdo", "neet", "jee", "board", "class", "rajasthan",
+              "bihar", "up", "mp", "haryana", "delhi", "punjab", "gujarat", "jharkhand", "uttarakhand"}
+SUBJECT_WORDS = {"gk", "gs", "history", "itihas", "polity", "rajniti", "geography", "bhugol", "economy", "economics",
+                 "eco", "arthshastra", "science", "vigyan", "physics", "chemistry", "biology", "maths", "math",
+                 "ganit", "reasoning", "tark", "english", "hindi", "computer", "current", "affairs", "static",
+                 "lucent", "ncert", "arihant", "samanya", "gyan", "grammar", "vocab", "constitution"}
+TYPE_WORDS = {"notes", "note", "mock", "test", "pyq", "question", "questions", "solved", "previous", "year", "syllabus",
+              "practice", "set", "oneliner", "one", "liner", "handwritten", "magazine"}
+LANG_WORDS = {"hindi": "hi", "हिंदी": "hi", "हिन्दी": "hi", "english": "en", "angreji": "en", "angrezi": "en",
+              "अंग्रेजी": "en", "eng": "en"}
+SPELL = {"alg": "alag", "hor": "aur", "skti": "sakti", "fil": "file", "buk": "book", "bok": "book", "englis": "english",
+         "inglish": "english", "hindii": "hindi", "maths": "maths", "mathematics": "maths", "resoning": "reasoning",
+         "reasning": "reasoning", "geograpy": "geography", "histroy": "history", "railways": "railway",
+         "polic": "police", "आर्मी": "army", "पुलिस": "police", "रेलवे": "railway"}
+ALIAS_GROUPS = [
+    {"eco", "economy", "economic", "economics", "arthshastra", "arthvyavastha", "अर्थशास्त्र"},
+    {"history", "itihas", "इतिहास"},
+    {"polity", "rajniti", "राजनीति", "samvidhan", "constitution", "संविधान"},
+    {"geography", "bhugol", "भूगोल"},
+    {"science", "vigyan", "विज्ञान"},
+    {"maths", "math", "ganit", "गणित"},
+    {"reasoning", "tark", "तर्कशक्ति", "रीजनिंग"},
+    {"english", "angreji", "angrezi", "अंग्रेजी"},
+    {"hindi", "हिंदी", "हिन्दी"},
+    {"gk", "gs", "सामान्य ज्ञान", "samanya gyan"},
+    {"computer", "कंप्यूटर", "कम्प्यूटर"},
+    {"railway", "rrb", "रेलवे"},
+    {"police", "पुलिस", "constable"},
+    {"army", "agniveer", "अग्निवीर", "सेना"},
+    {"current", "करंट"},
+]
+ALIASES: Dict[str, set] = {}
+for _g in ALIAS_GROUPS:
+    for _w in _g:
+        ALIASES[_w] = _g
+
+EXAM_BUTTONS = [("SSC", "ssc"), ("Railway", "railway"), ("Police", "police"), ("Army / Agniveer", "army"),
+                ("Teaching", "teacher"), ("📚 Sab dikhao", "all")]
+SUBJECT_BUTTONS = [("GK / GS", "gk"), ("Maths", "maths"), ("Reasoning", "reasoning"), ("Hindi", "hindi"),
+                   ("English", "english"), ("Science", "science"), ("History", "history"), ("Polity", "polity")]
+
+
+def ist_day(ts: Optional[float] = None) -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime((ts if ts is not None else time.time()) + IST_OFFSET))
+
+
+def ist_midnight_utc_iso() -> str:
+    now = time.time()
+    midnight = now - ((now + IST_OFFSET) % 86400)
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(midnight))
+
+
+def now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def ist_time(iso: Any) -> str:
+    try:
+        s = str(iso)[:19].replace("T", " ")
+        ts = time.mktime(time.strptime(s, "%Y-%m-%d %H:%M:%S")) - time.timezone
+        return time.strftime("%d %b %I:%M %p", time.gmtime(ts + IST_OFFSET))
+    except Exception:
+        return str(iso or "")[:16]
+
+
+def tokenize(text: str) -> List[str]:
+    t = (text or "").lower().replace("’", "'")
+    words = re.findall(r"[a-z0-9]+|[\u0900-\u097F]+", t)
+    out = []
+    for w in words:
+        w = SPELL.get(w, w)
+        # "hiii", "hellooo", "plzzz": squeeze 3+ repeated letters
+        w = re.sub(r"([a-z])\1{2,}", r"\1\1", w)
+        out.append(w)
+    return out
+
+
+def _close_greet(word: str) -> bool:
+    import difflib
+    if len(word) < 2 or word in EXAM_WORDS or word in SUBJECT_WORDS:
+        return False
+    return bool(difflib.get_close_matches(word, STRONG_GREET, n=1, cutoff=0.78))
+
+
+def understand(text: str) -> Dict[str, Any]:
+    """Free, local reading of one message: intent + search keywords + filters."""
+    tokens = tokenize(text)
+    low = " ".join(tokens)
+    result: Dict[str, Any] = {"tokens": tokens, "keywords": [], "lang": None, "types": [], "exam": [],
+                              "subject": [], "ref": any(t in REF_WORDS for t in tokens), "intent": "book"}
+    if not tokens:
+        result["intent"] = "empty"
+        return result
+    vocab_hit = any(t in EXAM_WORDS or t in SUBJECT_WORDS for t in tokens)
+    if not vocab_hit and (any(p in low for p in OFF_PHRASES) or any(t in OFF_WORDS for t in tokens)):
+        result["intent"] = "off_topic"
+        return result
+    if all(t in GREET_WORDS or t in FILLER for t in tokens) and any(t in GREET_WORDS for t in tokens):
+        result["intent"] = "greeting"
+        return result
+    if len(tokens) <= 2 and not vocab_hit and any(_close_greet(t) for t in tokens) and \
+            all(_close_greet(t) or t in GREET_WORDS or t in FILLER for t in tokens):
+        result["intent"] = "greeting"     # "Jello", "helo bhai", "hlo"
+        return result
+    if all(t in THANK_WORDS or t in FILLER for t in tokens) and any(t in THANK_WORDS for t in tokens):
+        result["intent"] = "thanks"
+        return result
+    more = any(t in MORE_WORDS for t in tokens)
+    keywords = []
+    for t in tokens:
+        if t in FILLER or t in MORE_WORDS or t in REF_WORDS or t in GREET_WORDS and t not in EXAM_WORDS:
+            continue
+        if t in LANG_WORDS:
+            result["lang"] = LANG_WORDS[t]
+            continue
+        if t in TYPE_WORDS:
+            result["types"].append(t)
+            continue
+        if len(t) < 2 and not t.isdigit():
+            continue
+        keywords.append(t)
+    result["exam"] = [k for k in keywords if k in EXAM_WORDS]
+    result["subject"] = [k for k in keywords if k in SUBJECT_WORDS]
+    result["keywords"] = keywords
+    if more and not keywords:
+        result["intent"] = "more"
+    elif not keywords:
+        result["intent"] = "vague"          # only filler / language / type words
+    return result
+
+
+# ---- short per-user conversation context (bot_settings "ctx:<user_id>", 30 min)
+
+def load_ctx(user_id: Optional[int]) -> Dict[str, Any]:
+    if not user_id:
+        return {}
+    raw = get_setting(f"ctx:{user_id}")
+    try:
+        data = json.loads(raw) if raw else {}
+    except Exception:
+        data = {}
+    if not data or time.time() - float(data.get("ts", 0)) > CTX_TTL:
+        return {}
+    return data
+
+
+def save_ctx(user_id: Optional[int], ctx: Dict[str, Any]) -> None:
+    if not user_id:
+        return
+    ctx["ts"] = int(time.time())
+    ctx["shown"] = [int(x) for x in (ctx.get("shown") or [])][-60:]
+    try:
+        set_setting(f"ctx:{user_id}", json.dumps(ctx, ensure_ascii=False)[:3000])
+    except Exception:
+        log_error("save_ctx")
+
+
+# ---- AI (only when the local step cannot decide)
+
+def ai_provider() -> str:
+    return "groq" if GROQ_KEYS else ("openai" if OPENAI_API_KEY else "")
+
+
+_KEY_COOL: Dict[int, float] = {}
+KEY_COOLDOWN = 300   # seconds a rate-limited / failing key is skipped
+
+
+def key_cooling(index: int) -> bool:
+    until = _KEY_COOL.get(index)
+    if until is None:
+        raw = get_setting(f"aikey_cool:{index}")
+        until = float(raw) if raw and raw.replace(".", "", 1).isdigit() else 0.0
+        _KEY_COOL[index] = until
+    return until > time.time()
+
+
+def cool_key(index: int, seconds: int = KEY_COOLDOWN) -> None:
+    until = time.time() + seconds
+    _KEY_COOL[index] = until
+    try:
+        set_setting(f"aikey_cool:{index}", str(int(until)))
+    except Exception:
+        log_error("cool_key")
+
+
+def ai_complete(system: str, user_text: str, max_tokens: int = 150) -> Optional[str]:
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user_text}]
+    models = [m for m in dict.fromkeys([GROQ_MODEL, "llama-3.1-8b-instant", "llama-3.3-70b-versatile"]) if m]
+    usable = [i for i in range(len(GROQ_KEYS)) if not key_cooling(i)] or list(range(len(GROQ_KEYS)))
+    for index in usable:
+        key = GROQ_KEYS[index]
+        for model in models:
+            try:
+                res = http_json("https://api.groq.com/openai/v1/chat/completions", "POST", {
+                    "model": model, "messages": messages, "max_tokens": max_tokens, "temperature": 0.1,
+                    "response_format": {"type": "json_object"}}, {"Authorization": f"Bearer {key}"}, timeout=6)
+                return res["choices"][0]["message"]["content"]
+            except Exception as exc:
+                low = str(exc).lower()
+                if "model" in low and any(x in low for x in ("not found", "decommission", "does not exist", "not supported")):
+                    continue   # same key, next model
+                print(f"[filesbull] groq key {index + 1} error: {str(exc)[:160].replace(key, '***')}", flush=True)
+                # 429 limit / 401-403 bad key / 5xx / timeout: skip this key for a while, try the next one now.
+                m = re.search(r"try again in (\d+)m", low)
+                cool_key(index, max(KEY_COOLDOWN, int(m.group(1)) * 60) if m else KEY_COOLDOWN)
+                break
+    if OPENAI_API_KEY:
+        body: Dict[str, Any] = {"model": OPENAI_MODEL, "messages": messages, "response_format": {"type": "json_object"}}
+        if OPENAI_MODEL.startswith(("gpt-5", "o1", "o3", "o4")):
+            body["reasoning_effort"] = "minimal" if OPENAI_MODEL.startswith("gpt-5") else "low"
+            body["max_completion_tokens"] = 800
+        else:
+            body["max_completion_tokens"] = max_tokens
+            body["temperature"] = 0.1
+        try:
+            res = http_json("https://api.openai.com/v1/chat/completions", "POST", body,
+                            {"Authorization": f"Bearer {OPENAI_API_KEY}"}, timeout=8)
+            return res["choices"][0]["message"]["content"]
+        except Exception as exc:
+            print(f"[filesbull] openai error: {str(exc)[:200]}", flush=True)
+    return None
+
+
+AI_SYSTEM = ("You help a Telegram bot that searches a catalog of study PDFs for Indian govt exams. "
+             "Read the user's message (Hindi/Hinglish/English) and reply ONLY with JSON: "
+             '{"intent":"book|more|greeting|off_topic","keywords":[],"exam":null,"subject":null,'
+             '"language":null,"ask":null}. keywords = 1-4 short words likely in a file name '
+             "(e.g. ssc, gd, gk, polity, lucent, maths, class 10). Fix spelling. Never invent book titles. "
+             "language = hindi|english|null. intent more = user wants other/different files than last time. "
+             "off_topic = not about books/study. ask = ONE short Hinglish question only if too vague to search, else null.")
+
+
+def ai_budget_ok(user_id: Optional[int], ctx: Dict[str, Any]) -> bool:
+    if not ai_provider() or not user_id:
+        return False
+    if int(ctx.get("ai", 0)) >= AI_TURNS_PER_CHAT:
+        return False
+    today = ist_day()
+    for key, cap in ((f"aiday:{user_id}", AI_DAILY_PER_USER), ("aiday:all", AI_DAILY_TOTAL)):
+        raw = get_setting(key) or ""
+        day, _, n = raw.partition(":")
+        if day == today and n.isdigit() and int(n) >= cap:
+            return False
+    return True
+
+
+def ai_spend(user_id: int, ctx: Dict[str, Any]) -> None:
+    ctx["ai"] = int(ctx.get("ai", 0)) + 1
+    today = ist_day()
+    for key in (f"aiday:{user_id}", "aiday:all"):
+        try:
+            raw = get_setting(key) or ""
+            day, _, n = raw.partition(":")
+            count = int(n) + 1 if day == today and n.isdigit() else 1
+            set_setting(key, f"{today}:{count}")
+        except Exception:
+            log_error("ai_spend")
+
+
+def ai_interpret(text: str, ctx: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    prev = " ".join(ctx.get("q") or [])
+    content = ai_complete(AI_SYSTEM, (f"Last search: {prev}\n" if prev else "") + "User: " + text[:300])
+    if not content:
+        return None
+    try:
+        data = json.loads(content[content.find("{"): content.rfind("}") + 1])
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    kws = []
+    for k in (data.get("keywords") or [])[:4] + [data.get("exam"), data.get("subject")]:
+        if isinstance(k, str):
+            for w in tokenize(k)[:3]:
+                if w not in FILLER and w not in kws and len(w) <= 30 and (len(w) > 1 or w.isdigit()):
+                    kws.append(w)
+    lang = str(data.get("language") or "").lower()
+    ask = data.get("ask")
+    return {"intent": str(data.get("intent") or "book").lower(), "keywords": kws[:5],
+            "lang": "hi" if lang.startswith("hi") else ("en" if lang.startswith("en") else None),
+            "ask": re.sub(r"\s+", " ", ask).strip()[:150] if isinstance(ask, str) and ask.strip() else None}
+
+
+# ---- search (database only)
+
+def search_rows(keywords: List[str], lang: Optional[str] = None, types: Optional[List[str]] = None,
+                strict: bool = True) -> List[Dict[str, Any]]:
+    """Matching rows, best first. Each keyword counts once even with its aliases (itihas = history).
+    strict: when some files match EVERY keyword ("ssc gd gk hindi"), only those are returned;
+    otherwise files matching any keyword, best first."""
+    groups = []
+    for k in keywords:
+        k = normalize(k)
+        if not k:
+            continue
+        g = set(ALIASES.get(k, {k})) | {k}
+        if g not in groups:
+            groups.append(g)
+    if not groups:
+        return []
+    # Typed keywords first, then their aliases (the pre-filter has a size cap).
+    primary = [normalize(k) for k in keywords if normalize(k)]
+    words = list(dict.fromkeys(primary + sorted(t for g in groups for t in g if len(t) > 1 or t.isdigit())))[:20]
+    filters = ",".join(f"{col}.ilike.*{word}*" for word in words
+                       for col in ("title", "caption", "keywords", "content_text", "source_chat_title"))
+    rows = supabase("books", "GET", query=(
+        "?select=id,title,caption,keywords,content_text,source_chat_title,language"
+        "&status=eq.indexed&limit=300&or=" + urllib.parse.quote(f"({filters})", safe="(),.*")
+    ))
+    scored = []
+    for row in rows:
+        head = normalize(" ".join(str(row.get(k) or "") for k in ("title", "caption", "keywords", "source_chat_title")))
+        body = normalize(str(row.get("content_text") or ""))
+        score = 0.0
+        hits = 0
+        for g in groups:
+            if any(term in head for term in g):
+                score += 3
+                hits += 1
+            elif any(term in body for term in g):
+                score += 1
+                hits += 1
+        if not score:
+            continue
+        row["_all"] = hits == len(groups)
+        if lang:
+            words_lang = {"hi": ("hindi", "हिंदी", "हिन्दी"), "en": ("english",)}[lang]
+            if row.get("language") in ({"hi", "mixed"} if lang == "hi" else {"en", "mixed"}) or any(w in head for w in words_lang):
+                score += 1
+        for t in types or []:
+            if t in head:
+                score += 0.5
+        scored.append((score, row))
+    scored.sort(key=lambda x: (-x[0], str(x[1].get("title") or "")))
+    out = [row for _, row in scored]
+    if strict and len(groups) > 1 and any(r.get("_all") for r in out):
+        out = [r for r in out if r.get("_all")]
+    return out
+
+
+def has_full_match(keywords: List[str], lang: Optional[str] = None) -> bool:
+    rows = search_rows(keywords, lang)
+    return bool(rows) and bool(rows[0].get("_all"))
+
+
+def search_books(query: str) -> List[Dict[str, Any]]:
+    """Keyword search used by /search, admin rename and the plain fallback (top 10)."""
+    u = understand(query)
+    kws = u["keywords"] or [t for t in u["tokens"] if len(t) > 1 and t not in FILLER]
+    if not kws and u["lang"]:
+        kws = ["hindi" if u["lang"] == "hi" else "english"]
+    rows = search_rows(kws, u["lang"], u["types"])[:10]
+    return ai_rank(query, rows) if AI_RANK else rows
+
+
+def results_markup(rows: List[Dict[str, Any]], more_left: int) -> Dict[str, Any]:
+    kb = [[{"text": f"📄 {str(r.get('title') or 'Untitled')[:45]}", "callback_data": f"book:{r['id']}"}] for r in rows]
+    if more_left > 0:
+        kb.append([{"text": f"➡️ Aur dikhao ({more_left})", "callback_data": "more"}])
+    return {"inline_keyboard": kb}
+
+
+def send_results(chat_id: int, user_id: Optional[int], ctx: Dict[str, Any], keywords: List[str],
+                 lang: Optional[str], types: Optional[List[str]], raw: str, note: str = "") -> bool:
+    """Search + show page 1. Returns False when nothing was found (nothing sent)."""
+    rows = search_rows(keywords, lang, types)
+    note_user(None, searches=1)
+    if not rows:
+        return False
+    page = rows[:PAGE]
+    ctx.update({"q": keywords, "lang": lang, "types": types or [], "raw": raw[:120], "shown": [r["id"] for r in page],
+                "ask": None, "pending": None})
+    save_ctx(user_id, ctx)
+    send_text(chat_id, note + f"🔎 <b>{len(rows)} file mili</b> — jo chahiye us par tap karo 👇",
+              results_markup(page, len(rows) - len(page)), "HTML")
+    return True
+
+
+def send_no_results(chat_id: int, label: str) -> None:
+    send_text(chat_id, f"😕 <b>\"{esc(label[:60])}\" ke liye koi file nahi mili</b>\n\n"
+                       "Dusra naam, chhota keyword ya sahi spelling try karo.\n"
+                       "Jaise: <i>lucent</i>, <i>ssc gd gk</i>, <i>polity</i>", None, "HTML")
+
+
+def show_more(chat_id: int, user_id: Optional[int], ctx: Dict[str, Any]) -> None:
+    if not ctx.get("q"):
+        send_text(chat_id, NO_CONTEXT_MORE_MSG, None, "HTML")
+        return
+    shown = set(int(x) for x in ctx.get("shown") or [])
+    rows = [r for r in search_rows(ctx["q"], ctx.get("lang"), ctx.get("types")) if int(r["id"]) not in shown]
+    broadened = False
+    if not rows and len(ctx["q"]) > 1:
+        # Nothing left for the exact search: try each word on its own (e.g. "ssc gd gk" -> "gk").
+        seen = set(shown)
+        for k in ctx["q"]:
+            for r in search_rows([k], ctx.get("lang"), ctx.get("types")):
+                if int(r["id"]) not in seen:
+                    seen.add(int(r["id"]))
+                    rows.append(r)
+        broadened = bool(rows)
+    note_user(None, searches=1)
+    if not rows:
+        send_text(chat_id, ALL_SHOWN_MSG, {"inline_keyboard": [[{"text": "📚 PDF List", "callback_data": "user_list"}]]}, "HTML")
+        return
+    page = rows[:PAGE]
+    ctx["shown"] = list(shown) + [r["id"] for r in page]
+    save_ctx(user_id, ctx)
+    head = "🔎 <b>" + (f"Milti-julti {len(rows)} aur file mili" if broadened else f"{len(rows)} aur file mili") + \
+           "</b> — tap karo 👇"
+    send_text(chat_id, head, results_markup(page, len(rows) - len(page)), "HTML")
+
+
+def ask_question(chat_id: int, user_id: Optional[int], ctx: Dict[str, Any], kind: str, pending: List[str],
+                 lang: Optional[str], text: Optional[str] = None) -> None:
+    buttons = EXAM_BUTTONS if kind == "exam" else SUBJECT_BUTTONS
+    kb, row = [], []
+    for label, val in buttons:
+        row.append({"text": label, "callback_data": f"g:{'e' if kind == 'exam' else 's'}:{val}"})
+        if len(row) == 2:
+            kb.append(row)
+            row = []
+    if row:
+        kb.append(row)
+    if kind == "exam" and pending:
+        n = len(search_rows(pending, lang))
+        kb[-1][-1]["text"] = f"📚 Sab dikhao ({n})"
+    ctx.update({"ask": kind, "pending": pending, "lang": lang})
+    save_ctx(user_id, ctx)
+    msg = text or (ask_exam_msg(" ".join(pending)) if kind == "exam" else ASK_SUBJECT_MSG)
+    send_text(chat_id, msg, {"inline_keyboard": kb}, "HTML")
+
+
+def smart_reply(chat_id: int, user: Dict[str, Any], text: str) -> None:
+    user_id = user.get("id")
+    u = understand(text)
+    intent = u["intent"]
+    if intent == "greeting":
+        send_text(chat_id, greeting_msg(user), None, "HTML")
+        return
+    if intent == "thanks":
+        send_text(chat_id, THANKS_MSG)
+        return
+    if intent in {"off_topic", "empty"}:
+        send_text(chat_id, OFFTOPIC_MSG, None, "HTML")
+        return
+    ctx = load_ctx(user_id)
+    if intent == "more":
+        show_more(chat_id, user_id, ctx)
+        return
+    keywords, lang, types = list(u["keywords"]), u["lang"], u["types"]
+    # Answer to our own question ("kis exam ke liye?") typed instead of tapped.
+    if ctx.get("ask") and ctx.get("pending") and keywords and len(keywords) <= 3 and \
+            all(k in EXAM_WORDS or k in SUBJECT_WORDS for k in keywords):
+        merged = list(dict.fromkeys(list(ctx["pending"]) + keywords))
+        if not has_full_match(merged, lang or ctx.get("lang")):
+            merged = keywords
+        if send_results(chat_id, user_id, ctx, merged, lang or ctx.get("lang"), types, text):
+            return
+    # "iski english wali" -> same search, new language/type
+    if not keywords and u["ref"] and ctx.get("q") and (lang or types):
+        if send_results(chat_id, user_id, ctx, ctx["q"], lang or ctx.get("lang"), types or ctx.get("types"), text):
+            return
+    if not keywords:
+        if lang:
+            # "Mujhe ek hindi ki book chahiye": search the language as a subject; if many, ask the exam.
+            kw = ["hindi" if lang == "hi" else "english"]
+            rows = search_rows(kw, lang, types)
+            if len(rows) > 6:
+                ask_question(chat_id, user_id, ctx, "exam", kw, lang)
+                return
+            if send_results(chat_id, user_id, ctx, kw, lang, types, text):
+                return
+            send_no_results(chat_id, kw[0])
+            return
+        ask_question(chat_id, user_id, ctx, "subject", [], None)
+        return
+    if send_results(chat_id, user_id, ctx, keywords, lang, types, text):
+        return
+    # Nothing found locally: ask the AI once (typos, long sentences), within the limits.
+    if ai_budget_ok(user_id, ctx):
+        ans = ai_interpret(text, ctx)
+        ai_spend(user_id, ctx)
+        save_ctx(user_id, ctx)
+        if ans:
+            if ans["intent"] in {"off_topic", "greeting"}:
+                send_text(chat_id, OFFTOPIC_MSG, None, "HTML")
+                return
+            if ans["intent"] == "more" and ctx.get("q"):
+                show_more(chat_id, user_id, ctx)
+                return
+            if ans["keywords"] and ans["keywords"] != keywords and \
+                    send_results(chat_id, user_id, ctx, ans["keywords"], ans["lang"] or lang, types, text):
+                return
+            if ans["ask"]:
+                ask_question(chat_id, user_id, ctx, "exam" if keywords else "subject", keywords, lang,
+                             "🤔 " + esc(ans["ask"]))
+                return
+    send_no_results(chat_id, " ".join(keywords) or text)
+
+
+def handle_guided_callback(query: Dict[str, Any], data: str, chat_id: int) -> None:
+    user = query.get("from") or {}
+    user_id = user.get("id")
+    ctx = load_ctx(user_id)
+    if data == "more":
+        show_more(chat_id, user_id, ctx)
+        return
+    _, kind, val = (data.split(":", 2) + ["", ""])[:3]
+    pending = list(ctx.get("pending") or [])
+    lang = ctx.get("lang")
+    if kind == "s":
+        if not send_results(chat_id, user_id, ctx, [val], lang, None, val):
+            send_no_results(chat_id, val)
+        return
+    if val == "all" or not val:
+        if not pending or not send_results(chat_id, user_id, ctx, pending, lang, None, " ".join(pending)):
+            send_text(chat_id, OFFTOPIC_MSG, None, "HTML")
+        return
+    label = dict((v, l) for l, v in EXAM_BUTTONS).get(val, val)
+    if has_full_match(pending + [val], lang) and send_results(chat_id, user_id, ctx, pending + [val], lang, None, " ".join(pending + [val])):
+        return
+    if pending and send_results(chat_id, user_id, ctx, pending, lang, None, " ".join(pending),
+                                note=f"ℹ️ {esc(label)} ke liye alag file nahi mili, ye saari {esc(' '.join(pending))} files hain:\n\n"):
+        return
+    send_no_results(chat_id, " ".join(pending + [val]))
+
+
+# ================================================================ user tracking
+# Table bot_users (files/filesbull_supabase.sql). Until it exists, the same record is kept in
+# bot_settings key "user:<id>" as JSON, so nothing breaks and nothing is lost.
+
+_USERS_TABLE: Dict[str, Any] = {}
+
+
+def users_table_ok() -> bool:
+    hit = _USERS_TABLE.get("ok")
+    if hit is not None and time.time() - _USERS_TABLE.get("ts", 0) < 300:
+        return hit
+    try:
+        supabase("bot_users", "GET", query="?select=user_id&limit=1")
+        ok = True
+    except Exception:
+        ok = False
+    _USERS_TABLE.update({"ok": ok, "ts": time.time()})
+    return ok
+
+
+def get_user_rec(user_id: int) -> Optional[Dict[str, Any]]:
+    if users_table_ok():
+        rows = supabase("bot_users", "GET", query=f"?user_id=eq.{int(user_id)}&select=*&limit=1")
+        if rows:
+            return rows[0]
+    raw = get_setting(f"user:{user_id}")
+    try:
+        return json.loads(raw) if raw else None
+    except Exception:
+        return None
+
+
+def save_user_rec(rec: Dict[str, Any]) -> None:
+    if users_table_ok():
+        try:
+            supabase("bot_users", "POST", rec, "?on_conflict=user_id")
+            return
+        except Exception:
+            log_error("bot_users save")
+    set_setting(f"user:{rec['user_id']}", json.dumps(rec, ensure_ascii=False))
+
+
+def note_user(user: Optional[Dict[str, Any]], **changes: Any) -> None:
+    """Remember who this update is from and what happened; written once by flush_user()."""
+    if user and user.get("id") and not user.get("is_bot"):
+        _REQ.setdefault("user", user)
+    for key, value in changes.items():
+        if key == "verified":
+            _REQ["verified"] = value
+        else:
+            _REQ[key] = _REQ.get(key, 0) + int(value)
+
+
+def user_label(rec: Dict[str, Any]) -> str:
+    name = " ".join(x for x in [rec.get("first_name"), rec.get("last_name")] if x).strip() or "User"
+    uname = f" @{rec['username']}" if rec.get("username") else ""
+    return f"{name[:40]}{uname}"
+
+
+def flush_user() -> None:
+    user = _REQ.get("user")
+    if not user:
+        return
+    uid = int(user["id"])
+    rec = get_user_rec(uid)
+    new = rec is None
+    if new:
+        rec = {"user_id": uid, "first_seen": now_iso(), "verified": False, "searches": 0, "files_received": 0}
+    before = json.dumps(rec, sort_keys=True, default=str)
+    old_seen = str(rec.get("last_seen") or "")
+    rec.update({"first_name": (user.get("first_name") or "")[:64], "last_name": (user.get("last_name") or "")[:64] or None,
+                "username": user.get("username")})
+    if _REQ.get("verified") is not None:
+        rec["verified"] = bool(_REQ["verified"])
+    rec["searches"] = int(rec.get("searches") or 0) + int(_REQ.get("searches", 0))
+    rec["files_received"] = int(rec.get("files_received") or 0) + int(_REQ.get("files", 0))
+    changed = new or json.dumps(dict(rec, last_seen=old_seen), sort_keys=True, default=str) != before
+    stale = old_seen[:16] < time.strftime("%Y-%m-%dT%H:%M", time.gmtime(time.time() - 120))
+    rec["last_seen"] = now_iso()
+    if changed or stale:
+        save_user_rec({k: rec.get(k) for k in ("user_id", "first_name", "last_name", "username", "first_seen",
+                                               "last_seen", "verified", "searches", "files_received")})
+    if new and not is_subadmin(uid):
+        audit_log(f"🆕 Naya user: {user_label(rec)} ({uid})")
+
+
+def flush_request() -> None:
+    try:
+        flush_user()
+    except Exception:
+        log_error("flush_user")
+    try:
+        flush_logs()
+    except Exception:
+        log_error("flush_logs")
+    _REQ.clear()
+
+
+def all_user_recs() -> List[Dict[str, Any]]:
+    """Fallback (no bot_users table): every user:<id> record from bot_settings."""
+    rows = supabase("bot_settings", "GET", query="?key=like.user:*&select=value&limit=5000")
+    out = []
+    for r in rows:
+        try:
+            out.append(json.loads(r.get("value") or "{}"))
+        except Exception:
+            pass
+    return out
+
+
+def users_view() -> str:
+    today_iso = ist_midnight_utc_iso()
+    files_today = count_rows("delivery_logs", f"&created_at=gte.{today_iso}")
+    if users_table_ok():
+        total = count_rows("bot_users", col="user_id")
+        active = count_rows("bot_users", f"&last_seen=gte.{today_iso}", col="user_id")
+        new = count_rows("bot_users", f"&first_seen=gte.{today_iso}", col="user_id")
+        recent = supabase("bot_users", "GET", query="?select=*&order=last_seen.desc&limit=10")
+        note = ""
+    else:
+        recs = all_user_recs()
+        total = len(recs)
+        active = sum(1 for r in recs if str(r.get("last_seen") or "") >= today_iso)
+        new = sum(1 for r in recs if str(r.get("first_seen") or "") >= today_iso)
+        recent = sorted(recs, key=lambda r: str(r.get("last_seen") or ""), reverse=True)[:10]
+        note = "\n\nℹ️ bot_users table abhi nahi bani — data bot_settings me safe hai. SQL chalane ke baad table me aayega."
+    lines = ["👥 Users", f"Kul users: {total}", f"Aaj active: {active}", f"Aaj naye: {new}",
+             f"Aaj files bheji: {files_today}", "", "🕑 Recent 10:"]
+    for i, r in enumerate(recent, 1):
+        lines.append(f"{i}. {user_label(r)} ({r.get('user_id')}) — 🔍 {r.get('searches') or 0} · 📄 {r.get('files_received') or 0}"
+                     f" · {ist_time(r.get('last_seen'))}")
+    if not recent:
+        lines.append("Abhi koi user record nahi hai.")
+    lines.append("\nKisi user ki details: /user <id>")
+    return "\n".join(lines) + note
+
+
+def user_detail(user_id: int) -> str:
+    rec = get_user_rec(user_id)
+    try:
+        logs = supabase("delivery_logs", "GET", query=f"?user_id=eq.{int(user_id)}&select=book_title,query,created_at"
+                                                      "&order=created_at.desc&limit=15")
+    except Exception:
+        logs = []
+    if not rec and not logs:
+        return f"User {user_id} ka koi record nahi mila."
+    rec = rec or {"user_id": user_id}
+    lines = [f"👤 {user_label(rec)}", f"ID: {user_id}",
+             f"Pehli baar: {ist_time(rec.get('first_seen'))}", f"Last seen: {ist_time(rec.get('last_seen'))}",
+             f"Join verified: {'✅' if rec.get('verified') else '❌'}",
+             f"Searches: {rec.get('searches') or 0}", f"Files li: {rec.get('files_received') or 0}", ""]
+    lines.append("📄 Aakhri files:" if logs else "📄 Abhi tak koi file nahi li.")
+    for lg in logs:
+        q = f" — query: {lg.get('query')}" if lg.get("query") else ""
+        lines.append(f"• {str(lg.get('book_title') or '')[:60]}{q} ({ist_time(lg.get('created_at'))})")
+    return "\n".join(lines)
+
+
+# ================================================================ backup channel (no duplicates)
+
+def _send_file_copy(target: int, from_chat: Any, message_id: Any, row: Dict[str, Any]) -> Optional[int]:
+    """Copy a file into the backup chat: copy the post, else re-send by file_id. Returns message id."""
+    if from_chat and message_id:
+        try:
+            res = telegram("copyMessage", {"chat_id": target, "from_chat_id": from_chat, "message_id": message_id,
+                                           "disable_notification": True}).get("result") or {}
+            if res.get("message_id"):
+                return int(res["message_id"])
+        except Exception as exc:
+            if "too many requests" in str(exc).lower():
+                raise
+    if row.get("telegram_file_id"):
+        mime = (row.get("mime_type") or "").lower()
+        method, field = ("sendVideo", "video") if mime.startswith("video/") else \
+            (("sendAudio", "audio") if mime.startswith("audio/") else ("sendDocument", "document"))
+        res = telegram(method, {"chat_id": target, field: row["telegram_file_id"],
+                                "caption": (row.get("title") or "")[:1000], "disable_notification": True}).get("result") or {}
+        if res.get("message_id"):
+            return int(res["message_id"])
+    return None
+
+
+def ensure_backup(record: Dict[str, Any], from_chat: Any, message_id: Any) -> str:
+    """Back up a just-indexed file once. 'saved' | 'dup' | 'off' | 'failed'."""
+    target = get_setting("backup_chat_id")
+    uniq = record.get("telegram_file_unique_id")
+    if not target or not uniq:
+        return "off"
+    rows = supabase("books", "GET", query=f"?telegram_file_unique_id=eq.{urllib.parse.quote(str(uniq))}"
+                                          "&select=id,backup_chat_id,backup_message_id&limit=1")
+    if rows and rows[0].get("backup_message_id") and str(rows[0].get("backup_chat_id")) == str(target):
+        return "dup"
+    try:
+        mid = _send_file_copy(int(target), from_chat, message_id, record)
+    except Exception:
+        log_error("backup copy")
+        mid = None
+    if not mid:
+        return "failed"
+    supabase("books", "PATCH", {"backup_chat_id": int(target), "backup_message_id": mid},
+             f"?telegram_file_unique_id=eq.{urllib.parse.quote(str(uniq))}")
+    return "saved"
+
+
+def index_file(record: Dict[str, Any], from_chat: Any, message_id: Any, where: str) -> str:
+    """Save a file to the catalog, back it up once, and log it."""
+    upsert_item(record)
+    try:
+        backup = ensure_backup(record, from_chat, message_id)
+    except Exception:
+        log_error("ensure_backup")
+        backup = "failed"
+    mark = {"saved": " · 💾 backup ✅", "dup": " · 💾 pehle se backup", "failed": " · 💾 backup ❌"}.get(backup, "")
+    audit_log(f"📥 Nayi file save: {str(record.get('title') or '')[:80]} — {where}{mark}")
+    return backup
+
+
+def backup_pending_query(target: Any) -> str:
+    return f"&or=(backup_message_id.is.null,backup_chat_id.neq.{int(target)})"
+
+
+def backup_old_batch(limit: int = 20, budget: float = 7.0) -> Dict[str, Any]:
+    target = get_setting("backup_chat_id")
+    if not target:
+        return {"error": "Pehle 💾 Backup Channel set karo."}
+    started = time.monotonic()
+    rows = supabase("books", "GET", query="?select=id,title,source_chat_id,source_message_id,telegram_file_id,mime_type"
+                                          + backup_pending_query(target) + f"&order=id&limit={limit}")
+    done = failed = 0
+    wait = 0
+    for row in rows:
+        if time.monotonic() - started > budget:
+            break
+        try:
+            mid = _send_file_copy(int(target), row.get("source_chat_id"), row.get("source_message_id"), row)
+        except Exception as exc:
+            m = re.search(r"retry after (\d+)", str(exc).lower())
+            if m or "too many requests" in str(exc).lower():
+                wait = int(m.group(1)) if m else 30
+                break
+            log_error("backup old")
+            mid = None
+        # backup_message_id 0 = tried and failed (source deleted, no file_id); not retried every run.
+        supabase("books", "PATCH", {"backup_chat_id": int(target), "backup_message_id": mid or 0}, f"?id=eq.{int(row['id'])}")
+        if mid:
+            done += 1
+        else:
+            failed += 1
+        time.sleep(0.3)
+    remaining = count_rows("books", backup_pending_query(target))
+    return {"done": done, "failed": failed, "remaining": remaining, "wait": wait}
+
+
+def backup_old_view() -> Any:
+    res = backup_old_batch()
+    if res.get("error"):
+        return "❌ " + res["error"], {"inline_keyboard": [[{"text": "💾 Backup Channel", "callback_data": "ad:backup"}], BACK_ROW]}
+    lines = ["💾 Purani files ka backup", f"✅ Is baar save hui: {res['done']}"]
+    if res["failed"]:
+        lines.append(f"❌ Nahi ho payi: {res['failed']} (source post delete / bot ko access nahi)")
+    lines.append(f"⏳ Baaki: {res['remaining']}")
+    if res["wait"]:
+        lines.append(f"\nTelegram ne {res['wait']} sec rukne ko kaha. Thodi der baad ▶️ dabao.")
+    elif not res["remaining"]:
+        lines.append("\n🎉 Saari files backup ho gayi! Nayi files apne-aap (bina duplicate) save hoti rahengi.")
+    kb = []
+    if res["remaining"]:
+        kb.append([{"text": f"▶️ Aur backup karo ({res['remaining']})", "callback_data": "ad:bkold"}])
+    kb.append(BACK_ROW)
+    return "\n".join(lines), {"inline_keyboard": kb}
+
 
 
 def ai_rank(query: str, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1048,43 +2002,6 @@ def upsert_item(record: Dict[str, Any]) -> None:
     supabase("books", "POST", record, "?on_conflict=telegram_file_unique_id")
 
 
-def search_books(query: str) -> List[Dict[str, Any]]:
-    raw_terms = [normalize(x) for x in re.findall(r"[\w\u0900-\u097F]+", query) if len(x) > 1]
-    aliases = {
-        "eco": {"eco", "economy", "economic", "economics"},
-        "economy": {"eco", "economy", "economic", "economics"},
-        "economic": {"eco", "economy", "economic", "economics"},
-        "economics": {"eco", "economy", "economic", "economics"},
-    }
-    terms = set(raw_terms)
-    for term in raw_terms:
-        terms.update(aliases.get(term, set()))
-    if not terms:
-        return []
-    # Let Supabase pre-filter matching rows instead of downloading the first 500 full rows
-    # (with up to 120 KB of PDF text each) on every search. Books past the first 500 were
-    # never searchable before.
-    words = sorted({w for term in terms for w in term.split() if len(w) > 1})[:12]
-    if not words:
-        return []
-    filters = ",".join(f"{col}.ilike.*{word}*" for word in words
-                       for col in ("title", "caption", "keywords", "content_text", "source_chat_title"))
-    rows = supabase("books", "GET", query=(
-        "?select=id,title,caption,keywords,content_text,source_chat_title"
-        "&status=eq.indexed&limit=200&or=" + urllib.parse.quote(f"({filters})", safe="(),.*")
-    ))
-    scored = []
-    for row in rows:
-        haystack = normalize(" ".join(str(row.get(k) or "") for k in ("title", "caption", "keywords", "content_text", "source_chat_title")))
-        score = sum(1 for term in terms if term in haystack)
-        if row.get("content_text") and any(term in normalize(row["content_text"]) for term in raw_terms):
-            score += 3
-        if score:
-            scored.append((score, row))
-    scored.sort(key=lambda x: (-x[0], x[1].get("title") or ""))
-    return ai_rank(query, [row for _, row in scored[:10]])
-
-
 def send_text(chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None,
               parse_mode: Optional[str] = None) -> None:
     payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
@@ -1173,12 +2090,29 @@ def forwarded_source(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return message.get("forward_from_chat") or None
 
 
-def log_delivery(chat_id: int, row: Dict[str, Any]) -> None:
+def log_delivery(chat_id: int, row: Dict[str, Any], user: Optional[Dict[str, Any]] = None) -> None:
+    user = user or _REQ.get("user") or {"id": chat_id}
+    uid = user.get("id") or chat_id
+    q = ""
     try:
-        supabase("delivery_logs", "POST", {"user_id": chat_id, "book_id": row.get("id"), "book_title": row.get("title")})
+        ctx = load_ctx(uid)
+        q = " ".join(ctx.get("q") or []) or str(ctx.get("raw") or "")
+    except Exception:
+        pass
+    entry = {"user_id": uid, "username": user.get("username") or user.get("first_name"), "query": q[:200] or None,
+             "book_id": row.get("id"), "book_title": row.get("title")}
+    try:
+        supabase("delivery_logs", "POST", entry)
     except Exception:
         log_error("delivery_log")
-    audit_log(f"PDF sent\nUser: {chat_id}\nFile: {row.get('title')}\nSource: {row.get('source_chat_title', 'unknown')}")
+        try:  # older table without username/query columns
+            supabase("delivery_logs", "POST", {k: entry[k] for k in ("user_id", "book_id", "book_title")})
+        except Exception:
+            log_error("delivery_log basic")
+    note_user(user if user.get("first_name") else None, files=1)
+    label = user_label({"first_name": user.get("first_name"), "last_name": user.get("last_name"),
+                        "username": user.get("username")})
+    audit_log(f"📄 {label} ({uid}) ne li: {str(row.get('title') or '')[:80]}" + (f" — query: {q[:60]}" if q else ""))
 
 
 def send_by_file_id(chat_id: int, row: Dict[str, Any]) -> None:
@@ -1192,7 +2126,7 @@ def send_by_file_id(chat_id: int, row: Dict[str, Any]) -> None:
     telegram(method, {"chat_id": chat_id, field: row["telegram_file_id"], "caption": (row.get("title") or "")[:1000]})
 
 
-def deliver_result(chat_id: int, row: Dict[str, Any]) -> None:
+def deliver_result(chat_id: int, row: Dict[str, Any], user: Optional[Dict[str, Any]] = None) -> None:
     try:
         # copyMessage works for both public and private source channels when permitted.
         telegram("copyMessage", {
@@ -1200,7 +2134,7 @@ def deliver_result(chat_id: int, row: Dict[str, Any]) -> None:
             "from_chat_id": row["source_chat_id"],
             "message_id": row["source_message_id"],
         })
-        log_delivery(chat_id, row)
+        log_delivery(chat_id, row, user)
         return
     except Exception:
         log_error("copyMessage")
@@ -1209,21 +2143,21 @@ def deliver_result(chat_id: int, row: Dict[str, Any]) -> None:
         if row.get("source_chat_id") and row.get("source_message_id"):
             telegram("forwardMessage", {"chat_id": chat_id, "from_chat_id": row["source_chat_id"],
                                         "message_id": row["source_message_id"]})
-            log_delivery(chat_id, row)
+            log_delivery(chat_id, row, user)
             return
     except Exception:
         log_error("forwardMessage")
     try:
         if row.get("backup_chat_id") and row.get("backup_message_id"):
             telegram("copyMessage", {"chat_id": chat_id, "from_chat_id": row["backup_chat_id"], "message_id": row["backup_message_id"]})
-            log_delivery(chat_id, row)
+            log_delivery(chat_id, row, user)
             return
     except Exception:
         log_error("backup copyMessage")
     try:
         if row.get("telegram_file_id"):
             send_by_file_id(chat_id, row)
-            log_delivery(chat_id, row)
+            log_delivery(chat_id, row, user)
             return
     except Exception:
         log_error("send by file_id")
@@ -1242,6 +2176,7 @@ def handle_private_message(message: Dict[str, Any]) -> None:
         return
 
     user_id = user.get("id")
+    note_user(user)
     command = command_name(text)
     if command == "/myid":
         role = {"owner": "Owner ✅", "admin": "Sub-admin ✅", "user": "Normal user"}[role_of(user_id)]
@@ -1282,7 +2217,7 @@ def handle_private_message(message: Dict[str, Any]) -> None:
                 if source.get("message_id"):
                     record["source_message_id"] = source["message_id"]
                     record["source_link"] = message_link(source, source["message_id"])
-                upsert_item(record)
+                index_file(record, chat_id, message.get("message_id"), str(source.get("title") or "forward"))
                 send_text(chat_id, f"Channel auto-add aur file index ho gayi: {source.get('title', 'source')}\nFile: {clean_text(info.get('file_name', 'file'))}")
             else:
                 send_text(chat_id, f"✅ Source channel jud gaya: {source.get('title', 'source')}\nAb is channel ki nayi files index hongi.\n"
@@ -1296,7 +2231,7 @@ def handle_private_message(message: Dict[str, Any]) -> None:
         pseudo_channel = {"id": chat_id, "title": "Admin uploads", "username": None}
         record = build_metadata(message, pseudo_channel)
         record["source_link"] = None
-        upsert_item(record)
+        index_file(record, chat_id, message.get("message_id"), "Admin upload")
         send_text(chat_id, f"Indexed: {record['title']}\nLanguage: {record['language']}\nAb admin is file ko search se dhoondh sakte hain.")
         return
 
@@ -1311,6 +2246,7 @@ def handle_private_message(message: Dict[str, Any]) -> None:
         extra = "\n\n⚙️ Admin: /admin se Admin Panel khulega." if is_subadmin(user_id) else ""
         send_text(chat_id, USER_HELP + extra, None, "HTML")
         return
+    is_private = message.get("chat", {}).get("type") == "private"
     if command_name(text) == "/search":
         query = text.split(None, 1)[1].strip() if len(text.split(None, 1)) > 1 else ""
     else:
@@ -1318,9 +2254,18 @@ def handle_private_message(message: Dict[str, Any]) -> None:
     if not query:
         send_text(chat_id, SEARCH_PROMPT, None, "HTML")
         return
+    if is_private and not command:
+        # Understand first (free), search second, AI only if needed.
+        try:
+            smart_reply(chat_id, user, query)
+        except Exception:
+            log_error("smart_reply")
+            send_text(chat_id, "Database abhi available nahi hai. Admin se setup check karne ko kahen.")
+        return
 
     try:
         results = search_books(query)
+        note_user(None, searches=1)
     except Exception:
         log_error("search")
         send_text(chat_id, "Database abhi available nahi hai. Admin se setup check karne ko kahen.")
@@ -1447,6 +2392,13 @@ def handle_admin_command(message: Dict[str, Any]) -> None:
             handle_admin_input(dict(message, text=arg), "setlog", None)
     elif command in {"/report", "/stats"}:
         send_text(chat_id, report_text())
+    elif command in {"/user", "/users"}:
+        if arg and re.fullmatch(r"\d{3,}", arg):
+            send_text(chat_id, user_detail(int(arg)), {"inline_keyboard": [[{"text": "👥 Users", "callback_data": "ad:users"}], BACK_ROW]})
+        else:
+            send_text(chat_id, users_view(), {"inline_keyboard": [BACK_ROW]})
+    elif command == "/backupold":
+        send_text(chat_id, *backup_old_view())
     elif command == "/rename":
         parts = text.split(maxsplit=2)
         if len(parts) >= 3 and parts[1].isdigit():
@@ -1468,11 +2420,7 @@ def handle_channel_post(message: Dict[str, Any]) -> None:
             return
         if file_info(message):
             record = build_metadata(message, channel)
-            upsert_item(record)
-            backup = backup_message(channel.get("id"), message.get("message_id"))
-            if backup and record.get("telegram_file_unique_id"):
-                supabase("books", "PATCH", {"backup_chat_id": get_setting("backup_chat_id"), "backup_message_id": backup.get("message_id")}, f"?telegram_file_unique_id=eq.{urllib.parse.quote(record['telegram_file_unique_id'])}")
-            audit_log(f"File indexed\nSource: {channel.get('title')}\nFile: {record.get('title')}")
+            index_file(record, channel.get("id"), message.get("message_id"), str(channel.get("title") or "channel"))
     except Exception:
         log_error("channel_post")
 
@@ -1485,7 +2433,7 @@ def handle_group_file(message: Dict[str, Any]) -> None:
         return
     try:
         register_channel(chat)
-        upsert_item(build_metadata(message, chat))
+        index_file(build_metadata(message, chat), chat.get("id"), message.get("message_id"), str(chat.get("title") or "group"))
     except Exception:
         log_error("group_file")
 
@@ -1494,6 +2442,7 @@ def handle_callback(query: Dict[str, Any]) -> None:
     data = query.get("data", "")
     chat_id = query.get("message", {}).get("chat", {}).get("id")
     user_id = query.get("from", {}).get("id")
+    note_user(query.get("from"))
     if data != "verify_join":
         try:
             telegram("answerCallbackQuery", {"callback_query_id": query.get("id")})
@@ -1511,6 +2460,7 @@ def handle_callback(query: Dict[str, Any]) -> None:
                 pass
             if reqs:
                 mark_verified(user_id)
+                note_user(None, verified=True)
             # The gate message turns into a thank-you (buttons gone), then the welcome + menu.
             show(chat_id, "✅ <b>Shukriya!</b> Ab aap bot use kar sakte ho 🎉", None, query, "HTML")
             if chat_id:
@@ -1555,12 +2505,15 @@ def handle_callback(query: Dict[str, Any]) -> None:
     if data == "user_search":
         send_text(chat_id, SEARCH_PROMPT, None, "HTML")
         return
+    if (data == "more" or data.startswith("g:")) and chat_id:
+        handle_guided_callback(query, data, chat_id)
+        return
     if not data.startswith("book:"):
         return
     book_id = data.split(":", 1)[1]
     rows = supabase("books", "GET", query=f"?id=eq.{urllib.parse.quote(book_id)}&select=*&limit=1")
     if rows and chat_id:
-        deliver_result(chat_id, rows[0])
+        deliver_result(chat_id, rows[0], query.get("from"))
 
 
 def webhook_url() -> str:
@@ -1627,6 +2580,11 @@ def diagnostics() -> Dict[str, Any]:
     except Exception as exc:
         d["source_channels"] = "error: " + str(exc)[:60]
     d["backup_channel_set"] = bool(get_setting("backup_chat_id"))
+    try:
+        if d["backup_channel_set"]:
+            d["files_not_backed_up"] = count_rows("books", backup_pending_query(get_setting("backup_chat_id")))
+    except Exception:
+        pass
     d["log_chat_set"] = bool(get_setting("log_chat_id"))
     return d
 
@@ -1641,8 +2599,23 @@ def setup_status() -> Dict[str, Any]:
             "SUPABASE_SERVICE_ROLE_KEY": bool(SUPABASE_KEY),
             "ADMIN_USER_IDS": bool(ADMIN_USER_IDS),
             "OPENAI_API_KEY": bool(OPENAI_API_KEY),
-        }
+            "GROQ_API_KEY": bool(GROQ_API_KEY),
+            "GROQ_API_KEY_2": bool(GROQ_API_KEY_2),
+            "GROQ_API_KEY_3": bool(GROQ_API_KEY_3),
+        },
+        "ai": ("on (" + ai_provider() + ")") if ai_provider() else "off",
     }
+    if GROQ_KEYS:
+        # Key check without spending tokens (lists models). Never shows a key.
+        checks_ai = {}
+        for i, key in enumerate(GROQ_KEYS):
+            name = "GROQ_API_KEY" if i == 0 else f"GROQ_API_KEY_{i + 1}"
+            try:
+                http_json("https://api.groq.com/openai/v1/models", "GET", None, {"Authorization": f"Bearer {key}"}, timeout=5)
+                checks_ai[name] = "ok"
+            except Exception as exc:
+                checks_ai[name] = "error: " + str(exc)[:120].replace(key, "***")
+        status["ai_key_check"] = checks_ai
     if BOT_TOKEN:
         try:
             info = telegram("getWebhookInfo", {}).get("result", {})
@@ -1675,6 +2648,11 @@ def setup_status() -> Dict[str, Any]:
                 tables[name] = "missing/error: " + str(exc)[:80]
         status["database"] = "ok" if all(v == "ok" for v in tables.values()) else "incomplete"
         status["tables"] = tables
+        try:
+            supabase("bot_users", "GET", query="?select=user_id&limit=1")
+            status["optional_tables"] = {"bot_users": "ok"}
+        except Exception:
+            status["optional_tables"] = {"bot_users": "missing (users saved in bot_settings until the SQL is run)"}
         status["bot"] = diagnostics()
     else:
         status["database"] = "not configured (set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)"
@@ -1689,6 +2667,8 @@ def webhook() -> Any:
         # open the site's home URL once and it re-registers itself.
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     update = request.get_json(silent=True) or {}
+    _REQ.clear()
+    _LOG_QUEUE.clear()
     reply_chat = ((update.get("message") or {}).get("chat") or {}).get("id") or \
         (((update.get("callback_query") or {}).get("message") or {}).get("chat") or {}).get("id")
     try:
@@ -1701,6 +2681,7 @@ def webhook() -> Any:
             text = (message.get("text") or "").strip()
             handle_group_file(message)
             if file_info(message) and message.get("chat", {}).get("type") in {"group", "supergroup"}:
+                flush_request()
                 return jsonify({"ok": True})
             command = command_name(text)
             is_private = message.get("chat", {}).get("type") == "private"
@@ -1719,6 +2700,7 @@ def webhook() -> Any:
                 send_text(reply_chat, "Abhi kuch gadbad hui" + hint + ", thodi der baad dobara try karein.")
             except Exception:
                 pass
+    flush_request()
     return jsonify({"ok": True})
 
 
