@@ -789,7 +789,7 @@ ADMIN_HELP = (
     "🔑 AI Keys — Groq/OpenAI key bot me hi jodo/hatao, Vercel deploy nahi (sirf owner)\n"
     "🔄 Bot Restart — bot ruk jaye to webhook + menu dobara set\n"
     "📂 All Files — saari files 10-10 karke, ⬅️ / ➡️, file pe tap: 📤 Bhejo / ✏️ Rename / ❌ Hatao\n"
-    "🤖 AI Naming — nayi file ka saaf naam AI rakhega (on/off) + purane naam theek karo (20-20)\n"
+    "🤖 AI Naming — har nayi file ka naam file ke andar padhke apne-aap (hamesha chalu) + purane naam ek baar theek karo\n"
     "🔍 Search Mode — ON pe aapka har msg search hoga; OFF pe bot samjhega kaam hai ya search\n\n"
     "🤖 Bolke kaam (sirf admin): \"polity ka naam politics kr do\", \"sab files me Hindi ko हिंदी kr do\", "
     "\"lucent wali file hatao\", \"sari ek baar me upload kro\" (backup), \"users dikhao\", \"report\", "
@@ -1182,7 +1182,7 @@ def add_ai_key(message: Dict[str, Any], chat_id: int, text: str) -> None:
 
 def status_markup() -> Dict[str, Any]:
     return {"inline_keyboard": [
-        [{"text": "🔄 Bot Restart", "callback_data": "ad:restart"}],
+        [{"text": "🔄 Bot Restart", "callback_data": "ad:restart"}, {"text": "🤖 AI test", "callback_data": "ad:aitest"}],
         [{"text": "🌐 Web kholo (restart)", "url": PUBLIC_HOME + "?restart=1"}],
         BACK_ROW]}
 
@@ -1557,8 +1557,8 @@ def fail_reason(exc: Exception) -> str:
 # Which chat models a Groq key may use. Groq retires / gates models over time (Oct 26 2026 live: the
 # llama-3.1-8b-instant and llama-3.3-70b-versatile ids answered 404 model_not_found for Aarav's key
 # while /models said the key is fine), so the list comes from the key's own free /models answer.
-GROQ_PREFER = ["llama-3.1-8b-instant", "openai/gpt-oss-20b", "meta-llama/llama-4-scout-17b-16e-instruct",
-               "llama-3.3-70b-versatile", "openai/gpt-oss-120b", "qwen/qwen3-32b",
+GROQ_PREFER = ["llama-3.1-8b-instant", "openai/gpt-oss-20b", "qwen/qwen3.8-27b", "qwen/qwen3-32b",
+               "meta-llama/llama-4-scout-17b-16e-instruct", "llama-3.3-70b-versatile", "openai/gpt-oss-120b",
                "meta-llama/llama-4-maverick-17b-128e-instruct", "moonshotai/kimi-k2-instruct", "gemma2-9b-it"]
 _GMODELS: Dict[str, Any] = {}
 NON_CHAT = ("whisper", "tts", "guard", "embed", "playai", "orpheus", "distil", "compound", "allam", "prompt", "safeguard")
@@ -1580,7 +1580,7 @@ def groq_models(key: str) -> List[str]:
         ids = hit[1]
     else:
         ids = []
-        raw = get_setting(f"aimodels:{kid}") or ""
+        raw = get_setting(f"aimodels2:{kid}") or ""
         ts, _, lst = raw.partition("|")
         if lst and ts.isdigit() and time.time() - int(ts) < 6 * 3600:
             ids = [x for x in lst.split(",") if x]
@@ -1592,12 +1592,15 @@ def groq_models(key: str) -> List[str]:
                        if m.get("id") and m.get("active", True) is not False
                        and not any(x in str(m.get("id")).lower() for x in NON_CHAT)]
                 ids = sorted(dict.fromkeys(ids), key=_model_rank)[:6]
-                if ids:
-                    set_setting(f"aimodels:{kid}", f"{int(time.time())}|{','.join(ids)}")
             except Exception:
                 ids = []
+            if ids:
+                try:
+                    set_setting(f"aimodels2:{kid}", f"{int(time.time())}|{','.join(ids)}")
+                except Exception:
+                    log_error("aimodels cache")
         if not ids:
-            ids = list(GROQ_PREFER[:3])
+            ids = ["openai/gpt-oss-20b", "qwen/qwen3.8-27b", "llama-3.1-8b-instant"]
         _GMODELS[kid] = (time.time(), ids)
     return [m for m in dict.fromkeys([GROQ_MODEL] + ids) if m][:4]
 
@@ -1608,9 +1611,25 @@ def drop_groq_model(key: str, model: str) -> None:
     ids = [m for m in groq_models(key) if m != model and m != GROQ_MODEL]
     _GMODELS[kid] = (time.time(), ids or [m for m in GROQ_PREFER if m != model][:3])
     try:
-        set_setting(f"aimodels:{kid}", f"{int(time.time())}|{','.join(_GMODELS[kid][1])}")
+        set_setting(f"aimodels2:{kid}", f"{int(time.time())}|{','.join(_GMODELS[kid][1])}")
     except Exception:
         log_error("drop_groq_model")
+
+
+def groq_body(model: str, messages: List[Dict[str, Any]], max_tokens: int) -> Dict[str, Any]:
+    """Request body per model family. gpt-oss models think before answering: with a small max_tokens the
+    thinking eats the budget, the JSON comes out empty and Groq answers 400 json_validate_failed (seen live)."""
+    body: Dict[str, Any] = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": 0.1,
+                            "response_format": {"type": "json_object"}}
+    if "gpt-oss" in model:
+        body["reasoning_effort"] = "low"
+        body["max_tokens"] = max_tokens + 600
+    return body
+
+
+def strip_think(text: Any) -> str:
+    t = re.sub(r"<think>.*?</think>", "", str(text or ""), flags=re.S).strip()
+    return t
 
 
 def ai_complete(system: str, user_text: str, max_tokens: int = 150, cap: float = 9.0) -> Optional[str]:
@@ -1625,11 +1644,13 @@ def ai_complete(system: str, user_text: str, max_tokens: int = 150, cap: float =
             if time.time() > deadline - 1:
                 return None
             try:
-                res = http_json("https://api.groq.com/openai/v1/chat/completions", "POST", {
-                    "model": model, "messages": messages, "max_tokens": max_tokens, "temperature": 0.1,
-                    "response_format": {"type": "json_object"}}, {"Authorization": f"Bearer {key}"},
-                    timeout=max(1.0, min(6.0, deadline - time.time())))
-                return res["choices"][0]["message"]["content"]
+                res = http_json("https://api.groq.com/openai/v1/chat/completions", "POST",
+                                groq_body(model, messages, max_tokens), {"Authorization": f"Bearer {key}"},
+                                timeout=max(1.0, min(7.0, deadline - time.time())))
+                content = strip_think(res["choices"][0]["message"].get("content"))
+                if not content:
+                    continue
+                return content
             except Exception as exc:
                 low = str(exc).lower()
                 if "model" in low and any(x in low for x in ("not found", "decommission", "does not exist", "not supported", "no access")):
@@ -2133,8 +2154,11 @@ def _send_file_copy(target: int, from_chat: Any, message_id: Any, row: Dict[str,
     """Copy a file into the backup chat: copy the post, else re-send by file_id. Returns message id."""
     if from_chat and message_id:
         try:
-            res = telegram("copyMessage", {"chat_id": target, "from_chat_id": from_chat, "message_id": message_id,
-                                           "disable_notification": True}).get("result") or {}
+            payload: Dict[str, Any] = {"chat_id": target, "from_chat_id": from_chat, "message_id": message_id,
+                                       "disable_notification": True}
+            if row.get("_caption"):
+                payload["caption"] = row["_caption"]
+            res = telegram("copyMessage", payload).get("result") or {}
             if res.get("message_id"):
                 return int(res["message_id"])
         except Exception as exc:
@@ -2145,14 +2169,16 @@ def _send_file_copy(target: int, from_chat: Any, message_id: Any, row: Dict[str,
         method, field = ("sendVideo", "video") if mime.startswith("video/") else \
             (("sendAudio", "audio") if mime.startswith("audio/") else ("sendDocument", "document"))
         res = telegram(method, {"chat_id": target, field: row["telegram_file_id"],
-                                "caption": (row.get("title") or "")[:1000], "disable_notification": True}).get("result") or {}
+                                "caption": (row.get("_caption") or row.get("title") or "")[:1000], "disable_notification": True}).get("result") or {}
         if res.get("message_id"):
             return int(res["message_id"])
     return None
 
 
-def ensure_backup(record: Dict[str, Any], from_chat: Any, message_id: Any) -> str:
-    """Back up a just-indexed file once. 'saved' | 'dup' | 'off' | 'failed'."""
+def ensure_backup(record: Dict[str, Any], from_chat: Any, message_id: Any, data: Optional[bytes] = None) -> str:
+    """Back up a just-indexed file once, under its clean name. 'saved' | 'dup' | 'off' | 'failed'.
+    With the file's bytes in hand (≤15 MB) the backup is a fresh upload whose FILE NAME is the clean name;
+    otherwise a copy of the post whose caption is the clean name (Telegram can't rename a copied file)."""
     target = get_setting("backup_chat_id")
     uniq = record.get("telegram_file_unique_id")
     if not target or not uniq:
@@ -2161,11 +2187,23 @@ def ensure_backup(record: Dict[str, Any], from_chat: Any, message_id: Any) -> st
                                           "&select=id,backup_chat_id,backup_message_id&limit=1")
     if rows and rows[0].get("backup_message_id") and str(rows[0].get("backup_chat_id")) == str(target):
         return "dup"
-    try:
-        mid = _send_file_copy(int(target), from_chat, message_id, record)
-    except Exception:
-        log_error("backup copy")
-        mid = None
+    mid = None
+    caption = backup_caption(record)
+    mime = str(record.get("mime_type") or "").lower()
+    if data and not mime.startswith(("video/", "audio/")) and req_elapsed() < 6.0:
+        try:
+            res = telegram_upload("sendDocument", {"chat_id": int(target), "caption": caption, "disable_notification": "true"},
+                                  "document", safe_filename(str(record.get("title") or ""), str(record.get("file_name") or "")), data)
+            mid = int(((res or {}).get("result") or {}).get("message_id") or 0) or None
+        except Exception:
+            log_error("backup upload")
+            mid = None
+    if not mid:
+        try:
+            mid = _send_file_copy(int(target), from_chat, message_id, dict(record, _caption=caption))
+        except Exception:
+            log_error("backup copy")
+            mid = None
     if not mid:
         return "failed"
     supabase("books", "PATCH", {"backup_chat_id": int(target), "backup_message_id": mid},
@@ -2174,21 +2212,49 @@ def ensure_backup(record: Dict[str, Any], from_chat: Any, message_id: Any) -> st
 
 
 def index_file(record: Dict[str, Any], from_chat: Any, message_id: Any, where: str) -> str:
-    """Save a file to the catalog, back it up once, and log it."""
+    """Save a file to the catalog: name it from its CONTENT (AI, automatic), put it in a subject category,
+    THEN back it up once (backup copy carries the clean name), and log it."""
+    text = record.pop("_text", None) or {"excerpt": "", "content": ""}
+    data = record.pop("_bytes", None)
+    orig_title = str(record.get("title") or "")
     try:
-        named = maybe_ai_title(record)
+        how = name_new_file(record, text)
     except Exception:
         log_error("ai_title")
-        named = ""
-    upsert_item(record)
+        how = "local"
+    slug = record.pop("_cat", None) or "other"
+    record["keywords"] = with_cat_tag(clean_text(" ".join(str(x or "") for x in (
+        record.get("title"), record.get("keywords"))))[:3990], slug)
+    if has_category_col():
+        record["category"] = slug
+    saved = upsert_item(record)
+    book_id = (saved[0].get("id") if isinstance(saved, list) and saved and isinstance(saved[0], dict) else None)
+    if not book_id and record.get("telegram_file_unique_id"):
+        try:
+            got_id = supabase("books", "GET", query="?telegram_file_unique_id=eq." +
+                              urllib.parse.quote(str(record["telegram_file_unique_id"])) + "&select=id&limit=1")
+            book_id = got_id[0].get("id") if got_id else None
+        except Exception:
+            book_id = None
+    if book_id and not has_category_col():
+        try:
+            save_categories({int(book_id): slug})
+        except Exception:
+            log_error("catmap")
+    if how == "retry":
+        queue_name_retry(book_id)
+    record["_cat"] = slug
     try:
-        backup = ensure_backup(record, from_chat, message_id)
+        backup = ensure_backup(record, from_chat, message_id, data)
     except Exception:
         log_error("ensure_backup")
         backup = "failed"
+    record.pop("_cat", None)
     mark = {"saved": " · 💾 backup ✅", "dup": " · 💾 pehle se backup", "failed": " · 💾 backup ❌"}.get(backup, "")
-    audit_log(f"📥 Nayi file save: {str(record.get('title') or '')[:80]} — {where}{mark}" +
-              (f" · 🤖 AI naam (asli: {named[:60]})" if named else ""))
+    named = orig_title if str(record.get("title") or "") != orig_title else ""
+    audit_log(f"📥 Nayi file save: {str(record.get('title') or '')[:80]} [{SUBJECT_LABEL.get(slug, slug)}] — {where}{mark}" +
+              (f" · 🤖 AI naam (asli: {str(record.get('file_name') or named)[:60]})" if how == "ai" and named else "") +
+              (" · ⏳ AI naam baad me" if how == "retry" else ""))
     return backup
 
 
@@ -2209,7 +2275,8 @@ def backup_old_batch(limit: int = 20, budget: float = 7.0) -> Dict[str, Any]:
         if time.monotonic() - started > budget:
             break
         try:
-            mid = _send_file_copy(int(target), row.get("source_chat_id"), row.get("source_message_id"), row)
+            mid = _send_file_copy(int(target), row.get("source_chat_id"), row.get("source_message_id"),
+                                  dict(row, _caption=f"📄 {row.get('title') or ''}"[:1000]))
         except Exception as exc:
             m = re.search(r"retry after (\d+)", str(exc).lower())
             if m or "too many requests" in str(exc).lower():
@@ -2351,7 +2418,10 @@ def build_metadata(message: Dict[str, Any], channel: Dict[str, Any]) -> Dict[str
     caption = message.get("caption", "") or ""
     raw_name = info.get("file_name", "")
     title = clean_text(caption) or clean_text(os.path.splitext(raw_name)[0])
-    content_text = extract_pdf_text(info.get("file_id"), raw_name, info.get("file_size"))
+    # Read the file itself (≤20 MB, Telegram's bot limit): first pages → AI name + subject; more pages → search.
+    data = download_file(info.get("file_id"), info.get("file_size"))
+    text = text_from_bytes(data, raw_name, info.get("mime_type") or "")
+    content_text = text["content"]
     searchable = " ".join([title, caption, raw_name, channel.get("title", ""), content_text])
     # Captions can contain explicit tags such as #ssc #english; retain them for search.
     keywords = clean_text(searchable)
@@ -2372,6 +2442,8 @@ def build_metadata(message: Dict[str, Any], channel: Dict[str, Any]) -> Dict[str
         "content_text": content_text,
         "language": detect_language(searchable),
         "status": "indexed",
+        "_text": text,
+        "_bytes": data if data and len(data) <= REUPLOAD_LIMIT else None,
     }
 
 
@@ -2387,9 +2459,10 @@ def detect_language(text: str) -> str:
     return "unknown"
 
 
-def upsert_item(record: Dict[str, Any]) -> None:
+def upsert_item(record: Dict[str, Any]) -> Any:
     # The unique constraint on telegram_file_unique_id prevents duplicate indexing.
-    supabase("books", "POST", record, "?on_conflict=telegram_file_unique_id")
+    clean = {k: v for k, v in record.items() if not str(k).startswith("_")}
+    return supabase("books", "POST", clean, "?on_conflict=telegram_file_unique_id")
 
 
 def send_text(chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None,
@@ -2744,6 +2817,18 @@ def handle_admin_command(message: Dict[str, Any]) -> None:
         send_text(chat_id, status_text(user_id), status_markup())
     elif command == "/restart":
         send_text(chat_id, restart_text(), status_markup())
+    elif command == "/aitest":
+        send_text(chat_id, ai_test_text(), {"inline_keyboard": [[{"text": "🔁 Dobara test", "callback_data": "ad:aitest"}], BACK_ROW]}, "HTML")
+    elif command == "/ainaming":
+        # Hidden owner-only emergency switch (AI naming is always on otherwise).
+        if not is_owner(user_id):
+            send_text(chat_id, "Ye sirf owner ke liye hai.")
+        elif arg.lower() in {"off", "band"}:
+            set_setting("ai_naming", "off")
+            send_text(chat_id, "⛔ AI naming emergency band. Chalu: /ainaming on")
+        else:
+            set_setting("ai_naming", "on")
+            send_text(chat_id, "✅ AI naming chalu (apne-aap har nayi file).")
     elif command in {"/keys", "/aikeys"}:
         if is_owner(user_id):
             send_text(chat_id, *keys_view())
@@ -2911,11 +2996,17 @@ def handle_callback(query: Dict[str, Any]) -> None:
     if data == "user_help":
         send_text(chat_id, USER_HELP, None, "HTML")
         return
+    if data == "noop":
+        return
     if data == "user_categories":
-        rows = supabase("books", "GET", query="?select=title,language&status=eq.indexed&limit=500")
-        langs = sorted({r.get("language") for r in rows if r.get("language")})
-        send_text(chat_id, "🗂️ <b>Categories</b>\n\n" + ("\n".join(f"▸ {esc(x)}" for x in langs) if langs else "Abhi koi category nahi hai.") +
-                  "\n\n<i>Book ka naam likhkar search karo 🔍</i>", None, "HTML")
+        text, kb = categories_view()
+        show(chat_id, text, kb, query, "HTML")
+        return
+    if data.startswith("cat:"):
+        parts = data.split(":")
+        page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
+        text, kb = category_list_view(parts[1] if len(parts) > 1 else "other", page)
+        show(chat_id, text, kb, query)
         return
     if data == "user_list":
         rows = supabase("books", "GET", query="?select=id,title,source_chat_title&status=eq.indexed&order=title&limit=30")
@@ -3194,12 +3285,8 @@ def admin_text(chat_id: int, user: Dict[str, Any], text: str) -> Optional[str]:
             return raw                       # plain words ("lucent", "ssc gd gk hindi") → search, no AI
         intent = ai_admin_intent(user_id, raw)
         if intent is None:
-            token = set_op(user_id, {"kind": "search", "q": raw[:300]})
-            send_text(chat_id, "🤔 Ye koi kaam (command) hai ya file search?\n\n"
-                               "Kaam ho to thoda saaf likho, jaise: \"polity ka naam politics kr do\".",
-                      {"inline_keyboard": [[{"text": "🔍 Search karo", "callback_data": f"ad:op:s:{token}"}],
-                                           [{"text": "⚙️ Admin Panel", "callback_data": "ad:panel"}]]})
-            return None
+            # AI down / limit / unsure → never a dead end: treat it as a normal search (local rules first).
+            return raw
     if intent["action"] == "search":
         return intent.get("query") or raw
     run_admin_action(chat_id, user, intent, raw)
@@ -3406,7 +3493,7 @@ def backup_flow(chat_id: int, user_id: int) -> None:
                                   f"(20-20 karke, koi duplicate nahi).\n\nShuru karu?", {"kind": "backup"})
 
 
-def apply_renames(items: List[Any], budget: float = 6.5) -> List[Any]:
+def apply_renames(items: List[Any], cats: Optional[Dict[str, str]] = None, budget: float = 6.5) -> List[Any]:
     """Apply [[id, old, new], ...]; the original file name / caption stay searchable. Returns items not done (time budget)."""
     started = time.monotonic()
     ids = [int(x[0]) for x in items]
@@ -3424,7 +3511,13 @@ def apply_renames(items: List[Any], budget: float = 6.5) -> List[Any]:
         # Search words = new name + the file's own caption / original file name / channel (not older names).
         keywords = clean_text(" ".join(str(x or "") for x in (new, row.get("caption"), row.get("file_name"),
                                                                 row.get("source_chat_title"))))
-        supabase("books", "PATCH", {"title": new[:500], "keywords": keywords[:4000]}, f"?id=eq.{int(bid)}")
+        slug = (cats or {}).get(str(bid)) or ""
+        supabase("books", "PATCH", {"title": new[:500], "keywords": with_cat_tag(keywords[:3990], slug)}, f"?id=eq.{int(bid)}")
+    if cats:
+        try:
+            save_categories({int(k): v for k, v in cats.items()})
+        except Exception:
+            log_error("save_categories")
     return left
 
 
@@ -3432,7 +3525,7 @@ def run_op(query: Dict[str, Any], chat_id: int, user_id: int, op: Dict[str, Any]
     kind = op.get("kind")
     if kind == "rename":
         items = op.get("items") or []
-        left = apply_renames(items)
+        left = apply_renames(items, op.get("cats"))
         done = items[:len(items) - len(left)]
         lines = [f"✅ {len(done)} file ka naam badal diya" if len(done) != 1 else "✅ Naam badal diya:"]
         for _, old, new in done[:5]:
@@ -3626,16 +3719,24 @@ def ainame_view() -> Any:
     on = ai_naming_on()
     key = bool(ai_provider())
     cursor = get_setting("ainame_cursor") or "0"
-    lines = [f"🤖 AI Naming: {'ON ✅' if on else 'OFF ❌'}", "",
-             "Nayi file save hote hi AI uska caption + asli file naam padhke saaf naam rakhta hai.",
-             "Asli file naam bhi save rehta hai (search me purane naam se bhi milegi).",
-             "AI ki key na ho / limit ho / pakka na ho → purana tareeka (caption / file naam).",
-             "AI kabhi naya book naam nahi banata — sirf caption / file naam ke shabd.",
+    try:
+        queued = len(json.loads(get_setting("ainame_queue") or "[]"))
+    except Exception:
+        queued = 0
+    lines = ["🤖 AI Naming — hamesha chalu, apne-aap" if on else "🤖 AI Naming — ⛔ emergency band hai (/ainaming on se chalu)", "",
+             "Har nayi file save hote hi bot file ke andar ke pehle 2-3 page padhta hai aur us hisaab se naam rakhta hai",
+             "(jaise hjskjd.pdf me history notes → \"History Notes\"). Naam me se uploader/channel ka naam, @, link hata deta hai.",
+             "Saath me subject category: History, Polity, Science... (📂 Categories me dikhegi).",
+             "File ke andar kuch nahi badalta — sirf naam + category. Asli file naam bhi save rehta hai.",
+             "Backup channel me file isi saaf naam se jaati hai.",
+             "AI fail ho to file naam saaf karke rakh deta hai aur baad me 3 baar tak dobara try karta hai.",
              "", f"AI key: {'✅ hai' if key else '❌ nahi (🔑 AI Keys me jodo)'}"]
+    if queued:
+        lines.append(f"⏳ AI naam baaki: {queued} files (apne-aap ho jayenge)")
     if cursor not in ("", "0"):
         lines.append(f"Purane naam: ID {cursor} tak check ho chuke")
-    kb = [[{"text": "⏸️ AI Naming band karo" if on else "▶️ AI Naming chalu karo", "callback_data": f"ad:ainame:{'off' if on else 'on'}"}],
-          [{"text": "🛠️ AI se purane naam theek karo", "callback_data": "ad:fixn"}], BACK_ROW]
+    kb = [[{"text": "🛠️ AI se purane naam theek karo (ek baar)", "callback_data": "ad:fixn"}],
+          [{"text": "🤖 AI test", "callback_data": "ad:aitest"}], BACK_ROW]
     return "\n".join(lines), {"inline_keyboard": kb}
 
 
@@ -3651,7 +3752,7 @@ def fixnames_view(chat_id: int, user_id: int, after: Optional[int], query: Optio
     if not ai_provider():
         show(chat_id, "❌ AI key nahi hai. Pehle 🔑 AI Keys me key jodo.", {"inline_keyboard": [BACK_ROW]}, query)
         return
-    rows = supabase("books", "GET", query=f"?select=id,title,caption,file_name&status=eq.indexed&id=gt.{int(after)}&order=id&limit={FIX_BATCH}")
+    rows = supabase("books", "GET", query=f"?select=id,title,caption,file_name,content_text&status=eq.indexed&id=gt.{int(after)}&order=id&limit={FIX_BATCH}")
     if not rows:
         show(chat_id, "🎉 Saare purane naam check ho gaye! Nayi files ka naam AI apne-aap rakhega.",
              {"inline_keyboard": [[{"text": "🔁 Shuru se dobara", "callback_data": "ad:fixn:0"}], BACK_ROW]}, query)
@@ -3661,21 +3762,30 @@ def fixnames_view(chat_id: int, user_id: int, after: Optional[int], query: Optio
         return
     _count_day("ainame:all")
     last = int(rows[-1]["id"])
-    got = ai_titles([{"i": n, "caption": r.get("caption"), "file": r.get("file_name"), "old": r.get("title")}
-                     for n, r in enumerate(rows, 1)], cap=max(3.0, 9.0 - req_elapsed()))
-    if not got:
-        show(chat_id, "❌ AI abhi jawab nahi de raha (limit / key). Thodi der baad dobara dabao.",
-             {"inline_keyboard": [[{"text": "🔁 Dobara try", "callback_data": f"ad:fixn:{int(after)}"}], BACK_ROW]}, query)
+    got = ai_name_items([{"i": n, "caption": r.get("caption"), "file": r.get("file_name"), "old": r.get("title"),
+                          "text": str(r.get("content_text") or "")[:400]} for n, r in enumerate(rows, 1)],
+                        cap=max(3.0, 9.0 - req_elapsed()), excerpt_chars=400)
+    if got is None:
+        show(chat_id, "⏳ AI abhi busy hai (limit / network). Naam purane jaise hi rahenge, kuch kharab nahi hua.\n"
+                      "Thodi der baad 🔁 dabao — ya 🩺 Status → 🤖 AI test se wajah dekho.",
+             {"inline_keyboard": [[{"text": "🔁 Dobara try", "callback_data": f"ad:fixn:{int(after)}"}],
+                                  [{"text": "🤖 AI test", "callback_data": "ad:aitest"}], BACK_ROW]}, query)
         return
-    items = [(r["id"], r.get("title"), got[n]) for n, r in enumerate(rows, 1)
-             if got.get(n) and got[n].strip().lower() != str(r.get("title") or "").strip().lower()]
+    cats: Dict[str, str] = {}
+    for n, r in enumerate(rows, 1):
+        subj = (got.get(n) or {}).get("subject") or classify_local(
+            " ".join(str(r.get(k) or "") for k in ("title", "caption", "file_name")), str(r.get("content_text") or ""))
+        cats[str(r["id"])] = subj
+    items = [(r["id"], r.get("title"), got[n]["title"]) for n, r in enumerate(rows, 1)
+             if (got.get(n) or {}).get("title") and got[n]["title"].strip().lower() != str(r.get("title") or "").strip().lower()]
     if not items:
+        save_categories({int(k): v for k, v in cats.items()})
         set_setting("ainame_cursor", str(last))
-        show(chat_id, f"✅ Ye {len(rows)} naam pehle se theek hain.",
+        show(chat_id, f"✅ Ye {len(rows)} naam pehle se theek hain (category laga di).",
              {"inline_keyboard": [[{"text": f"▶️ Agle {FIX_BATCH} naam", "callback_data": f"ad:fixn:{last}"}], BACK_ROW]}, query)
         return
-    preview_rename(chat_id, user_id, items, query, {"next_after": last},
-                   head=f"🤖 AI ke naam sujhav ({len(rows)} me se {len(items)} badlenge) — pakka?")
+    preview_rename(chat_id, user_id, items, query, {"next_after": last, "cats": cats},
+                   head=f"🤖 AI ke naam sujhav — file ke andar padhke ({len(rows)} me se {len(items)} badlenge) — pakka?")
 
 
 def handle_admin_callback_v6(query: Dict[str, Any], cmd: str, chat_id: int, user_id: int) -> bool:
@@ -3710,6 +3820,10 @@ def handle_admin_callback_v6(query: Dict[str, Any], cmd: str, chat_id: int, user
         note = ("🔍 Search Mode OFF — ab bot samjhega aapka msg kaam hai ya search 🤖\n\n" if on else
                 "🔍 Search Mode ON — ab aapka har msg seedha search hoga.\n(Bolke kaam ke liye ise OFF karo)\n\n")
         show(chat_id, note + ADMIN_PANEL_TEXT, admin_menu(user_id), query, "HTML")
+        return True
+    if cmd == "aitest":
+        show(chat_id, ai_test_text(), {"inline_keyboard": [[{"text": "🔁 Dobara test", "callback_data": "ad:aitest"}], BACK_ROW]},
+             query, "HTML")
         return True
     if cmd == "ainame":
         show(chat_id, *ainame_view(), query=query)
@@ -3850,9 +3964,20 @@ def health() -> Any:
             log_error("setup")
             registered = False
             heal = {"error": type(exc).__name__ + ": " + str(exc)[:120].replace(BOT_TOKEN, "***")}
+    _REQ_T0[0] = time.monotonic()
+    try:
+        names = process_name_queue(budget=6.0)   # keepalive (every 10 min) retries AI names that failed at save time
+    except Exception as exc:
+        log_error("name_queue")
+        names = {"error": type(exc).__name__}
     status = setup_status()
     status["webhook_registered"] = registered
     status["self_heal"] = heal
+    status["ai_name_retry"] = names
+    try:
+        status["category_column"] = "ok" if has_category_col() else "missing (catmap fallback)"
+    except Exception:
+        pass
     return jsonify({"ok": True, "service": "telegram-book-bot", "status": status})
 
 
@@ -3977,6 +4102,578 @@ def setup_status() -> Dict[str, Any]:
     return status
 
 
+# ================================================================ content-based naming + subject categories (Oct 26 2026)
+# Every new file: read the first pages (PDF text layer / .txt / .docx), one AI call names it from the CONTENT
+# and picks a subject. Only the stored name + category change — never the file itself. Original file name and
+# caption stay stored (and searchable). AI fail → cleaned file name + local subject rules, retried later.
+
+SUBJECTS = [  # slug, label, emoji, strong words (title / file name / caption / content)
+    ("history", "History", "🏛️", ["history", "itihas", "इतिहास", "mughal", "मुगल", "मुग़ल", "akbar", "अकबर", "harappa",
+                                  "हड़प्पा", "maurya", "मौर्य", "gupta", "गुप्त", "sultanate", "सल्तनत", "vedic", "वैदिक",
+                                  "1857", "freedom struggle", "स्वतंत्रता संग्राम", "ancient india", "प्राचीन भारत",
+                                  "medieval", "मध्यकालीन", "आधुनिक भारत", "modern india", "gandhi", "गांधी", "babur", "बाबर",
+                                  "aurangzeb", "औरंगजेब", "shivaji", "शिवाजी", "buddha", "बुद्ध", "mahavir", "महावीर",
+                                  "british rule", "east india company", "ईस्ट इंडिया कंपनी"]),
+    ("polity", "Polity", "⚖️", ["polity", "politics", "राजव्यवस्था", "राजनीति", "संविधान", "constitution", "संसद",
+                               "parliament", "अनुच्छेद", "fundamental rights", "मौलिक अधिकार", "राष्ट्रपति", "president",
+                               "governor", "राज्यपाल", "panchayat", "पंचायत", "judiciary", "न्यायपालिका", "लोकसभा",
+                               "lok sabha", "राज्यसभा", "rajya sabha", "preamble", "प्रस्तावना", "laxmikanth"]),
+    ("geography", "Geography", "🌍", ["geography", "bhugol", "भूगोल", "नदी", "नदियों", "नदियाँ", "river", "rivers",
+                                     "mountain", "पर्वत", "climate", "जलवायु", "soil", "मिट्टी", "मृदा", "ocean", "महासागर",
+                                     "continent", "महाद्वीप", "monsoon", "मानसून", "solar system", "सौरमंडल", "latitude",
+                                     "अक्षांश", "volcano", "ज्वालामुखी", "earth", "पृथ्वी", "map", "मानचित्र"]),
+    ("economics", "Economics", "💰", ["economics", "economy", "अर्थव्यवस्था", "अर्थशास्त्र", "budget", "बजट", "gdp",
+                                     "inflation", "मुद्रास्फीति", "महंगाई", "five year plan", "पंचवर्षीय", "rbi",
+                                     "reserve bank", "रिजर्व बैंक", "gst", "banking", "बैंकिंग", "niti aayog", "नीति आयोग"]),
+    ("science", "Science", "🔬", ["science", "vigyan", "विज्ञान", "physics", "भौतिकी", "chemistry", "रसायन", "biology",
+                                 "जीव विज्ञान", "vitamin", "विटामिन", "कोशिका", "atom", "परमाणु", "acid", "अम्ल",
+                                 "human body", "मानव शरीर", "disease", "रोग", "newton", "न्यूटन", "electricity", "विद्युत"]),
+    ("static_gk", "Static GK", "📌", ["static gk", "स्थैतिक", "books and authors", "पुस्तकें और लेखक", "पुस्तके और लेखक",
+                                     "important days", "महत्वपूर्ण दिवस", "awards", "पुरस्कार", "first in india",
+                                     "national symbols", "राष्ट्रीय प्रतीक", "dance", "नृत्य", "sports", "खेल",
+                                     "general knowledge", "सामान्य ज्ञान", "lucent", "ल्यूसेंट", "gk", "जीके",
+                                     "one liner", "वन लाइनर"]),
+    ("current_affairs", "Current Affairs", "📰", ["current affairs", "करंट अफेयर्स", "समसामयिकी", "सम सामयिकी",
+                                                 "current affair", "monthly ca", "daily ca", "करेंट अफेयर्स"]),
+    ("maths", "Maths", "➗", ["maths", "math", "mathematics", "ganit", "गणित", "arithmetic", "अंकगणित", "percentage",
+                             "प्रतिशत", "profit and loss", "लाभ और हानि", "लाभ हानि", "ratio", "अनुपात", "algebra",
+                             "बीजगणित", "geometry", "ज्यामिति", "simplification", "सरलीकरण", "number system",
+                             "संख्या पद्धति", "time and work", "समय और कार्य", "simple interest", "साधारण ब्याज",
+                             "mensuration", "क्षेत्रमिति", "trigonometry", "त्रिकोणमिति", "rs aggarwal", "rakesh yadav"]),
+    ("reasoning", "Reasoning", "🧩", ["reasoning", "रीजनिंग", "तर्कशक्ति", "तार्किक", "analogy", "सादृश्यता",
+                                     "coding decoding", "कोडिंग डिकोडिंग", "blood relation", "रक्त संबंध", "direction sense",
+                                     "दिशा ज्ञान", "syllogism", "न्याय निगमन", "puzzle", "पहेली", "non verbal", "अशाब्दिक",
+                                     "series", "श्रृंखला"]),
+    ("hindi", "Hindi", "🇮🇳", ["hindi grammar", "हिंदी व्याकरण", "हिन्दी व्याकरण", "व्याकरण", "vyakaran", "संधि", "समास",
+                              "अलंकार", "मुहावरे", "लोकोक्ति", "पर्यायवाची", "विलोम", "हिंदी साहित्य", "हिन्दी साहित्य",
+                              "तत्सम", "छंद", "कारक", "सर्वनाम"]),
+    ("english", "English", "🔤", ["english grammar", "vocabulary", "synonyms", "antonyms", "idioms", "phrases", "tense",
+                                 "tenses", "active passive", "narration", "preposition", "one word substitution",
+                                 "spelling", "comprehension", "articles", "modals", "noun", "pronoun", "adjective"]),
+    ("computer", "Computer", "💻", ["computer", "कंप्यूटर", "कम्प्यूटर", "ms office", "excel", "internet", "इंटरनेट",
+                                   "ccc", "o level", "software", "hardware", "operating system", "keyboard shortcut"]),
+    ("pyq", "PYQ / Previous Papers", "📑", ["pyq", "previous year", "previous years", "पिछले वर्ष", "पिछले वर्षों",
+                                           "solved paper", "solved papers", "question paper", "प्रश्न पत्र", "हल प्रश्न पत्र",
+                                           "पूर्व वर्ष", "papers"]),
+    ("mock", "Mock / Practice", "📝", ["mock", "mock test", "मॉक", "practice set", "प्रैक्टिस सेट", "प्रैक्टिस",
+                                      "test series", "टेस्ट सीरीज", "model paper", "मॉडल पेपर", "मॉडल पेपर्स",
+                                      "practice book", "अभ्यास"]),
+    ("other", "Other", "📁", []),
+]
+SUBJECT_LABEL = {s: l for s, l, _, _ in SUBJECTS}
+SUBJECT_EMOJI = {s: e for s, _, e, _ in SUBJECTS}
+SUBJECT_ALIASES = {
+    "history": "history", "itihas": "history", "polity": "polity", "politics": "polity", "constitution": "polity",
+    "civics": "polity", "geography": "geography", "economics": "economics", "economy": "economics",
+    "science": "science", "physics": "science", "chemistry": "science", "biology": "science",
+    "static gk": "static_gk", "gk": "static_gk", "general knowledge": "static_gk", "general awareness": "static_gk",
+    "gk/gs": "static_gk", "general studies": "static_gk", "current affairs": "current_affairs",
+    "maths": "maths", "math": "maths", "mathematics": "maths", "quant": "maths", "quantitative aptitude": "maths",
+    "reasoning": "reasoning", "hindi": "hindi", "english": "english", "computer": "computer",
+    "pyq": "pyq", "previous papers": "pyq", "previous papers/pyq": "pyq", "previous year papers": "pyq",
+    "pyq / previous papers": "pyq", "mock": "mock", "mock/practice": "mock", "practice": "mock",
+    "mock / practice": "mock", "other": "other", "unknown": "other",
+}
+CAT_TAG = "catg_"
+NAME_JUNK_WORDS = {"join", "joinus", "telegram", "channel", "official", "download", "free", "subscribe", "follow",
+                   "whatsapp", "youtube", "share", "link", "group", "admin", "pdf", "file", "copy", "final", "new"}
+
+
+def norm_subject(value: Any) -> str:
+    v = re.sub(r"\s+", " ", str(value or "").strip().lower())
+    if v in SUBJECT_ALIASES:
+        return SUBJECT_ALIASES[v]
+    for slug, label, _, _ in SUBJECTS:
+        if v == label.lower() or v == slug:
+            return slug
+    return ""
+
+
+def _hits(words: List[str], text: str) -> int:
+    n = 0
+    for w in words:
+        if re.search(r"[\u0900-\u097F]", w):
+            if w in text:
+                n += 1
+        elif re.search(r"(?<![a-z0-9])" + re.escape(w) + r"(?![a-z0-9])", text):
+            n += 1
+    return n
+
+
+def classify_local(name_text: str, content: str = "") -> str:
+    """Free subject guess: name words count 3x, content words 1x. PYQ / Mock win only when the NAME says so."""
+    name = (name_text or "").lower().replace("_", " ")
+    body = (content or "")[:6000].lower()
+    for slug in ("pyq", "mock"):
+        words = [w for s, _, _, ws in SUBJECTS if s == slug for w in ws]
+        if _hits(words, name):
+            return slug
+    best, score = "other", 0
+    for slug, _, _, words in SUBJECTS:
+        if slug in ("pyq", "mock", "other"):
+            continue
+        s = 3 * _hits(words, name) + min(6, _hits(words, body))
+        if s > score:
+            best, score = slug, s
+    return best
+
+
+def is_junk_name(stem: str) -> bool:
+    """Random / meaningless file names like hjskjd, IMG_2023, telegram_AgAD.., 12345."""
+    s = re.sub(r"[_\-.\s]+", " ", stem or "").strip()
+    if not s or re.search(r"[\u0900-\u097F]", s):
+        return not s
+    words = re.findall(r"[a-z]+", s.lower())
+    if not words or re.fullmatch(r"[\d\s]+", s):
+        return True
+    if s.lower().startswith(("telegram ", "img ", "doc ", "document", "file ", "scan", "cam scanner", "camscanner")):
+        return True
+    real = [w for w in words if len(w) >= 3 and re.search(r"[aeiou]", w) and not re.search(r"[^aeiou]{5,}", w)]
+    if not real:
+        return True
+    # one short made-up token like "hjskjd" (few vowels)
+    if len(words) == 1 and len(re.findall(r"[aeiou]", words[0])) / max(1, len(words[0])) < 0.2:
+        return True
+    return False
+
+
+def strip_people(title: str) -> str:
+    """Remove uploader / channel / person names and junk from a name."""
+    t = str(title or "")
+    t = re.sub(r"https?://\S+|t\.me/\S+|www\.\S+", " ", t, flags=re.I)
+    t = re.sub(r"@\w+", " ", t)
+    t = re.sub(r"#\w+", " ", t)
+    t = re.sub(r"\s+(?:by|from|uploaded by|shared by|credit|credits|cr)\s*[:\-]?\s+[^\n|,()\[\]]+$", " ", t, flags=re.I)
+    t = re.sub(r"\s+द्वारा\s+[^\n|,()\[\]]+$", " ", t)
+    t = re.sub(r"[\U0001F000-\U0001FFFF\u2600-\u27BF\uFE0F\u200d❤]+", " ", t)
+    t = re.sub(r"\.(pdf|docx?|txt|pptx?|zip|rar|mp4|epub)\b", " ", t, flags=re.I)
+    t = re.sub(r"[_|]+", " ", t)
+    words = [w for w in t.split() if w.lower().strip(".,:;!-") not in NAME_JUNK_WORDS]
+    t = " ".join(words)
+    t = re.sub(r"(?<![\w])\d{5,}(?![\w])", " ", t)          # long number-only codes (not years)
+    t = re.sub(r"\s+", " ", t).strip(" -–—:.,;|")
+    return t[:100]
+
+
+def local_clean_name(caption: str, file_name: str) -> str:
+    stem = os.path.splitext(str(file_name or ""))[0]
+    stem = re.sub(r"_(\d)$", "", stem)
+    first = ""
+    for line in str(caption or "").splitlines():
+        c = strip_people(line)
+        if len(re.findall(r"[A-Za-z\u0900-\u097F]", c)) >= 3:
+            first = c
+            break
+    name = first or strip_people(stem.replace("_", " ").replace("-", " "))
+    return name or clean_text(stem) or "Untitled"
+
+
+# ---- reading the file (Telegram bots may download up to 20 MB)
+TG_FILE_LIMIT = 20 * 1024 * 1024
+REUPLOAD_LIMIT = 15 * 1024 * 1024
+
+
+def download_file(file_id: Optional[str], file_size: Optional[int]) -> Optional[bytes]:
+    """The file's bytes (≤20 MB, Telegram's limit for bots); None when bigger / unavailable."""
+    if not file_id or not BOT_TOKEN or (file_size and int(file_size) > TG_FILE_LIMIT):
+        return None
+    try:
+        path = (telegram("getFile", {"file_id": file_id}).get("result") or {}).get("file_path")
+        if not path:
+            return None
+        with urllib.request.urlopen(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{path}", timeout=6) as resp:
+            return resp.read(TG_FILE_LIMIT + 1)
+    except Exception:
+        return None
+
+
+def text_from_bytes(data: Optional[bytes], file_name: str, mime: str = "", budget: float = 2.5) -> Dict[str, str]:
+    """{"excerpt": first ~2-3 pages, "content": more pages for search}. Empty for scanned PDFs (no OCR)."""
+    out = {"excerpt": "", "content": ""}
+    if not data:
+        return out
+    low = (file_name or "").lower()
+    started = time.monotonic()
+    try:
+        if low.endswith(".pdf") or (mime or "").endswith("pdf") or data[:5] == b"%PDF-":
+            reader = PdfReader(io.BytesIO(data), strict=False)
+            chunks: List[str] = []
+            for n, page in enumerate(reader.pages[:20]):
+                try:
+                    chunks.append(page.extract_text() or "")
+                except Exception:
+                    chunks.append("")
+                if n == 2 or (n < 2 and len(" ".join(chunks)) > 2500):
+                    out["excerpt"] = clean_text(" ".join(chunks))
+                if time.monotonic() - started > budget or sum(len(x) for x in chunks) > 60000:
+                    break
+            out["content"] = clean_text(" ".join(chunks))[:60000]
+            out["excerpt"] = out["excerpt"] or out["content"][:3000]
+        elif low.endswith(".txt") or (mime or "").startswith("text/"):
+            t = data[:200000].decode("utf-8", "replace")
+            out["content"] = clean_text(t)[:60000]
+            out["excerpt"] = out["content"][:3000]
+        elif low.endswith(".docx"):
+            import zipfile
+            with zipfile.ZipFile(io.BytesIO(data)) as z:
+                xml = z.read("word/document.xml").decode("utf-8", "replace")
+            t = html.unescape(re.sub(r"<[^>]+>", " ", re.sub(r"</w:p>", "\n", xml)))
+            out["content"] = clean_text(t)[:60000]
+            out["excerpt"] = out["content"][:3000]
+    except Exception:
+        pass
+    # a "text layer" of only a few letters (scanned PDF with page numbers) counts as no text
+    if len(re.findall(r"[A-Za-z\u0900-\u097F]", out["excerpt"])) < 40:
+        out["excerpt"] = ""
+    return out
+
+
+# ---- AI naming
+AI_NAME2_SYSTEM = (
+    "You name study files for an Indian govt-exam PDF library. Each item has the original file name, the post caption and "
+    "an excerpt of the text INSIDE the file (may be empty). Reply ONLY with JSON "
+    '{"items":[{"i":1,"title":"...","subject":"...","exam":null,"language":"hi|en|mixed"}]}. '
+    "title: a short clean name (2-7 words, max 60 characters) saying what the file really is. The CONTENT wins: if the "
+    "file name is random letters or does not match the text inside, name it from the text (e.g. history notes about the "
+    "Mughals named hjskjd.pdf -> \"Mughal Empire History Notes\"). Use words that appear in the text, caption or file name "
+    "(you may add a subject word like History/Polity/Notes/इतिहास). Write it in the language/script of the content "
+    "(Hindi content -> Devanagari). Keep a real book/publisher name, exam, class, part or year only if it is written there. "
+    "REMOVE person, uploader and channel names (\"History by Aarav\" -> \"History\"), @usernames, links, 'join', promo text, "
+    "emojis, file extensions, codes and random letters. Never invent a book title or author. "
+    "subject: exactly one of History, Polity, Geography, Economics, Science, Static GK, Current Affairs, Maths, Reasoning, "
+    "Hindi, English, Computer, PYQ, Mock, Other (PYQ = previous year papers, Mock = mock tests / practice sets; Hindi / "
+    "English only for language grammar/literature, not for a book merely written in Hindi).")
+
+
+def title_supported2(title: str, source: str) -> bool:
+    """Relaxed guard: every real word must come from the caption, file name OR the text inside (spelling fixes allowed);
+    subject words (History, इतिहास, Notes...) are always fine. Invented names fail."""
+    extra = set()
+    for slug, label, _, words in SUBJECTS:
+        extra.update(re.findall(r"[a-z0-9]+|[\u0900-\u097F]+", (label + " " + slug).lower()))
+    extra.update({"इतिहास", "राजव्यवस्था", "भूगोल", "अर्थव्यवस्था", "विज्ञान", "गणित", "रीजनिंग", "हिंदी", "अंग्रेजी",
+                  "कंप्यूटर", "नोट्स", "प्रश्न", "उत्तर", "सामान्य", "ज्ञान", "notes", "empire", "practice", "papers",
+                  "current", "affairs", "static", "previous", "mock", "pyq", "mcq", "mcqs"})
+    import difflib
+    src = normalize(source)
+    src_words = set(re.findall(r"[a-z0-9]+|[\u0900-\u097F]+", src))
+    for w in re.findall(r"[a-z0-9]+|[\u0900-\u097F]+", (title or "").lower()):
+        if w in GENERIC_TITLE_WORDS or w in extra or len(w) <= 2 or w in src_words:
+            continue
+        if not w.isdigit() and w in src:
+            continue
+        if w.isdigit():
+            return False
+        if difflib.get_close_matches(w, list(src_words)[:4000], n=1, cutoff=0.8):
+            continue
+        return False
+    return True
+
+
+def ai_name_items(items: List[Dict[str, Any]], cap: float = 9.0, excerpt_chars: int = 1500) -> Optional[Dict[int, Dict[str, str]]]:
+    """items [{"i","caption","file","text"}] -> {i: {"title","subject"}} (guarded). None = the AI call itself failed."""
+    payload = [{"i": x["i"], "file": str(x.get("file") or "")[:150],
+                "caption": re.sub(r"\s+", " ", str(x.get("caption") or ""))[:300],
+                "text": re.sub(r"\s+", " ", str(x.get("text") or ""))[:excerpt_chars]} for x in items]
+    content = ai_complete(AI_NAME2_SYSTEM, json.dumps(payload, ensure_ascii=False),
+                          max_tokens=min(2000, 80 + 60 * len(items)), cap=cap)
+    if not content:
+        return None
+    try:
+        data = json.loads(content[content.find("{"): content.rfind("}") + 1])
+    except Exception:
+        return None
+    got = data.get("items") or data.get("titles") if isinstance(data, dict) else None
+    by_i = {x["i"]: x for x in items}
+    out: Dict[int, Dict[str, str]] = {}
+    for t in got if isinstance(got, list) else []:
+        if not isinstance(t, dict) or t.get("i") not in by_i:
+            continue
+        x = by_i[t["i"]]
+        title = clean_ai_title(strip_people(str(t.get("title") or "")))
+        source = " ".join(str(x.get(k) or "") for k in ("caption", "file", "old", "text"))
+        subj = norm_subject(t.get("subject"))
+        if len(title) >= 3 and title_supported2(title, source):
+            out[int(t["i"])] = {"title": title, "subject": subj}
+        elif subj:
+            out[int(t["i"])] = {"title": "", "subject": subj}
+    return out
+
+
+# ---- category storage: books.category column when it exists, else bot_settings "catmap" {id: slug}
+_CATCOL: Dict[str, Any] = {"t": 0.0, "v": None}
+
+
+def has_category_col() -> bool:
+    if _CATCOL["v"] is not None and time.time() - _CATCOL["t"] < 600:
+        return bool(_CATCOL["v"])
+    try:
+        supabase("books", "GET", query="?select=category&limit=1")
+        ok = True
+    except Exception:
+        ok = False
+    _CATCOL.update(t=time.time(), v=ok)
+    return ok
+
+
+def catmap() -> Dict[str, str]:
+    try:
+        return json.loads(get_setting("catmap") or "{}")
+    except Exception:
+        return {}
+
+
+def save_categories(cats: Dict[int, str]) -> None:
+    cats = {int(k): v for k, v in cats.items() if v}
+    if not cats:
+        return
+    if has_category_col():
+        for bid, slug in cats.items():
+            try:
+                supabase("books", "PATCH", {"category": slug}, f"?id=eq.{int(bid)}")
+            except Exception:
+                log_error("save_category")
+        return
+    m = catmap()
+    m.update({str(k): v for k, v in cats.items()})
+    set_setting("catmap", json.dumps(m, separators=(",", ":")))
+
+
+def with_cat_tag(keywords: str, slug: str) -> str:
+    k = re.sub(r"\s*" + CAT_TAG + r"[a-z_]+", "", str(keywords or ""))
+    return (k + (" " + CAT_TAG + slug if slug else ""))[:4000]
+
+
+def name_new_file(record: Dict[str, Any], text: Dict[str, str]) -> str:
+    """Set record title + category from the content. Returns "ai" | "local" | "retry" (AI failed → queue)."""
+    caption, fname = str(record.get("caption") or ""), str(record.get("file_name") or "")
+    uniq = record.get("telegram_file_unique_id")
+    if uniq:
+        # Already in the catalog (re-forward): keep its name + category, an admin may have renamed it. No AI.
+        cols = "id,title,file_name,keywords" + (",category" if has_category_col() else "")
+        have = supabase("books", "GET", query=f"?telegram_file_unique_id=eq.{urllib.parse.quote(str(uniq))}&select={cols}&limit=1")
+        if have:
+            record["title"] = have[0].get("title") or record.get("title")
+            record["_cat"] = book_category(have[0], {} if has_category_col() else catmap())
+            return "kept"
+    base = local_clean_name(caption, fname)
+    excerpt = text.get("excerpt") or ""
+    local_cat = classify_local(" ".join([base, caption[:300], fname]), excerpt or text.get("content") or "")
+    record["title"] = base[:500]
+    record["_cat"] = local_cat
+    if is_junk_name(os.path.splitext(fname)[0]) and not caption.strip() and local_cat != "other":
+        record["title"] = SUBJECT_LABEL[local_cat] + " Notes"
+    if not ai_naming_on() or not ai_provider() or not ai_name_budget_ok():
+        return "local"
+    if req_elapsed() > 6.5:
+        return "retry"
+    _count_day("ainame:all")
+    got = ai_name_items([{"i": 1, "caption": caption, "file": fname, "text": excerpt}],
+                        cap=max(2.0, min(7.0, 9.0 - req_elapsed())))
+    if got is None:
+        return "retry"
+    res = got.get(1) or {}
+    if res.get("title"):
+        record["title"] = res["title"][:500]
+    if res.get("subject") and res["subject"] != "other":
+        record["_cat"] = res["subject"]
+    return "ai"
+
+
+def backup_caption(record: Dict[str, Any]) -> str:
+    slug = record.get("_cat") or record.get("category") or ""
+    cat = f"\n🗂️ {SUBJECT_LABEL.get(slug, '')}" if slug in SUBJECT_LABEL else ""
+    return (f"📄 {record.get('title') or ''}{cat}")[:1000]
+
+
+def safe_filename(title: str, orig: str) -> str:
+    ext = os.path.splitext(orig or "")[1].lower() or ".pdf"
+    base = re.sub(r"[\\/:*?\"<>|\n\r\t]+", " ", str(title or "file")).strip()[:80] or "file"
+    return base + ext
+
+
+def telegram_upload(method: str, fields: Dict[str, Any], file_field: str, filename: str, data: bytes) -> Dict[str, Any]:
+    """multipart/form-data upload (used to store the backup copy under its clean file name)."""
+    boundary = "----filesbull" + hashlib.sha1(os.urandom(8)).hexdigest()
+    parts: List[bytes] = []
+    for k, v in fields.items():
+        if v is None:
+            continue
+        parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode("utf-8"))
+    fn = filename.replace('"', "'")
+    parts.append((f"--{boundary}\r\nContent-Disposition: form-data; name=\"{file_field}\"; filename=\"{fn}\"\r\n"
+                  "Content-Type: application/octet-stream\r\n\r\n").encode("utf-8") + data + b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+    req = urllib.request.Request(f"{TG_API}/{method}", data=b"".join(parts), method="POST",
+                                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"HTTP {exc.code}: upload failed") from None
+
+
+# ---- retry queue for files the AI could not name at save time (bot_settings "ainame_queue")
+NAME_RETRIES = 3
+
+
+def queue_name_retry(book_id: Any) -> None:
+    if not book_id:
+        return
+    try:
+        q = json.loads(get_setting("ainame_queue") or "[]")
+        if not any(int(x.get("id")) == int(book_id) for x in q):
+            q.append({"id": int(book_id), "n": 0})
+        set_setting("ainame_queue", json.dumps(q[-200:], separators=(",", ":")))
+    except Exception:
+        log_error("queue_name_retry")
+
+
+def process_name_queue(budget: float = 8.0, max_items: int = 10) -> Dict[str, int]:
+    """Retry AI naming for queued files (keepalive every 10 min / site open). Uses stored text, no download."""
+    stats = {"done": 0, "failed": 0, "left": 0}
+    try:
+        q = json.loads(get_setting("ainame_queue") or "[]")
+    except Exception:
+        q = []
+    if not q or not ai_provider() or not ai_naming_on():
+        stats["left"] = len(q)
+        return stats
+    started = time.monotonic()
+    batch = q[:max_items]
+    ids = ",".join(str(int(x["id"])) for x in batch)
+    rows = {int(r["id"]): r for r in supabase("books", "GET", query=f"?id=in.({ids})&select=id,title,caption,file_name,"
+                                                                     "content_text,keywords,backup_chat_id,backup_message_id")}
+    items = [{"i": int(x["id"]), "caption": rows[int(x["id"])].get("caption"), "file": rows[int(x["id"])].get("file_name"),
+              "text": str(rows[int(x["id"])].get("content_text") or "")[:1200]} for x in batch if int(x["id"]) in rows]
+    got = ai_name_items(items, cap=max(2.0, budget - (time.monotonic() - started)), excerpt_chars=1200) if items else {}
+    keep = []
+    cats: Dict[int, str] = {}
+    for x in q:
+        bid = int(x["id"])
+        if bid not in rows:
+            if x in batch:
+                continue
+            keep.append(x)
+            continue
+        if x not in batch:
+            keep.append(x)
+            continue
+        if got is None:
+            x["n"] = int(x.get("n") or 0) + 1
+            if x["n"] < NAME_RETRIES:
+                keep.append(x)
+            stats["failed"] += 1
+            continue
+        res = got.get(bid) or {}
+        row = rows[bid]
+        slug = res.get("subject") or classify_local(" ".join(str(row.get(k) or "") for k in ("title", "caption", "file_name")),
+                                                    str(row.get("content_text") or ""))
+        title = res.get("title") or row.get("title")
+        cats[bid] = slug
+        patch = {"title": str(title)[:500], "keywords": with_cat_tag(clean_text(" ".join(str(v or "") for v in (
+            title, row.get("caption"), row.get("file_name")))), slug)}
+        try:
+            supabase("books", "PATCH", patch, f"?id=eq.{bid}")
+            if row.get("backup_chat_id") and row.get("backup_message_id"):
+                try:
+                    telegram("editMessageCaption", {"chat_id": row["backup_chat_id"], "message_id": row["backup_message_id"],
+                                                    "caption": backup_caption({"title": title, "_cat": slug})})
+                except Exception:
+                    pass
+            stats["done"] += 1
+        except Exception:
+            log_error("name_queue_patch")
+            keep.append(x)
+    save_categories(cats)
+    set_setting("ainame_queue", json.dumps(keep, separators=(",", ":")))
+    stats["left"] = len(keep)
+    return stats
+
+
+# ---- 📂 Categories (subjects with counts → paginated file list)
+CAT_PAGE = 10
+
+
+def book_category(row: Dict[str, Any], cmap: Dict[str, str]) -> str:
+    slug = row.get("category") or cmap.get(str(row.get("id")))
+    if not slug:
+        m = re.search(CAT_TAG + r"([a-z_]+)", str(row.get("keywords") or ""))
+        slug = m.group(1) if m else ""
+    if slug not in SUBJECT_LABEL:
+        slug = classify_local(" ".join(str(row.get(k) or "") for k in ("title", "file_name")))
+    return slug
+
+
+def category_rows() -> List[Dict[str, Any]]:
+    cols = "id,title,file_name" + (",category" if has_category_col() else "")
+    rows = supabase("books", "GET", query=f"?select={cols}&status=eq.indexed&order=id.desc&limit=5000")
+    cmap = {} if has_category_col() else catmap()
+    for r in rows:
+        r["_cat"] = book_category(r, cmap)
+    return rows
+
+
+def categories_view() -> Any:
+    rows = category_rows()
+    counts: Dict[str, int] = {}
+    for r in rows:
+        counts[r["_cat"]] = counts.get(r["_cat"], 0) + 1
+    if not rows:
+        return "🗂️ <b>Categories</b>\n\nAbhi koi file nahi hai.", None
+    kb: List[Any] = []
+    row: List[Any] = []
+    for slug, label, emoji, _ in SUBJECTS:
+        if not counts.get(slug):
+            continue
+        row.append({"text": f"{emoji} {label} ({counts[slug]})", "callback_data": f"cat:{slug}:1"})
+        if len(row) == 2:
+            kb.append(row)
+            row = []
+    if row:
+        kb.append(row)
+    return (f"🗂️ <b>Categories</b> — {len(rows)} files\n\nSubject chuno 👇", {"inline_keyboard": kb})
+
+
+def category_list_view(slug: str, page: int = 1) -> Any:
+    rows = [r for r in category_rows() if r["_cat"] == slug]
+    total = len(rows)
+    pages = max(1, (total + CAT_PAGE - 1) // CAT_PAGE)
+    page = min(max(1, page), pages)
+    chunk = rows[(page - 1) * CAT_PAGE: page * CAT_PAGE]
+    label = f"{SUBJECT_EMOJI.get(slug, '📁')} {SUBJECT_LABEL.get(slug, slug)}"
+    if not chunk:
+        return f"{label}\n\nIs category me abhi koi file nahi.", {"inline_keyboard": [[{"text": "🔙 Categories", "callback_data": "user_categories"}]]}
+    kb = [[{"text": f"📄 {str(r.get('title') or 'Untitled')[:45]}", "callback_data": f"book:{r['id']}"}] for r in chunk]
+    nav = []
+    if page > 1:
+        nav.append({"text": "⬅️ Previous", "callback_data": f"cat:{slug}:{page - 1}"})
+    nav.append({"text": f"{page}/{pages}", "callback_data": "noop"})
+    if page < pages:
+        nav.append({"text": "Next ➡️", "callback_data": f"cat:{slug}:{page + 1}"})
+    kb.append(nav)
+    kb.append([{"text": "🔙 Categories", "callback_data": "user_categories"}])
+    return f"{label} — {total} files (page {page}/{pages})\n\nJo chahiye us par tap karo 👇", {"inline_keyboard": kb}
+
+
+# ---- 🤖 AI test (owner): one tiny real call, shows ✅ or the exact error (never the key)
+def ai_test_text() -> str:
+    if not ai_provider():
+        return "🤖 AI test: ❌ koi AI key nahi hai (🔑 AI Keys me jodo)."
+    p = ai_probe(True)
+    lines = ["🤖 <b>AI test</b> (ek chhoti asli call)"]
+    for k in p.get("keys", []):
+        tries = k.get("tries") or []
+        ok = [t for t in tries if t.get("ok")]
+        if ok:
+            lines.append(f"✅ {esc(k['key'])}: chal raha hai — model {esc(ok[0]['model'])}, {ok[0]['ms']} ms")
+        elif tries:
+            lines.append(f"❌ {esc(k['key'])}: " + esc(str(tries[-1].get('error') or '')[:160]))
+        else:
+            lines.append(f"• {esc(k['key'])}: {esc(str(k.get('cooling')))}")
+    return "\n".join(lines)
+
+
 # ================================================================ AI diagnostics (no keys ever shown)
 DIAG_TOKEN_SHA256 = "4d4e81e91187974473b09468e5c04a92865425fe8b02960c1359de6abdb68f41"
 
@@ -3992,7 +4689,7 @@ def _err_class(exc: Exception, key: str = "") -> str:
     return (type(exc).__name__ + ": " + s)[:220]
 
 
-def ai_probe(json_mode: bool = True) -> Dict[str, Any]:
+def ai_probe(json_mode: bool = True, all_models: bool = False) -> Dict[str, Any]:
     """One tiny real AI call per key (first working model). Status codes / model names only."""
     out: Dict[str, Any] = {"provider": ai_provider() or "none", "keys": []}
     for n, key in enumerate(groq_pool(), 1):
@@ -4006,17 +4703,17 @@ def ai_probe(json_mode: bool = True) -> Dict[str, Any]:
         row["models_picked"] = groq_models(key)
         for model in row["models_picked"]:
             t0 = time.monotonic()
-            body: Dict[str, Any] = {"model": model, "max_tokens": 20, "temperature": 0,
-                                    "messages": [{"role": "system", "content": "Reply ONLY with JSON {\"ok\":true}."},
-                                                 {"role": "user", "content": "ping"}]}
-            if json_mode:
-                body["response_format"] = {"type": "json_object"}
+            body = groq_body(model, [{"role": "system", "content": "Reply ONLY with JSON {\"ok\":true}."},
+                                     {"role": "user", "content": "ping"}], 20)
+            if not json_mode:
+                body.pop("response_format", None)
             try:
                 res = http_json("https://api.groq.com/openai/v1/chat/completions", "POST", body,
                                 {"Authorization": f"Bearer {key}"}, timeout=8)
-                txt = str(res["choices"][0]["message"]["content"])[:40]
-                row["tries"].append({"model": model, "ok": True, "ms": int((time.monotonic() - t0) * 1000), "reply": txt})
-                break
+                txt = strip_think(res["choices"][0]["message"].get("content"))[:40]
+                row["tries"].append({"model": model, "ok": bool(txt), "ms": int((time.monotonic() - t0) * 1000), "reply": txt})
+                if txt and not all_models:
+                    break
             except Exception as exc:
                 row["tries"].append({"model": model, "ok": False, "ms": int((time.monotonic() - t0) * 1000),
                                      "error": _err_class(exc, key)})
@@ -4028,15 +4725,18 @@ def ai_probe(json_mode: bool = True) -> Dict[str, Any]:
 
 
 def naming_diag(ids: str = "") -> Dict[str, Any]:
-    rows = supabase("books", "GET", query="?select=id,title,caption,file_name&status=eq.indexed&order=id&limit=5")
-    items = [{"i": n, "caption": r.get("caption"), "file": r.get("file_name"), "old": r.get("title")} for n, r in enumerate(rows, 1)]
-    payload = [{"i": x["i"], "caption": re.sub(r"\s+", " ", str(x.get("caption") or ""))[:300],
-                "file": str(x.get("file") or "")[:150]} for x in items]
+    """Live check of content naming on fixed samples (no real files touched)."""
+    samples = [
+        {"i": 1, "file": "hjskjd.pdf", "caption": "", "text": "The Mughal Empire was founded by Babur after the first battle of "
+         "Panipat in 1526. Akbar the Great ruled from 1556 to 1605 and introduced the Mansabdari system and Din-i-Ilahi."},
+        {"i": 2, "file": "History by Aarav.pdf", "caption": "", "text": ""},
+        {"i": 3, "file": "geography_book.pdf", "caption": "", "text": "भारतीय संविधान की प्रस्तावना, मौलिक अधिकार अनुच्छेद 12 से 35, "
+         "राज्य के नीति निदेशक तत्व, संसद और राष्ट्रपति की शक्तियाँ"},
+    ]
     t0 = time.monotonic()
-    raw = ai_complete(AI_NAME_SYSTEM, json.dumps(payload, ensure_ascii=False), max_tokens=min(1800, 50 + 45 * len(items)), cap=9)
-    out: Dict[str, Any] = {"ms": int((time.monotonic() - t0) * 1000), "raw": (raw or "")[:1500], "items": payload}
-    out["guarded"] = ai_titles(items, cap=9)
-    return out
+    got = ai_name_items(samples, cap=9)
+    return {"ms": int((time.monotonic() - t0) * 1000), "result": got if got is not None else "AI call failed",
+            "files": [s["file"] for s in samples]}
 
 
 @app.get("/api/aidiag")
@@ -4046,7 +4746,7 @@ def aidiag() -> Any:
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     _REQ_T0[0] = time.monotonic()
     res: Dict[str, Any] = {"ok": True, "build": os.environ.get("VERCEL_GIT_COMMIT_SHA", "")[:7]}
-    res["probe_json"] = ai_probe(True)
+    res["probe_json"] = ai_probe(True, request.args.get("all") == "1")
     if request.args.get("plain") == "1":
         res["probe_plain"] = ai_probe(False)
     if request.args.get("name") == "1":
@@ -4064,6 +4764,9 @@ def build_header(response: Any) -> Any:
     return response
 
 
+_SEEN_UPDATES: List[Any] = []
+
+
 @app.post("/api/webhook")
 def webhook() -> Any:
     received = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
@@ -4072,6 +4775,15 @@ def webhook() -> Any:
         # open the site's home URL once and it re-registers itself.
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     update = request.get_json(silent=True) or {}
+    # Telegram re-sends an update it thinks timed out; never run the same update twice on a warm instance
+    # (a slow old button press must not pop up again after a later /start).
+    uid_ = update.get("update_id")
+    if uid_ is not None:
+        if uid_ in _SEEN_UPDATES:
+            return jsonify({"ok": True, "dup": True})
+        _SEEN_UPDATES.append(uid_)
+        if len(_SEEN_UPDATES) > 500:
+            del _SEEN_UPDATES[:250]
     _REQ.clear()
     _LOG_QUEUE.clear()
     _REQ_T0[0] = time.monotonic()
