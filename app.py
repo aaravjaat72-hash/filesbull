@@ -798,6 +798,8 @@ def webhook() -> Any:
         # open the site's home URL once and it re-registers itself.
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     update = request.get_json(silent=True) or {}
+    reply_chat = ((update.get("message") or {}).get("chat") or {}).get("id") or \
+        (((update.get("callback_query") or {}).get("message") or {}).get("chat") or {}).get("id")
     try:
         if update.get("callback_query"):
             handle_callback(update["callback_query"])
@@ -820,6 +822,12 @@ def webhook() -> Any:
         # Always return 200 so Telegram does not retry a malformed/duplicate update forever,
         # but log the traceback so the error is visible in Vercel logs.
         log_error("webhook")
+        if reply_chat and not update.get("channel_post"):
+            try:
+                hint = "" if (SUPABASE_URL and SUPABASE_KEY) else " (database setup missing)"
+                send_text(reply_chat, "Abhi kuch gadbad hui" + hint + ", thodi der baad dobara try karein.")
+            except Exception:
+                pass
     return jsonify({"ok": True})
 
 
