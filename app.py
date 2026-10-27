@@ -11964,7 +11964,7 @@ WEB_MAX_LINKS = 10
 WEB_FOLDER_MAX = 50
 WEB_PORTS = {80, 443, 8080, 8443}
 WEB_UA = ("Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) "
-          "Chrome/126.0 Mobile Safari/537.36 filesbull-bot")
+          "Chrome/126.0.0.0 Mobile Safari/537.36")         # a "bot" word gets 403 from govt CDNs (mha.gov.in, Oct 27)
 WEB_DOC_EXTS = (".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".zip", ".rar", ".7z", ".epub", ".txt",
                 ".rtf", ".odt", ".csv")
 WEB_IMG_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif")
@@ -12107,7 +12107,8 @@ def _web_open_real(url: str, timeout: float = 25.0, headers: Optional[Dict[str, 
         ip = web_resolve(u.hostname or "", port)
         conn = (_PinnedHTTPS if u.scheme == "https" else _PinnedHTTP)(u.hostname or "", ip, port, timeout)
         path = (u.path or "/") + ("?" + u.query if u.query else "")
-        h = {"User-Agent": WEB_UA, "Accept": "*/*", "Accept-Language": "en-IN,en;q=0.9,hi;q=0.8", "Connection": "close"}
+        h = {"User-Agent": WEB_UA, "Accept": "text/html,application/xhtml+xml,application/pdf,*/*;q=0.8",
+             "Accept-Language": "en-IN,en;q=0.9,hi;q=0.8", "Connection": "close"}
         h.update(headers or {})
         try:
             conn.request("GET", path, headers=h)
@@ -12148,6 +12149,8 @@ def web_status_error(status: int, final: str) -> Optional[str]:
             return "🔒 File public nahi hai — Drive me sharing \"Anyone with the link\" karo, phir link bhejo."
         return "🔒 Website ne file dene se mana kiya (login/permission chahiye). Public link bhejo."
     if status in (404, 410):
+        if "google" in final:
+            return "❌ Drive pe ye file nahi mili — shayad delete ho gayi, ya public nahi hai (sharing \"Anyone with the link\" karo)."
         return "❌ Is link pe file nahi mili (404). Link check karo."
     if status == 429:
         return "⏳ Website abhi busy hai (bahut requests). Thodi der baad dobara bhejo."
@@ -12371,8 +12374,9 @@ def web_page_links(html_text: str, base: str) -> List[Dict[str, str]]:
     return (docs or found)[:30]
 
 
-def web_drive_folder(fid: str) -> Dict[str, Any]:
-    """A public Drive folder → its files (the folder's embed view; no API key, no login)."""
+def web_drive_folder(fid: str, depth: int = 0) -> Dict[str, Any]:
+    """A public Drive folder → its files, sub-folders too (2 levels, ≤ 12 sub-folders; the folder's embed view, no API
+    key, no login)."""
     deny = "🔒 Folder public nahi hai — Drive me folder ki sharing \"Anyone with the link\" karo, phir link bhejo."
     try:
         r = web_probe(f"https://drive.google.com/embeddedfolderview?id={fid}", 2_000_000, 30.0)
@@ -12389,11 +12393,23 @@ def web_drive_folder(fid: str) -> Dict[str, Any]:
         title = html.unescape(re.sub(r"<[^>]+>", "", m.group(3))).strip()
         if "/folders/" in href:
             folders += 1
+            if depth < 2 and _WEB_FOLDER_SEEN[0] < 12 and len(files) < WEB_FOLDER_MAX:
+                _WEB_FOLDER_SEEN[0] += 1
+                try:
+                    sub = web_drive_folder(m.group(1), depth + 1)
+                    files += [dict(f, n=(title[:30] + " / " + f["n"])[:80]) for f in sub["files"]]
+                    folders += sub["folders"]
+                    folders -= 1                  # this one was opened
+                except WebErr:
+                    pass
             continue
         files.append({"u": f"https://drive.google.com/file/d/{m.group(1)}/view", "n": title[:80]})
     if not files and not folders and "flip-entry" not in page:
         raise WebErr(deny)
     return {"files": files, "folders": folders}
+
+
+_WEB_FOLDER_SEEN = [0]
 
 
 def web_mediafire_direct(html_text: str) -> Optional[str]:
@@ -12661,9 +12677,13 @@ def web_batch_note(job: Dict[str, Any], line: str) -> None:
 
 def web_queue_big(url: str, info: Dict[str, Any], chat: Any, uid: Any, caption: str = "") -> Dict[str, Any]:
     """> WEB_INLINE_MAX (or a slow site): the bigfile GitHub Action downloads it and uploads it into the Inbox."""
-    name = info.get("name") or "file.pdf"
+    name = info.get("name") or "file"
     if os.path.splitext(name)[1].lower() not in WEB_EXTS:
-        name = os.path.splitext(name)[0] + (WEB_MIME_EXT.get(info.get("ctype") or "") or ".pdf")
+        ext = WEB_MIME_EXT.get(info.get("ctype") or "")
+        if not ext:
+            raise WebErr(f"❌ Ye file type support nahi hai ({os.path.splitext(name)[1] or info.get('ctype') or '?'}). "
+                         "PDF, Word, PPT, Excel, ZIP/RAR, EPUB, TXT ya photo (JPG/PNG) bhejo.")
+        name = os.path.splitext(name)[0] + ext
     if not bigfile_ready() or not ub_inbox():
         return {"state": "failed", "name": name, "size": info.get("size"),
                 "why": f"file {human_size(info.get('size'))} ki hai — bot seedha {human_size(WEB_INLINE_MAX)} tak le sakta hai"
@@ -12724,6 +12744,7 @@ def web_fetch_one(url: str, chat: Any, uid: Any, name_hint: str = "", depth: int
     if rw["kind"] == "tgpost":
         return web_tg_post(chat, rw)
     if rw["kind"] == "folder":
+        _WEB_FOLDER_SEEN[0] = 0
         got = web_drive_folder(rw["id"])
         return {"state": "folder", "files": got["files"], "folders": got["folders"]}
     r = web_probe(rw["url"], WEB_INLINE_MAX)
@@ -13507,6 +13528,7 @@ def webdiag() -> Any:
         out["rewrite"] = {k: v for k, v in rw.items() if k != "url"}
         try:
             if rw["kind"] == "folder":
+                _WEB_FOLDER_SEEN[0] = 0
                 f = web_drive_folder(rw["id"])
                 out["folder"] = {"files": len(f["files"]), "first": [x["n"] for x in f["files"][:5]], "subfolders": f["folders"]}
             elif rw["kind"] in ("file", "page"):

@@ -107,7 +107,7 @@ def web_download(job, path):
         ips = [i[4][0] for i in socket.getaddrinfo(u.hostname, u.port or (443 if u.scheme == "https" else 80), 0, socket.SOCK_STREAM)]
         if not ips or not all(_ip_ok(ip) for ip in ips):
             raise RuntimeError("private/local address")
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Chrome/126.0 filesbull-bot", "Accept": "*/*"})
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36", "Accept": "*/*"})
         try:
             r = opener.open(req, timeout=60)
         except urllib.error.HTTPError as e:
