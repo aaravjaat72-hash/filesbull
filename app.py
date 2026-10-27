@@ -985,6 +985,63 @@ def send_join_gate(chat_id: int, missing: List[Dict[str, Any]], left: bool = Fal
         gate_save(user_id, st)
 
 
+_REQ_IDS: Dict[str, Any] = {"t": 0.0, "v": set()}
+JOINED_STATUSES = {"member", "administrator", "creator"}
+
+
+def required_chat_ids() -> set:
+    """Join-channel ids, kept 60 s per warm instance (chat_member updates arrive for every join/leave)."""
+    if time.time() - _REQ_IDS["t"] > 60:
+        try:
+            _REQ_IDS["v"] = {int(c["chat_id"]) for c in required_channels()}
+        except Exception:
+            pass
+        _REQ_IDS["t"] = time.time()
+    return _REQ_IDS["v"]
+
+
+def handle_chat_member(cm: Dict[str, Any]) -> None:
+    """AUTO-ACCESS (Aarav 10:54 AM Oct 27): a user with an open join prompt joins a join channel → no tap needed:
+    if nothing is missing any more, the prompt is deleted and their request runs (else the welcome); if another
+    channel is still missing, the same prompt is updated to show only that one. Works where the bot is admin."""
+    try:
+        cid = int((cm.get("chat") or {}).get("id") or 0)
+    except Exception:
+        return
+    new = cm.get("new_chat_member") or {}
+    user = new.get("user") or {}
+    uid = user.get("id")
+    if not uid or user.get("is_bot") or cid not in required_chat_ids():
+        return
+    status = new.get("status")
+    if not (status in JOINED_STATUSES or (status == "restricted" and new.get("is_member"))):
+        return
+    if is_subadmin(uid):
+        return
+    try:
+        prefetch_settings([f"gate:{uid}", f"verified:{uid}"])
+    except Exception:
+        pass
+    st = gate_state(uid)
+    if not st.get("mid"):
+        return                              # no open prompt for this person: nothing to do
+    reqs = required_channels()
+    missing = missing_required(uid, reqs)
+    if missing:
+        send_join_gate(uid, missing, left=was_verified(uid), total=len(reqs), user_id=uid)
+        return
+    mark_verified(uid)
+    note_user(user, verified=True)
+    st = gate_clear(uid, uid)
+    q = st.get("q") or {}
+    if q.get("k") == "text" and q.get("text"):
+        handle_private_message({"message_id": 0, "chat": {"id": uid, "type": "private"}, "from": user, "text": str(q["text"])[:500]})
+    elif q.get("k") == "cb" and q.get("data") and callback_known(str(q["data"])) and q["data"] != "verify_join":
+        _handle_callback_body({"id": "", "from": user, "data": q["data"], "message": {"chat": {"id": uid}}}, str(q["data"]), uid, uid)
+    else:
+        send_text(uid, "✅ <b>Shukriya, join ho gaya!</b> Ab aap bot use kar sakte ho 🎉\n\n" + welcome_text(user), user_menu(), "HTML")
+
+
 def gate_blocks(user_id: Optional[int], chat_id: int, ask: Optional[Dict[str, Any]] = None) -> bool:
     """True (and the join prompt is sent) when a normal user still has to join channels.
     A user who passed before and is now missing gets the "you left our channel" message.
@@ -6823,7 +6880,7 @@ def handle_admin_callback_v6(query: Dict[str, Any], cmd: str, chat_id: int, user
 
 
 PUBLIC_HOME = "https://" + public_host_source()[0] + "/"   # PUBLIC_URL → Vercel production URL → this deployment
-ALLOWED_UPDATES = ["message", "channel_post", "callback_query"]
+ALLOWED_UPDATES = ["message", "channel_post", "callback_query", "chat_member"]   # chat_member: join auto-detect (bot admin in the join channel)
 
 
 def webhook_url() -> str:
@@ -12541,6 +12598,8 @@ def webhook() -> Any:
     try:
         if update.get("callback_query"):
             handle_callback(update["callback_query"])
+        elif update.get("chat_member"):
+            handle_chat_member(update["chat_member"])     # 🔒 someone joined a join channel → access at once
         elif update.get("channel_post"):
             handle_channel_post(update["channel_post"])
         elif update.get("message"):
@@ -14263,7 +14322,11 @@ def webdiag() -> Any:
         chans = []
         reqs = required_channels()
         for ch in reqs:
+            _il = str(ch.get("invite_link") or "")
+            _m = re.match(r"https?://t\.me/([A-Za-z0-9_]{4,})/?$", _il)
             row: Dict[str, Any] = {"title": ch.get("title"), "username": bool(ch.get("username")),
+                                   "invite_is_username": bool(_m),
+                                   "invite_matches_username": (bool(_m) and str(_m.group(1)).lower() == str(ch.get("username") or "").lower()) if _m else None,
                                    "invite": ("+" if "/+" in str(ch.get("invite_link") or "") else
                                               ("joinchat" if "joinchat" in str(ch.get("invite_link") or "") else
                                                ("none" if not ch.get("invite_link") else "other")))}
@@ -14274,6 +14337,7 @@ def webdiag() -> Any:
             try:
                 info = telegram("getChat", {"chat_id": ch["chat_id"]}).get("result", {}) or {}
                 row.update({"type": info.get("type"), "title_now": info.get("title"), "join_by_request": info.get("join_by_request"),
+                            "username_now_matches": str(info.get("username") or "").lower() == str(ch.get("username") or "").lower(),
                             "same_id": str(info.get("id")) == str(ch.get("chat_id"))})
             except Exception as exc:
                 row["chat"] = "error: " + str(exc)[:80]
