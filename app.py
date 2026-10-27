@@ -3888,8 +3888,8 @@ DOC_EXTS = {"pdf", "doc", "docx", "dot", "dotx", "odt", "rtf", "txt", "md", "csv
 NONDOC_EXTS = {"mp4", "mkv", "mov", "webm", "avi", "m4v", "3gp", "3g2", "flv", "wmv", "mpg", "mpeg", "ts", "m2ts", "vob",
                "ogv", "mp3", "m4a", "aac", "ogg", "oga", "opus", "wav", "flac", "amr", "wma", "jpg", "jpeg", "png", "gif",
                "webp", "bmp", "heic", "heif", "tif", "tiff", "svg", "tgs", "webm", "apk", "exe", "msi", "dmg", "iso"}
-DOC_MIME_PARTS = ("pdf", "msword", "officedocument", "ms-excel", "ms-powerpoint", "opendocument", "epub", "zip", "rar",
-                  "7z", "x-tar", "gzip", "x-bzip", "x-xz", "rtf", "djvu", "mobipocket", "x-chm", "oxps", "xps")
+NONDOC_MIME_PARTS = ("android.package-archive", "x-msdownload", "x-msi", "x-executable", "x-sharedlib", "x-apple-diskimage",
+                     "x-iso9660", "x-mach-binary", "vnd.microsoft.portable-executable")
 
 
 def doc_kind(mime: Any, name: Any) -> str:
@@ -3906,11 +3906,9 @@ def doc_kind(mime: Any, name: Any) -> str:
         return "photo"
     if ext in DOC_EXTS:
         return ""
-    if ext in NONDOC_EXTS:
+    if ext in NONDOC_EXTS or any(p in mime for p in NONDOC_MIME_PARTS):
         return "other"
-    if mime.startswith("text/") or any(p in mime for p in DOC_MIME_PARTS):
-        return ""
-    return "other"
+    return ""       # unknown type without a media mime (e.g. WhatsApp "DOC-…-WA0050." PDFs) stays a document
 
 
 def doc_ok_info(info: Optional[Dict[str, Any]]) -> bool:
@@ -13680,7 +13678,8 @@ def nondoc_scan(min_id: int = 0, apply: bool = False) -> Dict[str, Any]:
     res: Dict[str, Any] = {"scanned": seen, "count": len(hits), "by": by,
                            "ids": [int(h["id"]) for h in hits][:400],
                            "sample": [{"id": h["id"], "n": str(h.get("file_name") or h.get("title") or "")[:60], "k": h["_kind"],
-                                       "st": h.get("status"), "sz": h.get("file_size")} for h in hits[:25]]}
+                                       "mime": str(h.get("mime_type") or "")[:60], "src": str(h.get("source_chat_title") or "")[:30],
+                                       "st": h.get("status"), "sz": h.get("file_size")} for h in hits[:120]]}
     if apply and hits:
         done = 0
         ids = [int(h["id"]) for h in hits]

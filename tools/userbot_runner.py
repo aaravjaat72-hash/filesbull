@@ -101,8 +101,8 @@ DOC_EXTS = {"pdf", "doc", "docx", "dot", "dotx", "odt", "rtf", "txt", "md", "csv
 NONDOC_EXTS = {"mp4", "mkv", "mov", "webm", "avi", "m4v", "3gp", "3g2", "flv", "wmv", "mpg", "mpeg", "ts", "m2ts", "vob",
                "ogv", "mp3", "m4a", "aac", "ogg", "oga", "opus", "wav", "flac", "amr", "wma", "jpg", "jpeg", "png", "gif",
                "webp", "bmp", "heic", "heif", "tif", "tiff", "svg", "tgs", "webm", "apk", "exe", "msi", "dmg", "iso"}
-DOC_MIME_PARTS = ("pdf", "msword", "officedocument", "ms-excel", "ms-powerpoint", "opendocument", "epub", "zip", "rar",
-                  "7z", "x-tar", "gzip", "x-bzip", "x-xz", "rtf", "djvu", "mobipocket", "x-chm", "oxps", "xps")
+NONDOC_MIME_PARTS = ("android.package-archive", "x-msdownload", "x-msi", "x-executable", "x-sharedlib", "x-apple-diskimage",
+                     "x-iso9660", "x-mach-binary", "vnd.microsoft.portable-executable")
 VIDEO_EXTS = {"mp4", "mkv", "mov", "webm", "avi", "m4v", "3gp", "3g2", "flv", "wmv", "mpg", "mpeg", "m2ts", "vob", "ogv"}
 AUDIO_EXTS = {"mp3", "m4a", "aac", "ogg", "oga", "opus", "wav", "flac", "amr", "wma"}
 IMAGE_EXTS = {"jpg", "jpeg", "png", "gif", "webp", "bmp", "heic", "heif", "tif", "tiff", "svg", "tgs"}
@@ -121,11 +121,9 @@ def doc_kind(mime, name):
         return "photo"
     if ext in DOC_EXTS:
         return ""
-    if ext in NONDOC_EXTS:
+    if ext in NONDOC_EXTS or any(p in mime for p in NONDOC_MIME_PARTS):
         return "other"
-    if mime.startswith("text/") or any(p in mime for p in DOC_MIME_PARTS):
-        return ""
-    return "other"
+    return ""       # unknown type without a media mime (e.g. WhatsApp "DOC-…-WA0050." PDFs) stays a document
 
 
 def skip_kind(m):
