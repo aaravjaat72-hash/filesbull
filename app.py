@@ -3878,6 +3878,50 @@ def file_info(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return None
 
 
+# ---- DOCUMENT-ONLY FILTER (Aarav 9:59 AM Oct 27: "Inbox me sirf files — PDF vgera; videos/posts nahi").
+# The userbot (live + purani backfill) and the bot-admin channel auto-save keep ONLY study documents. Admin's own
+# forwards, link-fetch and /upload are NOT filtered (owner's choice). The runner carries the same lists.
+DOC_EXTS = {"pdf", "doc", "docx", "dot", "dotx", "odt", "rtf", "txt", "md", "csv", "tsv", "ppt", "pptx", "pps", "ppsx", "pot",
+            "potx", "odp", "key", "xls", "xlsx", "xlsm", "xlsb", "ods", "numbers", "pages", "epub", "mobi", "azw", "azw3",
+            "fb2", "djvu", "djv", "chm", "xps", "oxps", "cbz", "cbr", "zip", "rar", "7z", "tar", "gz", "tgz", "bz2", "xz",
+            "html", "htm", "mht", "mhtml", "tex", "json", "xml"}
+NONDOC_EXTS = {"mp4", "mkv", "mov", "webm", "avi", "m4v", "3gp", "3g2", "flv", "wmv", "mpg", "mpeg", "ts", "m2ts", "vob",
+               "ogv", "mp3", "m4a", "aac", "ogg", "oga", "opus", "wav", "flac", "amr", "wma", "jpg", "jpeg", "png", "gif",
+               "webp", "bmp", "heic", "heif", "tif", "tiff", "svg", "tgs", "webm", "apk", "exe", "msi", "dmg", "iso"}
+DOC_MIME_PARTS = ("pdf", "msword", "officedocument", "ms-excel", "ms-powerpoint", "opendocument", "epub", "zip", "rar",
+                  "7z", "x-tar", "gzip", "x-bzip", "x-xz", "rtf", "djvu", "mobipocket", "x-chm", "oxps", "xps")
+
+
+def doc_kind(mime: Any, name: Any) -> str:
+    """'' = a study document (keep). Else why it is skipped: video | audio | photo | other."""
+    mime = str(mime or "").lower().split(";")[0].strip()
+    nm = str(name or "").lower().strip()
+    ext = nm.rsplit(".", 1)[-1] if "." in nm else ""
+    if mime.startswith("video/") or ext in {"mp4", "mkv", "mov", "webm", "avi", "m4v", "3gp", "3g2", "flv", "wmv", "mpg",
+                                             "mpeg", "m2ts", "vob", "ogv"}:
+        return "video"
+    if mime.startswith("audio/") or ext in {"mp3", "m4a", "aac", "ogg", "oga", "opus", "wav", "flac", "amr", "wma"}:
+        return "audio"
+    if mime.startswith("image/") or ext in {"jpg", "jpeg", "png", "gif", "webp", "bmp", "heic", "heif", "tif", "tiff", "svg", "tgs"}:
+        return "photo"
+    if ext in DOC_EXTS:
+        return ""
+    if ext in NONDOC_EXTS:
+        return "other"
+    if mime.startswith("text/") or any(p in mime for p in DOC_MIME_PARTS):
+        return ""
+    return "other"
+
+
+def doc_ok_info(info: Optional[Dict[str, Any]]) -> bool:
+    """A Bot API file_info(): only a 'document' (never a video/audio object) whose type is a study document."""
+    if not info:
+        return False
+    if info.get("kind") in ("video", "audio"):
+        return False
+    return doc_kind(info.get("mime_type"), info.get("file_name")) == ""
+
+
 def extract_pdf_text(file_id: Optional[str], file_name: str = "", file_size: Optional[int] = None) -> str:
     """Best-effort extraction for normal text PDFs; scanned PDFs need OCR."""
     if not file_id or not file_name.lower().endswith(".pdf") or not BOT_TOKEN:
@@ -4616,6 +4660,8 @@ def handle_channel_post(message: Dict[str, Any]) -> None:
         if not allowed:
             return
         if file_info(message):
+            if not doc_ok_info(file_info(message)):
+                return      # DOCUMENT-ONLY: a video/audio/photo post in an auto-save channel is not saved
             record = build_metadata(message, channel)
             index_file(record, channel.get("id"), message.get("message_id"), str(channel.get("title") or "channel"))
     except Exception:
@@ -10629,7 +10675,7 @@ def ub_catalog(record: Dict[str, Any], where: str) -> str:
 
 def ub_ingest(body: Dict[str, Any], st: Dict[str, Any]) -> str:
     """One forwarded/re-uploaded Inbox post → catalog (status inbox/review), source = the ORIGINAL channel.
-    'saved' | 'review' | 'dup' | 'nofile'."""
+    'saved' | 'review' | 'dup' | 'nofile' | 'skipped'."""
     chat = body.get("inbox") or ub_inbox() or get_setting("backup_chat_id")
     mid = body.get("inbox_msg") or body.get("backup_msg")
     src = body.get("src") or {}
@@ -10638,6 +10684,8 @@ def ub_ingest(body: Dict[str, Any], st: Dict[str, Any]) -> str:
     if not info:
         return "nofile"
     _UB_REQ["file"] = {"n": str(info.get("file_name") or "file")[:80], "s": int(info.get("file_size") or 0)}
+    if not doc_ok_info(info):
+        return "skipped"        # DOCUMENT-ONLY: an older runner forwarded a video/audio/photo → not catalogued, never settled
     if ub_known([{"u": info.get("file_unique_id"), "n": info.get("file_name"), "s": info.get("file_size")}])[0]:
         return "dup"
     channel = {"id": int(src.get("id") or 0), "title": str(src.get("title") or "channel"), "username": src.get("username") or None,
@@ -10771,7 +10819,7 @@ def ub_review_retry(st: Dict[str, Any]) -> str:
         patch["category"] = slug
     if rec.get("content_text") and not pick.get("content_text"):
         patch["content_text"] = rec["content_text"]
-    supabase("books", "PATCH", patch, f"?id=eq.{int(pick['id'])}")
+    supabase("books", "PATCH", patch, f"?id=eq.{int(pick['id'])}&status=eq.review")
     if not has_category_col():
         save_categories({int(pick["id"]): slug})
     rv.pop(str(pick["id"]), None)
@@ -11107,6 +11155,15 @@ def _ub_done(body: Dict[str, Any], st: Dict[str, Any]) -> Any:
             res = "error"
             c["err"] = ub_scrub(str(exc))[:120]
         f = _UB_REQ.get("file") or {}
+        if res == "skipped":            # DOCUMENT-ONLY: confirmed to the runner (it moves on), counted, never retried
+            ub_cnt(st, "skip")
+            if lane == "live":
+                c["last"] = max(int(c.get("last") or 0), int(src.get("msg") or 0))
+            c["title"] = str(src.get("title") or c.get("title") or "")[:60]
+            out["result"] = "dup"
+            ub_save_state(st)
+            flush_request()
+            return jsonify(out)
         if res in ("saved", "review", "dup") and f:
             if res == "dup":
                 inbox_alert(f"♻️ duplicate skip: {f.get('n')} ({str(src.get('title') or '')[:40]}) — pehle se Inbox/Backup me")
@@ -11180,6 +11237,10 @@ def _ub_done(body: Dict[str, Any], st: Dict[str, Any]) -> Any:
                         "id": int(body["me"].get("id") or 0)}
         if int(body.get("dupes") or 0):
             ub_cnt(st, "dup", int(body["dupes"]))
+        skipped = {str(k): int(v or 0) for k, v in (body.get("skipped") or {}).items() if int(v or 0) > 0} \
+            if isinstance(body.get("skipped"), dict) else {}
+        if skipped:
+            ub_cnt(st, "skip", sum(skipped.values()))
         ibad = st.setdefault("ibad", {})        # Inbox chats the userbot could not use this run (next run tries the others first)
         for cid, why in (body.get("ibad") or {}).items():
             if ub_is_inbox(cid):
@@ -11208,7 +11269,8 @@ def _ub_done(body: Dict[str, Any], st: Dict[str, Any]) -> Any:
         by = rn.get("by") or {}
         st["last_run"] = {"t": now, "saved": saved, "fwd": int(body.get("sent") or 0), "seen": int(body.get("checked") or 0),
                           "stop": str(body.get("stop") or "")[:80], "dup": int(rn.get("dup") or 0),
-                          "settled": int(rn.get("settled") or 0), "review": int(rn.get("review") or 0), "bf": int(body.get("bf_sent") or 0)}
+                          "settled": int(rn.get("settled") or 0), "review": int(rn.get("review") or 0), "bf": int(body.get("bf_sent") or 0),
+                          "skip": int(rn.get("skip") or 0), "skip_by": skipped}
         for it in (body.get("dup_items") or [])[:150]:
             inbox_alert(f"♻️ duplicate skip: {str(it.get('n') or '')[:80]} ({str(it.get('ch') or '')[:40]}) — pehle se Inbox/Backup me")
         if flood:
@@ -11226,12 +11288,14 @@ def _ub_done(body: Dict[str, Any], st: Dict[str, Any]) -> Any:
         if fatal or body.get("error"):
             inbox_alert(f"❌ {ub_scrub(fatal or body.get('error'))[:160]}")
         buf = st.pop("abuf", []) or []
-        if saved or rn.get("dup") or rn.get("settled") or rn.get("review") or buf:
+        if saved or rn.get("dup") or rn.get("settled") or rn.get("review") or buf or rn.get("skip"):
             parts = sorted(by.items(), key=lambda x: -x[1])
             line = f"📥 Inbox · {ub_hm(now)} — {saved} nayi file{'' if saved == 1 else 's'} aayi"
             if parts:
                 line += " (" + ", ".join(f"{t} {n}" for t, n in parts[:6]) + ")"
             line += f" · {int(rn.get('dup') or 0)} duplicate skip · ✅ {int(rn.get('settled') or 0)} Backup me settle · ❓ {int(rn.get('review') or 0)} review"
+            if int(rn.get("skip") or 0):
+                line += f" · ⏭️ {int(rn.get('skip') or 0)} video/post skip"
             if body.get("stop"):
                 line += f" · ⏸️ {str(body['stop'])[:60]}"
             inbox_send([line] + buf)
@@ -11300,6 +11364,8 @@ def ub_ingest_retry(st: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         inbox_alert(f"📥 {f.get('n') or 'file'} · {human_size(f.get('s'))} · from {str(src.get('title') or '')[:40]} (dobara try se save)")
     elif res == "dup":
         ub_cnt(st, "dup")
+    elif res == "skipped":
+        ub_cnt(st, "skip")              # DOCUMENT-ONLY: a video/photo in the Inbox is dropped from the retry list
     else:
         u["tries"] = int(u.get("tries") or 0) + 1
         if u["tries"] < UB_RETRY_TRIES:
@@ -11901,9 +11967,10 @@ def ub_health_info() -> Dict[str, Any]:
             "inbox_count": len(ub_chat_ids("inbox")), "alert_count": len(ub_chat_ids("alert")),
             "role_overlaps": ub_overlap_titles(),
             "counts": {"inbox": sc["inbox"], "review": sc["review"], "settled": int(cnt.get("settled") or 0),
-                       "dupes_skipped": int(cnt.get("dup") or 0)},
+                       "dupes_skipped": int(cnt.get("dup") or 0), "nondoc_skipped": int(cnt.get("skip") or 0)},
             "cap": ub_cap(), "backfill": {"paused": ub_bf_paused(), "channels": bfo},
-            "last_run_detail": {k: lr.get(k) for k in ("saved", "dup", "settled", "review", "bf", "stop")} if lr else None}
+            "doc_only": True,
+            "last_run_detail": {k: lr.get(k) for k in ("saved", "dup", "settled", "review", "bf", "stop", "skip", "skip_by")} if lr else None}
 
 
 @app.get("/api/ubdiag")
@@ -13578,6 +13645,57 @@ def web_status() -> Dict[str, Any]:
             "upload_storage": "ok" if get_setting("upl:bucket") == "1" else "not_created_yet"}
 
 
+def nondoc_scan(min_id: int = 0, apply: bool = False) -> Dict[str, Any]:
+    """Catalogue rows that came in through the userbot (source = a userbot channel, or still pointing at an Inbox copy)
+    and are NOT study documents. Nothing is deleted anywhere: apply=True only sets status 'skipped' (out of search,
+    lists, review and settle; the Inbox/Backup posts stay where they are)."""
+    st = ub_state()
+    ub_ids = {str(k) for k in (st.get("ch") or {}).keys()}
+    cols = "id,title,file_name,mime_type,file_size,status,source_chat_id,source_chat_title,backup_chat_id"
+    after, hits, seen = max(0, int(min_id) - 1), [], 0
+    for _ in range(40):
+        rows = supabase("books", "GET", query=f"?select={cols}&id=gt.{after}&status=in.(inbox,review,indexed)&order=id&limit=1000")
+        if not rows:
+            break
+        for r in rows:
+            seen += 1
+            kind = doc_kind(r.get("mime_type"), r.get("file_name"))
+            if not kind:
+                continue
+            if ub_is_inbox(r.get("source_chat_id")):
+                continue        # ⬆️ upload page / 🔗 web link rows (owner's own choice) are never touched
+            via_ub = str(r.get("source_chat_id")) in ub_ids or ub_is_inbox(r.get("backup_chat_id"))
+            if via_ub:
+                hits.append(dict(r, _kind=kind))
+        after = int(rows[-1]["id"])
+        if len(rows) < 1000:
+            break
+    backup = str(get_setting("backup_chat_id") or "x")
+    by: Dict[str, Dict[str, int]] = {"status": {}, "kind": {}, "src": {}, "where": {}}
+    for h in hits:
+        where = "backup" if str(h.get("backup_chat_id")) == backup else ("inbox" if ub_is_inbox(h.get("backup_chat_id")) else "other")
+        for k, v in (("status", h.get("status")), ("kind", h["_kind"]), ("src", str(h.get("source_chat_title") or "?")[:40]),
+                     ("where", where)):
+            by[k][str(v)] = by[k].get(str(v), 0) + 1
+    res: Dict[str, Any] = {"scanned": seen, "count": len(hits), "by": by,
+                           "ids": [int(h["id"]) for h in hits][:400],
+                           "sample": [{"id": h["id"], "n": str(h.get("file_name") or h.get("title") or "")[:60], "k": h["_kind"],
+                                       "st": h.get("status"), "sz": h.get("file_size")} for h in hits[:25]]}
+    if apply and hits:
+        done = 0
+        ids = [int(h["id"]) for h in hits]
+        for i in range(0, len(ids), 100):
+            part = ids[i:i + 100]
+            supabase("books", "PATCH", {"status": "skipped"}, f"?id=in.({','.join(str(x) for x in part)})&status=in.(inbox,review,indexed)")
+            done += len(part)
+        try:
+            books_changed()
+        except Exception:
+            pass
+        res["marked_skipped"] = done
+    return res
+
+
 @app.route("/api/webdiag", methods=["GET", "POST"])
 def webdiag() -> Any:
     body = request.get_json(silent=True) or {} if request.method == "POST" else {}
@@ -13595,6 +13713,11 @@ def webdiag() -> Any:
                         f"&or=(title.ilike.*{urllib.parse.quote(q)}*,file_name.ilike.*{urllib.parse.quote(q)}*)&order=id.desc&limit=5") if q else []
         out["books"] = [{"id": b.get("id"), "title": b.get("title"), "size": human_size(b.get("file_size")), "status": b.get("status"),
                          "in_backup": bool(b.get("backup_chat_id")), "src": b.get("source_chat_title")} for b in rows]
+        flush_request()
+        return jsonify(out)
+    if op == "nondoc":     # DOCUMENT-ONLY cleanup: userbot videos/photos/audio already catalogued → status 'skipped'
+        out.update(nondoc_scan(int(request.args.get("min_id") or body.get("min_id") or 0),
+                               apply=request.method == "POST" and bool(body.get("apply"))))
         flush_request()
         return jsonify(out)
     if op == "status":

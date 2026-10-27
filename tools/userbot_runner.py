@@ -9,7 +9,7 @@ the run is this repo's userbot workflow on main. Each run, gently:
   * join new source channels the account is not in yet (public @username, t.me link, stored invite link), max 3/run
   * LIVE: posts newer than the stored last id (first look: only the last ~20 posts of the last 24 h)
   * HISTORY: per channel a cursor walking newest → oldest, with what is left of the shared cap (live first)
-  * only file posts (documents/PDF, video, audio), never one the bot already has (file_unique_id / name+size /
+  * only DOCUMENT posts (PDF/DOC/PPT/XLS/EPUB/TXT/ZIP…; no video/photo/audio/text/link), never one the bot already has (file_unique_id / name+size /
     same name ±1 % size) or one already sent in this run → forward ONLY into the Inbox (download + re-upload when the
     channel blocks forwarding), max 25 per run (15 after a FloodWait > 10 min), 2–4 s apart, stop at FloodWait
   * report each file to the bot at once (the bot names + categorises it), then pump the bot's settle step
@@ -93,13 +93,70 @@ def file_unique_id(doc_id):
     return base64.urlsafe_b64encode(bytes(out)).decode().rstrip("=")
 
 
+# DOCUMENT-ONLY (Aarav 9:59 AM Oct 27: "Inbox me sirf files — PDF vgera; videos/posts nahi"). Same lists as app.py doc_kind().
+DOC_EXTS = {"pdf", "doc", "docx", "dot", "dotx", "odt", "rtf", "txt", "md", "csv", "tsv", "ppt", "pptx", "pps", "ppsx", "pot",
+            "potx", "odp", "key", "xls", "xlsx", "xlsm", "xlsb", "ods", "numbers", "pages", "epub", "mobi", "azw", "azw3",
+            "fb2", "djvu", "djv", "chm", "xps", "oxps", "cbz", "cbr", "zip", "rar", "7z", "tar", "gz", "tgz", "bz2", "xz",
+            "html", "htm", "mht", "mhtml", "tex", "json", "xml"}
+NONDOC_EXTS = {"mp4", "mkv", "mov", "webm", "avi", "m4v", "3gp", "3g2", "flv", "wmv", "mpg", "mpeg", "ts", "m2ts", "vob",
+               "ogv", "mp3", "m4a", "aac", "ogg", "oga", "opus", "wav", "flac", "amr", "wma", "jpg", "jpeg", "png", "gif",
+               "webp", "bmp", "heic", "heif", "tif", "tiff", "svg", "tgs", "webm", "apk", "exe", "msi", "dmg", "iso"}
+DOC_MIME_PARTS = ("pdf", "msword", "officedocument", "ms-excel", "ms-powerpoint", "opendocument", "epub", "zip", "rar",
+                  "7z", "x-tar", "gzip", "x-bzip", "x-xz", "rtf", "djvu", "mobipocket", "x-chm", "oxps", "xps")
+VIDEO_EXTS = {"mp4", "mkv", "mov", "webm", "avi", "m4v", "3gp", "3g2", "flv", "wmv", "mpg", "mpeg", "m2ts", "vob", "ogv"}
+AUDIO_EXTS = {"mp3", "m4a", "aac", "ogg", "oga", "opus", "wav", "flac", "amr", "wma"}
+IMAGE_EXTS = {"jpg", "jpeg", "png", "gif", "webp", "bmp", "heic", "heif", "tif", "tiff", "svg", "tgs"}
+
+
+def doc_kind(mime, name):
+    """'' = a study document (keep). Else why it is skipped: video | audio | photo | other."""
+    mime = str(mime or "").lower().split(";")[0].strip()
+    nm = str(name or "").lower().strip()
+    ext = nm.rsplit(".", 1)[-1] if "." in nm else ""
+    if mime.startswith("video/") or ext in VIDEO_EXTS:
+        return "video"
+    if mime.startswith("audio/") or ext in AUDIO_EXTS:
+        return "audio"
+    if mime.startswith("image/") or ext in IMAGE_EXTS:
+        return "photo"
+    if ext in DOC_EXTS:
+        return ""
+    if ext in NONDOC_EXTS:
+        return "other"
+    if mime.startswith("text/") or any(p in mime for p in DOC_MIME_PARTS):
+        return ""
+    return "other"
+
+
+def skip_kind(m):
+    """'' = forward this post (a real document attached to it). Else the skip label for the run summary:
+    video | photo | audio | sticker | gif | text | link | poll | other."""
+    media = getattr(m, "media", None)
+    mname = type(media).__name__ if media is not None else ""
+    if hasattr(m, "media") and media is not None and mname != "MessageMediaDocument":
+        # photo, poll, a link post with a web preview (m.document would be the PREVIEW's file — never forward it)
+        return {"MessageMediaPhoto": "photo", "MessageMediaPoll": "poll", "MessageMediaWebPage": "link"}.get(mname, "other")
+    doc = getattr(m, "document", None)
+    if not doc:
+        if getattr(m, "photo", None):
+            return "photo"
+        return "text" if (getattr(m, "message", "") or "").strip() else ""
+    if getattr(m, "sticker", None):
+        return "sticker"
+    if getattr(m, "gif", None):
+        return "gif"
+    if getattr(m, "video_note", None) or getattr(m, "video", None):
+        return "video"
+    if getattr(m, "voice", None) or getattr(m, "audio", None):
+        return "audio"
+    f = getattr(m, "file", None)
+    return doc_kind(getattr(doc, "mime_type", "") or (getattr(f, "mime_type", "") if f else ""), (getattr(f, "name", "") or "") if f else "")
+
+
 def is_file_post(m):
-    """documents/PDF, video, audio — not stickers, GIFs, voice notes, round videos, photos or plain text."""
-    if not getattr(m, "document", None):
-        return False
-    if getattr(m, "sticker", None) or getattr(m, "gif", None) or getattr(m, "voice", None) or getattr(m, "video_note", None):
-        return False
-    return True
+    """DOCUMENT-ONLY: a study document (PDF, DOC/DOCX, PPT, XLS, EPUB, TXT, ZIP/RAR/7Z …). Videos (also as a file),
+    video notes, GIFs, photos, audio/voice, stickers, polls, text and link posts are skipped."""
+    return bool(getattr(m, "document", None)) and skip_kind(m) == ""
 
 
 def item_of(m):
@@ -216,6 +273,13 @@ class Run:
         self.inbox, self.inbox_id = None, 0
         self.inbox_alt = []          # other usable Inbox storage chats [(id, entity)], tried in order if one fails
 
+    def skip(self, m):
+        """DOCUMENT-ONLY: a post that is not a document is never forwarded; counted for the run summary only."""
+        k = skip_kind(m)
+        if k:
+            sk = self.s.setdefault("skipped", {})
+            sk[k] = int(sk.get(k) or 0) + 1
+
     def fresh(self, files, title=""):
         """Which of these file posts are new: not known to the bot (any status) and not already sent this run."""
         if not files:
@@ -303,6 +367,10 @@ class Run:
             msgs = [m async for m in client.iter_messages(ent, min_id=last, reverse=True, limit=300)]
         self.s["checked"] += len(msgs)
         files = [m for m in msgs if is_file_post(m)]
+        fids = {m.id for m in files}
+        for m in msgs:
+            if m.id not in fids:
+                self.skip(m)
         new = self.fresh(files, self.s["titles"].get(str(cid)) or "")
         self.s["dupes"] += sum(1 for v in new.values() if not v)
         protected = bool(getattr(ent, "noforwards", False))
@@ -348,6 +416,8 @@ class Run:
                     self.s["dupes"] += 1
                 if m.id in new:
                     rec["files"] += 1
+                else:
+                    self.skip(m)
                 rec["scanned"] += 1
                 scan_left -= 1
                 cur = m.id
@@ -364,7 +434,7 @@ async def main_async(job):
     from telethon.sessions import StringSession
     bot = Bot(job)
     summary = {"kind": "final", "last": {}, "errors": {}, "ok_ids": [], "titles": {}, "sent": 0, "checked": 0,
-               "dupes": 0, "dup_items": [], "bf": {}, "bf_sent": 0, "flood": 0,
+               "dupes": 0, "dup_items": [], "bf": {}, "bf_sent": 0, "flood": 0, "skipped": {},
                "ibad": {}, "ibok": [], "ibjoined": []}
     client = TelegramClient(StringSession(job["session"]), int(job["api_id"]), job["api_hash"],
                             device_model=job.get("device") or "Filesbull Userbot", system_version="filesbull",
@@ -623,7 +693,8 @@ def main():
     out = {k: v for k, v in summary.items()}
     bot.post("/api/userbot-done", out)
     print(json.dumps({"sent": summary.get("sent"), "history": summary.get("bf_sent"), "checked": summary.get("checked"),
-                      "dupes": summary.get("dupes"), "stop": summary.get("stop"), "errors": len(summary.get("errors") or {}),
+                      "dupes": summary.get("dupes"), "skipped": summary.get("skipped"), "stop": summary.get("stop"),
+                      "errors": len(summary.get("errors") or {}),
                       "fatal": bool(summary.get("fatal"))}))
     if summary.get("fatal") != "revoked":
         chain_next(t0)
