@@ -789,13 +789,36 @@ def missing_required(user_id: Optional[int], channels: Optional[List[Dict[str, A
     for channel in (required_channels() if channels is None else channels):
         try:
             member = telegram("getChatMember", {"chat_id": channel["chat_id"], "user_id": user_id}).get("result", {}) or {}
-        except Exception:
+        except Exception as exc:
+            # bot not admin / channel gone / API error: never lock the user out — log + tell the owner (max every 6 h)
             log_error(f"gate check {channel.get('chat_id')}")
+            gate_owner_alert(channel, exc)
             continue
         status = member.get("status")
-        if status in {"left", "kicked"} or (status == "restricted" and not member.get("is_member", True)):
+        if status in {"member", "administrator", "creator"}:
+            continue
+        if status == "restricted":
+            if member.get("is_member") is False:
+                missing.append(channel)
+            continue
+        if status in {"left", "kicked"}:
             missing.append(channel)
+        # any other / empty answer: unknown → not blocked
     return missing
+
+
+def gate_owner_alert(channel: Dict[str, Any], exc: Exception) -> None:
+    """One Log Chat line per join channel every 6 h when the bot can't check membership there."""
+    key = f"gatealert:{channel.get('chat_id')}"
+    try:
+        if time.time() - float(get_setting(key) or 0) < 6 * 3600:
+            return
+        set_setting(key, str(int(time.time())))
+        why = str(exc).replace(BOT_TOKEN, "***")[:120] if BOT_TOKEN else str(exc)[:120]
+        audit_log(f"⚠️ Join check nahi ho pa raha: {str(channel.get('title') or 'channel')[:40]} — {why}\n"
+                  "Users ko roka nahi gaya. Bot ko us channel me admin banao (ya /admin → 📋 Join Channels se hatao).")
+    except Exception:
+        log_error("gate owner alert")
 
 
 def user_has_required_access(user_id: Optional[int]) -> bool:
@@ -888,24 +911,102 @@ def mark_verified(user_id: Optional[int]) -> None:
     _VERIFIED_CACHE[user_id] = True
 
 
-def send_join_gate(chat_id: int, missing: List[Dict[str, Any]], left: bool = False, total: int = 0) -> None:
-    send_text(chat_id, gate_text(missing, left, total), join_markup(missing, total), "HTML")
+GATE_EDIT_SEC = 120          # a second prompt within 2 min (double send / Telegram re-delivery) edits the first one
 
 
-def gate_blocks(user_id: Optional[int], chat_id: int) -> bool:
+def gate_state(user_id: Optional[int]) -> Dict[str, Any]:
+    """bot_settings "gate:<uid>" = {"mid": prompt message id, "t": sent at, "q": what the user asked (text / button)}."""
+    if not user_id:
+        return {}
+    try:
+        return json.loads(get_setting(f"gate:{user_id}") or "{}") or {}
+    except Exception:
+        return {}
+
+
+def gate_save(user_id: Optional[int], st: Dict[str, Any]) -> None:
+    if not user_id:
+        return
+    try:
+        set_setting(f"gate:{user_id}", json.dumps(st, ensure_ascii=False)[:3000])
+    except Exception:
+        log_error("gate_save")
+
+
+def gate_clear(user_id: Optional[int], chat_id: Any, keep_mid: Any = None) -> Dict[str, Any]:
+    """The user passed: delete the join prompt(s) still in the chat, forget the state. Returns the old state."""
+    st = gate_state(user_id)
+    if not st:
+        return {}
+    for mid in dict.fromkeys([st.get("mid")] + list(st.get("old") or [])):
+        if mid and chat_id and mid != keep_mid:
+            try:
+                telegram("deleteMessage", {"chat_id": chat_id, "message_id": int(mid)})
+            except Exception:
+                pass
+    try:
+        supabase("bot_settings", "DELETE", query=f"?key=eq.{urllib.parse.quote(f'gate:{user_id}')}")
+    except Exception:
+        log_error("gate_clear")
+    return st
+
+
+def send_join_gate(chat_id: int, missing: List[Dict[str, Any]], left: bool = False, total: int = 0,
+                   user_id: Optional[int] = None, ask: Optional[Dict[str, Any]] = None) -> None:
+    """ONE join prompt per user: a repeat within 2 min edits the same message; a later one replaces it
+    (old prompt deleted). The user's request is remembered and run once they have joined."""
+    text, markup = gate_text(missing, left, total), join_markup(missing, total)
+    st = gate_state(user_id) if user_id else {}
+    now = time.time()
+    if ask:
+        st["q"] = ask
+    old = st.get("mid")
+    if old and now - float(st.get("t") or 0) < GATE_EDIT_SEC:
+        try:
+            telegram("editMessageText", {"chat_id": chat_id, "message_id": int(old), "text": text, "parse_mode": "HTML",
+                                         "reply_markup": safe_markup(markup), "disable_web_page_preview": True})
+            gate_save(user_id, st)
+            return
+        except Exception as exc:
+            if "not modified" in str(exc).lower():
+                gate_save(user_id, st)
+                return
+    res = telegram("sendMessage", {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "reply_markup": safe_markup(markup),
+                                   "disable_web_page_preview": True}) or {}
+    mid = ((res.get("result") or {}) if isinstance(res, dict) else {}).get("message_id")
+    if old and old != mid:
+        try:
+            telegram("deleteMessage", {"chat_id": chat_id, "message_id": int(old)})
+        except Exception:
+            pass
+    if user_id:
+        st.update({"mid": mid, "t": now})
+        st.pop("old", None)
+        gate_save(user_id, st)
+
+
+def gate_blocks(user_id: Optional[int], chat_id: int, ask: Optional[Dict[str, Any]] = None) -> bool:
     """True (and the join prompt is sent) when a normal user still has to join channels.
-    A user who passed before and is now missing gets the "you left our channel" message."""
+    A user who passed before and is now missing gets the "you left our channel" message.
+    Owner / sub-admins always pass. Passing removes an old join prompt from the chat."""
     if is_subadmin(user_id):
         return False
     reqs = required_channels()
-    missing = missing_required(user_id, reqs)
+    if reqs and user_id:
+        try:
+            prefetch_settings([f"verified:{user_id}", f"gate:{user_id}"])   # one read for both (no extra round trip)
+        except Exception:
+            pass
+    missing = missing_required(user_id, reqs) if reqs else []
     if missing:
         note_user(None, verified=False)
-        send_join_gate(chat_id, missing, left=was_verified(user_id), total=len(reqs))
+        send_join_gate(chat_id, missing, left=was_verified(user_id), total=len(reqs), user_id=user_id, ask=ask)
         return True
     if reqs:
         mark_verified(user_id)
         note_user(None, verified=True)
+        if get_setting(f"gate:{user_id}"):
+            gate_clear(user_id, chat_id)      # joined since the prompt: the prompt goes away
     return False
 
 
@@ -4480,7 +4581,8 @@ def handle_private_message(message: Dict[str, Any]) -> None:
         web_handle_links(chat_id, user_id, text)  # 🔗 owner sent file link(s): download → Inbox pipeline
         return
 
-    if gate_blocks(user_id, chat_id):
+    _ask = ({"k": "text", "text": text[:500]} if text and (not command or command == "/search") else None)
+    if gate_blocks(user_id, chat_id, ask=_ask):
         return
 
     info = file_info(message)
@@ -4927,7 +5029,7 @@ def handle_callback(query: Dict[str, Any]) -> None:
         if cmd.startswith(("y:", "op:y:")) and msg_date and time.time() - msg_date > CONFIRM_TTL:
             cb_answer(query, "⌛ Ye confirm purana ho gaya (1 ghante se zyada). Dobara karo, phir ✅ Accept dabao.", True)
             return
-    cb_answer(query, "⏳ Join check ho raha hai..." if data == "verify_join" else cb_toast(data))
+    cb_answer(query, "" if data == "verify_join" else cb_toast(data))   # verify: no toast (it looked "stuck"); the answer is the message
     note_user(query.get("from"))
     try:
         _handle_callback_body(query, data, chat_id, user_id)
@@ -4959,23 +5061,45 @@ def _handle_callback_body(query: Dict[str, Any], data: str, chat_id: Any, user_i
         admin = is_subadmin(user_id)
         reqs = [] if admin else required_channels()
         missing = missing_required(user_id, reqs) if reqs else []
+        tapped = ((query.get("message") or {}).get("message_id"))
         if not missing:
             if reqs:
                 mark_verified(user_id)
                 note_user(None, verified=True)
-            # The gate message turns into a thank-you (buttons gone), then the welcome + menu.
-            show(chat_id, "✅ <b>Shukriya!</b> Ab aap bot use kar sakte ho 🎉", None, query, "HTML")
-            if chat_id:
-                send_text(chat_id, welcome_text(query.get("from"), admin=admin),
+            # Joined: every join prompt disappears and the user's own request runs (else the welcome + menu).
+            st = gate_clear(user_id, chat_id)
+            if tapped and chat_id and tapped != st.get("mid"):
+                try:
+                    telegram("deleteMessage", {"chat_id": chat_id, "message_id": int(tapped)})
+                except Exception:
+                    pass
+            q = st.get("q") or {}
+            if chat_id and q.get("k") == "text" and q.get("text"):
+                handle_private_message({"message_id": 0, "chat": {"id": chat_id, "type": "private"},
+                                        "from": query.get("from") or {"id": user_id}, "text": str(q["text"])[:500]})
+            elif chat_id and q.get("k") == "cb" and q.get("data") and callback_known(str(q["data"])) and q["data"] != "verify_join":
+                _handle_callback_body({"id": query.get("id"), "from": query.get("from"), "data": q["data"],
+                                       "message": {"chat": {"id": chat_id}}}, str(q["data"]), chat_id, user_id)
+            elif chat_id:
+                send_text(chat_id, "✅ <b>Shukriya!</b> Ab aap bot use kar sakte ho 🎉\n\n" + welcome_text(query.get("from"), admin=admin),
                           admin_start_menu() if admin else user_menu(), "HTML")
         else:
             names = ", ".join(str(c.get("title") or "Channel") for c in missing)
             alert = "❌ Abhi join nahi kiya! Pehle channel join karo, phir Verify dabao."
             alert += f"\n\nBaaki: {names}"
             # Already answered immediately; Telegram allows only one callback answer.
-            # Put the failure in the message itself rather than a second (ignored) alert.
+            # Put the failure in the message itself (the same prompt, edited — never a second prompt).
             show(chat_id, esc(alert[:160]) + "\n\n" + gate_text(missing, was_verified(user_id), len(reqs)),
                  join_markup(missing, len(reqs)), query, "HTML")
+            if user_id and tapped:
+                st = gate_state(user_id)
+                if st.get("mid") and st.get("mid") != tapped and chat_id:
+                    try:
+                        telegram("deleteMessage", {"chat_id": chat_id, "message_id": int(st["mid"])})
+                    except Exception:
+                        pass
+                st.update({"mid": tapped, "t": time.time()})
+                gate_save(user_id, st)
         return
     if (data.startswith("ad:") or data.startswith("admin_")) and chat_id:
         if not is_subadmin(user_id):
@@ -4986,7 +5110,7 @@ def _handle_callback_body(query: Dict[str, Any], data: str, chat_id: Any, user_i
         except InputError as exc:
             send_text(chat_id, f"❌ Nahi hua: {exc}", {"inline_keyboard": [BACK_ROW]})
         return
-    if chat_id and gate_blocks(user_id, chat_id):
+    if chat_id and gate_blocks(user_id, chat_id, ask={"k": "cb", "data": data}):
         return
     if data == "user_help":
         send_text(chat_id, USER_HELP, None, "HTML")
@@ -14134,6 +14258,47 @@ def webdiag() -> Any:
         set_setting("diag_sha", hashlib.sha256(tok.encode()).hexdigest())
         out["saved"] = True
         out["source_after"] = diag_source()
+        return jsonify(out)
+    if op == "gate":       # join-gate check: per join channel the bot's own status + chat facts; users with an open prompt
+        chans = []
+        reqs = required_channels()
+        for ch in reqs:
+            row: Dict[str, Any] = {"title": ch.get("title"), "username": bool(ch.get("username")),
+                                   "invite": ("+" if "/+" in str(ch.get("invite_link") or "") else
+                                              ("joinchat" if "joinchat" in str(ch.get("invite_link") or "") else
+                                               ("none" if not ch.get("invite_link") else "other")))}
+            try:
+                row["bot"] = bot_member(ch["chat_id"]).get("status")
+            except Exception as exc:
+                row["bot"] = "error: " + str(exc)[:80]
+            try:
+                info = telegram("getChat", {"chat_id": ch["chat_id"]}).get("result", {}) or {}
+                row.update({"type": info.get("type"), "title_now": info.get("title"), "join_by_request": info.get("join_by_request"),
+                            "same_id": str(info.get("id")) == str(ch.get("chat_id"))})
+            except Exception as exc:
+                row["chat"] = "error: " + str(exc)[:80]
+            chans.append(row)
+        out["channels"] = chans
+        uids = [int(x) for x in re.findall(r"\d+", str(request.args.get("uid") or body.get("uid") or ""))][:5]
+        if not uids:
+            try:
+                rows = supabase("bot_settings", "GET", query="?key=like.gate:*&select=key&limit=10")
+                uids = [int(r["key"].split(":")[1]) for r in rows if r.get("key", "").split(":")[-1].isdigit()][:5]
+            except Exception:
+                uids = []
+        users = []
+        for u in uids:
+            per = {}
+            for ch in reqs:
+                try:
+                    mem = telegram("getChatMember", {"chat_id": ch["chat_id"], "user_id": u}).get("result", {}) or {}
+                    per[str(ch.get("title"))[:30]] = mem.get("status") + ("" if mem.get("is_member") is None else f"/is_member={mem.get('is_member')}")
+                except Exception as exc:
+                    per[str(ch.get("title"))[:30]] = "error: " + str(exc)[:60]
+            users.append({"uid": "…" + str(u)[-3:], "verified_before": was_verified(u), "status": per,
+                          "missing": [c.get("title") for c in missing_required(u, reqs)]})
+        out["users"] = users
+        _LOG_QUEUE.clear()
         return jsonify(out)
     if op == "config":     # names + sources only, never values
         out["config"] = config_status()
