@@ -255,6 +255,10 @@ Fork में `BOT_URL` नहीं है तो run आराम से र�
 | `/admin → 👀 Join attempts`, `🔓 Bypass users` | admins | who is trying, let in without joining / take back |
 | `/admin → 📢 Sabko message` | owner | broadcast to all users (preview + Accept) |
 | `/admin → 🔍 Admin / 👥 Users search mode` | owner | search only on `search <naam>` or auto |
+| `/admin → ✨ Animations` | owner | ON/OFF, ▶️ preview, 🎨 welcome sticker, 🎬 bot DP video (each change: ✅ Accept) |
+
+✨ **Animations** (free Telegram Bot API features, private chats): animated sticker + 🎉 effect on `/start` (🎉 max once per 6 h per user; always when access is granted), 🔥 effect on a delivered file (max once per 2 min per user), ❤️ effect on a help-desk reply, bot reaction 👀 → ⚡ on a search message, coloured buttons (Join blue, Verify green). Telegram refusing an effect never loses the message. Animated profile video for the bot: `/admin → ✨ Animations → 🎬` (square MP4, max 10 s).
+✨ **Animations**: `/start` पर animated sticker + 🎉, file मिलने पर 🔥, help-desk जवाब पर ❤️, search पर 👀 → ⚡, रंगीन buttons. Owner `/admin → ✨ Animations` से बंद कर सकता है।
 
 Owner's private chat also understands plain Hinglish ("X ka naam Y kar do", "backup channel set karo"). Files are searched only with `search <naam>`.
 Owner chat में सीधी Hinglish भी चलती है; file search सिर्फ `search <नाम>` से।

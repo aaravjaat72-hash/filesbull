@@ -155,7 +155,7 @@ def log_error(where: str) -> None:
 # ---- diagnostics: per-call timing trace + dry run (used only by /api/cbdiag; off for real updates)
 _DIAG: Dict[str, Any] = {"on": False, "dry": False, "t0": 0.0, "calls": [], "sent": []}
 _TG_READ = {"getMe", "getChat", "getChatMember", "getFile", "getWebhookInfo", "getChatMemberCount", "getMyCommands",
-            "getChatAdministrators"}
+            "getChatAdministrators", "getStickerSet"}
 
 
 def diag_label(url: str, method: str) -> str:
@@ -375,7 +375,7 @@ def required_channels() -> List[Dict[str, Any]]:
 # set_setting()/supabase("bot_settings", ...) updates/drops the cached copy, so this instance never serves its own stale value.
 SETTINGS_TTL = 30.0
 _SET_TTL_KEYS = ("log_chat_id", "backup_chat_id", "ai_naming", "cat_registry", "catmap", "search_mode_owner", "search_mode_users",
-                 "gate_autoapprove")
+                 "gate_autoapprove", "fx_mode", "fx_sticker", "fx_sticker_auto")
 _SET_CACHE: Dict[str, Any] = {}
 
 
@@ -988,9 +988,9 @@ def join_markup(channels: Optional[List[Dict[str, Any]]] = None, total: int = 0)
         url = join_url(channel)
         if url:
             label = f"📢 Join: {str(channel.get('title') or 'Channel')[:28]}" if named else "📢 Join Channel"
-            rows.append([{"text": label, "url": url}])
+            rows.append([fx_style({"text": label, "url": url}, "primary")])
     rows.append([{"text": "❓ Help / Request", "callback_data": "user_help"}])
-    rows.append([{"text": VERIFY_BUTTON, "callback_data": "verify_join"}])
+    rows.append([fx_style({"text": VERIFY_BUTTON, "callback_data": "verify_join"}, "success")])
     return {"inline_keyboard": rows}
 
 
@@ -1141,6 +1141,7 @@ def welcome_mid_get(user_id: Optional[int]) -> Any:
 
 
 def welcome_mid_drop(user_id: int, chat_id: Any, mid: Any) -> None:
+    fx_drop_sticker(user_id, chat_id)
     try:
         telegram("deleteMessage", {"chat_id": chat_id, "message_id": int(mid)})
     except Exception:
@@ -1151,13 +1152,220 @@ def welcome_mid_drop(user_id: int, chat_id: Any, mid: Any) -> None:
         pass
 
 
-def send_welcome(chat_id: int, user: Optional[Dict[str, Any]], text: str, markup: Any) -> None:
-    """Welcome/menu as a FRESH message; the previous welcome (and any join prompt) for this user is deleted."""
+
+# ---- ✨ ANIMATIONS (Aarav 1:13 PM Oct 27: "ye premium animations bot me bhi add kr do"). Free Bot API features only:
+# message effects (private chats only), an animated welcome sticker, reactions on the user's search message, chat
+# actions, coloured buttons. Owner switch: /admin → ✨ Animations (setting fx_mode = on (default) | off).
+# Every piece is best-effort: Telegram refusing an effect / reaction / sticker never costs the user the real message.
+FX_EFFECTS = {"party": "5046509860389126442", "fire": "5104841245755180586",
+              "heart": "5159385139981059251", "like": "5107584321108051014"}   # Telegram's free message effects 🎉 🔥 ❤️ 👍
+FX_STICKER_SETS = ("UtyaDuck", "HotCherry", "AnimatedEmojies")   # Telegram's own animated packs (file_ids read by the bot itself)
+FX_STICKER_EMOJI = ("👋", "🎉", "🥳", "😊", "🤗", "❤️", "😍", "🔥")
+FX_FIRE_EVERY = 120          # 🔥 on a delivered file at most once per user per 2 min (no animation storm on 10 files)
+FX_PARTY_EVERY = 6 * 3600    # 🎉 on the /start welcome at most once per user per 6 h (always on "access mil gaya")
+_FX = threading.local()
+_FX_LAST: Dict[str, float] = {}
+FX_STATS: Dict[str, int] = {"effect_ok": 0, "effect_refused": 0, "react_ok": 0, "react_fail": 0,
+                            "sticker_ok": 0, "sticker_fail": 0}
+
+
+def fx_on() -> bool:
+    try:
+        return str(get_setting("fx_mode") or "on") != "off"
+    except Exception:
+        return True
+
+
+def fx_private(chat_id: Any) -> bool:
+    try:
+        return int(chat_id) > 0
+    except Exception:
+        return False
+
+
+def fx_throttle(key: str, every: float) -> bool:
+    """True (and remembered) when `key` did not fire in the last `every` seconds (per warm instance, no DB)."""
+    now = time.time()
+    if now - _FX_LAST.get(key, 0.0) < every:
+        return False
+    if len(_FX_LAST) > 5000:
+        _FX_LAST.clear()
+    _FX_LAST[key] = now
+    return True
+
+
+def fx_arm(name: Optional[str]) -> None:
+    """The NEXT message this request sends to a private chat carries this effect (once)."""
+    _FX.eff = name if (name and fx_on()) else None
+
+
+def fx_disarm() -> None:
+    _FX.eff = None
+
+
+def tg_fx(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """telegram() + the armed message effect. A refused effect (old client / group / unknown id) → sent plain."""
+    eff = getattr(_FX, "eff", None)
+    if not eff or not isinstance(payload, dict) or "message_effect_id" in payload or not fx_private(payload.get("chat_id")):
+        return telegram(method, payload)
+    _FX.eff = None
+    try:
+        res = telegram(method, dict(payload, message_effect_id=FX_EFFECTS.get(eff, eff)))
+        FX_STATS["effect_ok"] += 1
+        return res
+    except Exception as exc:
+        if "effect" not in str(exc).lower():
+            raise
+        FX_STATS["effect_refused"] += 1
+        return telegram(method, payload)
+
+
+def fx_react(chat_id: Any, message_id: Any, emoji: Optional[str]) -> None:
+    """Bot reaction on a user's message (emoji None = take ours off). Allowed emoji only (👀 ⚡ 👍 🔥 🎉 ❤ …)."""
+    if not chat_id or not message_id:
+        return
+    try:
+        telegram("setMessageReaction", {"chat_id": chat_id, "message_id": int(message_id),
+                                        "reaction": [{"type": "emoji", "emoji": emoji}] if emoji else []})
+        FX_STATS["react_ok"] += 1
+    except Exception:
+        FX_STATS["react_fail"] += 1
+
+
+def fx_action(chat_id: Any, action: str = "typing") -> None:
+    if not fx_private(chat_id):
+        return
+    try:
+        telegram("sendChatAction", {"chat_id": chat_id, "action": action})
+    except Exception:
+        pass
+
+
+def fx_style(button: Dict[str, Any], style: str) -> Dict[str, Any]:
+    """Coloured inline button (Bot API: "primary" blue / "success" green / "danger" red); clients without it ignore it."""
+    if fx_on():
+        button["style"] = style
+    return button
+
+
+def _fx_pick_sticker() -> Optional[str]:
+    """One animated sticker from Telegram's own packs, picked once and remembered (fx_sticker_auto = file_id | none:<ts>)."""
+    v = get_setting("fx_sticker_auto")
+    if v and not v.startswith("none:"):
+        return v
+    if v and time.time() - float(v[5:] or 0) < 86400:
+        return None                                   # no pack answered in the last day: don't ask on every /start
+    for name in FX_STICKER_SETS:
+        try:
+            st = (telegram("getStickerSet", {"name": name}) or {}).get("result") or {}
+        except Exception:
+            continue
+        anim = [x for x in st.get("stickers") or [] if (x.get("is_animated") or x.get("is_video")) and x.get("file_id")]
+        if not anim:
+            continue
+        pick = next((x for e in FX_STICKER_EMOJI for x in anim if (x.get("emoji") or "").startswith(e)), anim[0])
+        try:
+            set_setting("fx_sticker_auto", pick["file_id"])
+        except Exception:
+            pass
+        return pick["file_id"]
+    try:
+        set_setting("fx_sticker_auto", f"none:{int(time.time())}")
+    except Exception:
+        pass
+    return None
+
+
+def fx_sticker_id() -> Optional[str]:
+    own = get_setting("fx_sticker")
+    if own:
+        return None if own == "off" else own
+    return _fx_pick_sticker()
+
+
+def fx_send_sticker(chat_id: Any) -> Optional[int]:
+    if not fx_private(chat_id) or not fx_on():
+        return None
+    try:
+        sid = fx_sticker_id()
+        if not sid:
+            return None
+        res = telegram("sendSticker", {"chat_id": chat_id, "sticker": sid}) or {}
+        FX_STATS["sticker_ok"] += 1
+        return ((res.get("result") or {}) if isinstance(res, dict) else {}).get("message_id")
+    except Exception:
+        FX_STATS["sticker_fail"] += 1
+        log_error("fx sticker")
+        return None
+
+
+def fx_drop_sticker(user_id: Any, chat_id: Any, keep: Any = None) -> None:
+    """The welcome sticker goes with its welcome (fresh on /start, gone when the join prompt replaces it)."""
+    if not user_id:
+        return
+    try:
+        old = int(get_setting(f"lastst:{user_id}") or 0) or None
+    except Exception:
+        old = None
+    if not old or old == keep:
+        return
+    try:
+        telegram("deleteMessage", {"chat_id": chat_id, "message_id": int(old)})
+    except Exception:
+        pass
+    try:
+        supabase("bot_settings", "DELETE", query=f"?key=eq.{urllib.parse.quote(f'lastst:{user_id}')}")
+    except Exception:
+        pass
+
+
+def fx_search(chat_id: Any, user: Dict[str, Any], query: str, message_id: Any) -> None:
+    """smart_reply with 👀 on the user's message (+ typing) while searching → ⚡ when files were sent, else ours removed.
+    The 👀 call runs beside the search, so the results are not slowed down."""
+    if not (message_id and fx_private(chat_id) and fx_on()):
+        smart_reply(chat_id, user, query)
+        return
+    state = {"done": False}
+
+    def bg() -> None:
+        if not state["done"]:
+            fx_action(chat_id, "typing")      # skipped when the answer is already out (no stale "typing…")
+        fx_react(chat_id, message_id, "👀")
+
+    t = threading.Thread(target=bg, daemon=True)
+    t.start()
+    _FX.found = False
+    try:
+        smart_reply(chat_id, user, query)
+    finally:
+        state["done"] = True
+        t.join(3.0)
+        fx_react(chat_id, message_id, "⚡" if getattr(_FX, "found", False) else None)
+        _FX.found = False
+
+
+def send_welcome(chat_id: int, user: Optional[Dict[str, Any]], text: str, markup: Any, fx: Optional[str] = None) -> None:
+    """Welcome/menu as a FRESH message; the previous welcome (and any join prompt) for this user is deleted.
+    fx="start" / "granted": ✨ animated sticker above it + 🎉 effect (start: max once per 6 h per user)."""
     uid = (user or {}).get("id")
-    res = send_text(chat_id, text, markup, "HTML") or {}
+    smid = None
+    if fx and uid and fx_private(chat_id) and fx_on():
+        smid = fx_send_sticker(chat_id)
+        if fx == "granted" or fx_throttle(f"party:{uid}", FX_PARTY_EVERY):
+            fx_arm("party")
+    try:
+        res = send_text(chat_id, text, markup, "HTML") or {}
+    finally:
+        fx_disarm()
     mid = ((res.get("result") or {}) if isinstance(res, dict) else {}).get("message_id")
     if not uid:
         return
+    fx_drop_sticker(uid, chat_id, keep=smid)
+    if smid:
+        try:
+            set_setting(f"lastst:{uid}", str(smid))
+        except Exception:
+            log_error("lastst")
     old = welcome_mid_get(uid)
     if old and old != mid:
         try:
@@ -1348,7 +1556,8 @@ def gate_recheck(uid: int, user: Dict[str, Any], chat_id: Any = None) -> None:
     elif q.get("k") == "cb" and q.get("data") and callback_known(str(q["data"])) and q["data"] != "verify_join":
         _handle_callback_body({"id": "", "from": user, "data": q["data"], "message": {"chat": {"id": chat_id}}}, str(q["data"]), chat_id, uid)
     else:
-        send_welcome(chat_id, user, "✅ <b>Shukriya, join ho gaya!</b> Ab aap bot use kar sakte ho 🎉\n\n" + welcome_text(user), user_menu())
+        send_welcome(chat_id, user, "✅ <b>Shukriya, join ho gaya!</b> Ab aap bot use kar sakte ho 🎉\n\n" + welcome_text(user), user_menu(),
+                     fx="granted")
 
 
 def gate_passed(uid: int, user: Optional[Dict[str, Any]], st: Dict[str, Any]) -> None:
@@ -1383,7 +1592,7 @@ def gate_grant(admin_id: int, uid: int, query: Optional[Dict[str, Any]], chat_id
     st = gate_clear(uid, uid)
     try:
         u = {"id": uid, "first_name": rec.get("n") or ""}
-        send_welcome(uid, u, "✅ <b>Admin ne aapko access de diya!</b> 🎉\n\n" + welcome_text(u), user_menu())
+        send_welcome(uid, u, "✅ <b>Admin ne aapko access de diya!</b> 🎉\n\n" + welcome_text(u), user_menu(), fx="granted")
     except Exception:
         log_error("gate grant notify")
     show(chat_id, "🔓 <b>Bina join access diya</b>\n" + gate_who(uid, rec) + f"\n✅ by {esc(actor_label(admin_id))} · {ist_now()}",
@@ -1480,7 +1689,7 @@ def gate_blocks(user_id: Optional[int], chat_id: int, ask: Optional[Dict[str, An
     reqs = required_channels()
     if reqs and user_id:
         try:
-            prefetch_settings([f"verified:{user_id}", f"gate:{user_id}", f"jrq:{user_id}", f"lastw:{user_id}"])   # one read
+            prefetch_settings([f"verified:{user_id}", f"gate:{user_id}", f"jrq:{user_id}", f"lastw:{user_id}", f"lastst:{user_id}"])   # one read
         except Exception:
             pass
     missing = missing_required(user_id, reqs) if reqs else []
@@ -1524,6 +1733,159 @@ def welcome_text(user: Optional[Dict[str, Any]], admin: bool = False) -> str:
     return text
 
 
+# ---- ✨ Animations panel (owner): ON/OFF, ▶️ preview to himself, 🎨 welcome sticker, 🎬 bot DP video (each change ✅ Accept once)
+def fx_panel_text() -> str:
+    own = get_setting("fx_sticker")
+    st = "aapka chuna hua" if own and own != "off" else ("band" if own == "off" else "Telegram ka animated (default)")
+    return ("✨ <b>Animations: " + ("ON ✅" if fx_on() else "OFF ❌") + "</b>\n\n"
+            "• /start pe animated sticker + 🎉 effect\n"
+            "• Join karke access milne pe 🎉\n"
+            "• File milne pe 🔥 effect\n"
+            "• Help-desk ka jawab ❤️ effect ke saath\n"
+            "• Search pe bot ka reaction 👀 → ⚡ (file mili)\n"
+            "• Rangeen buttons: Join 🔵, Verify 🟢, Search 🔵\n\n"
+            f"🎨 Welcome sticker: {st}\n"
+            "<i>Effects sirf private chat me, naye Telegram app pe dikhte hain. Purane app pe message normal aata hai.</i>")
+
+
+def fx_panel_markup() -> Dict[str, Any]:
+    return {"inline_keyboard": [
+        [{"text": "❌ Animations OFF karo" if fx_on() else "✅ Animations ON karo", "callback_data": "ad:fxt"}],
+        [{"text": "▶️ Mujhe preview dikhao", "callback_data": "ad:fxp"}],
+        [{"text": "🎨 Welcome sticker badlo", "callback_data": "ad:fxs"}, {"text": "♻️ Default sticker", "callback_data": "ad:fxsd"}],
+        [{"text": "🎬 Bot DP video lagao", "callback_data": "ad:fxdp"}],
+        BACK_ROW]}
+
+
+def fx_admin_cb(query: Dict[str, Any], data: str, chat_id: Any, user_id: int) -> None:
+    cmd = data[3:]
+    if not is_owner(user_id):
+        send_text(chat_id, "🔒 Animations sirf owner badal sakta hai.", {"inline_keyboard": [BACK_ROW]})
+        return
+    if cmd == "fx":
+        show(chat_id, fx_panel_text(), fx_panel_markup(), query, "HTML")
+    elif cmd == "fxt":
+        on = not fx_on()
+        set_setting("fx_mode", "on" if on else "off")
+        _SET_CACHE.pop("fx_mode", None)
+        audit_log(f"✨ Animations {'ON' if on else 'OFF'} · {actor_label(user_id)} · {ist_now()}")
+        show(chat_id, fx_panel_text(), fx_panel_markup(), query, "HTML")
+    elif cmd == "fxp":
+        if not fx_on():
+            send_text(chat_id, "✨ Animations OFF hain — pehle ON karo.", fx_panel_markup())
+            return
+        u = (query.get("from") or {"id": user_id})
+        fx_send_sticker(chat_id)
+        fx_arm("party")
+        try:
+            send_text(chat_id, "🎉 <b>Ye /start / access milne wala effect hai</b>", None, "HTML")
+        finally:
+            fx_disarm()
+        fx_arm("fire")
+        try:
+            send_text(chat_id, "🔥 <b>Ye file milne wala effect hai</b>", None, "HTML")
+        finally:
+            fx_disarm()
+        fx_arm("heart")
+        try:
+            send_text(chat_id, "❤️ <b>Ye help-desk jawab wala effect hai</b>\n\nSearch karke dekho: bot aapke message pe 👀 → ⚡ lagayega. "
+                               "Users ke liye /start dabao.", fx_panel_markup(), "HTML")
+        finally:
+            fx_disarm()
+        _ = u
+    elif cmd == "fxs":
+        set_pending(user_id, "fxsticker")
+        send_text(chat_id, "🎨 Koi bhi sticker bhejo (animated/video sticker best) — wahi /start pe dikhega.\n/cancel = band",
+                  {"force_reply": True, "input_field_placeholder": "Sticker bhejo…"})
+    elif cmd == "fxsd":
+        set_setting("fx_cand", json.dumps({"k": "sticker", "v": ""}))
+        send_text(chat_id, "♻️ Welcome sticker Telegram ke default animated sticker pe wapas karein?",
+                  {"inline_keyboard": [[{"text": "✅ Accept", "callback_data": "ad:fxsy"}, {"text": "❌ Deny", "callback_data": "ad:fxsn"}]]})
+    elif cmd == "fxdp":
+        set_pending(user_id, "fxdp")
+        send_text(chat_id, "🎬 Bot ki DP ke liye chhota video bhejo:\n• square (1:1), max 10 sec, MP4, 20 MB se kam\n"
+                           "• Telegram usse bot ki animated profile photo bana dega (purani DP badal jayegi)\n/cancel = band",
+                  {"force_reply": True, "input_field_placeholder": "Video bhejo…"})
+    elif cmd in ("fxsy", "fxsn", "fxdy", "fxdn"):
+        try:
+            cand = json.loads(get_setting("fx_cand") or "null") or {}
+        except Exception:
+            cand = {}
+        try:
+            supabase("bot_settings", "DELETE", query="?key=eq.fx_cand")
+        except Exception:
+            pass
+        want = "sticker" if cmd.startswith("fxs") else "dp"
+        if cand.get("k") != want:
+            show(chat_id, "🔄 Ye button purana hai — ✨ Animations dobara kholo.", fx_panel_markup(), query)
+            return
+        if cmd.endswith("n"):
+            show(chat_id, "❌ Kuch nahi badla.", fx_panel_markup(), query)
+            return
+        if want == "sticker":
+            if cand.get("v"):
+                set_setting("fx_sticker", str(cand["v"]))
+            else:
+                supabase("bot_settings", "DELETE", query="?key=eq.fx_sticker")
+            _SET_CACHE.pop("fx_sticker", None)
+            audit_log(f"🎨 Welcome sticker {'badla' if cand.get('v') else 'default'} · {actor_label(user_id)} · {ist_now()}")
+            show(chat_id, "✅ Welcome sticker set ho gaya. /start dabake dekho.", fx_panel_markup(), query)
+            return
+        err = fx_set_dp(cand)
+        if err:
+            show(chat_id, f"❌ DP nahi lagi: {esc(err)}\n\nSquare MP4, max 10 sec, chhota size try karo.", fx_panel_markup(), query, "HTML")
+            return
+        audit_log(f"🎬 Bot DP video lagi · {actor_label(user_id)} · {ist_now()}")
+        show(chat_id, "✅ Bot ki animated DP lag gayi! Bot ki profile kholke dekho (app me dikhne me 1-2 min lag sakte hain).",
+             fx_panel_markup(), query)
+
+
+def fx_admin_input(message: Dict[str, Any], user_id: int, pending: Dict[str, Any]) -> bool:
+    """Owner's answer after 🎨 / 🎬. True = handled. Anything else clears the step and goes on normally."""
+    chat_id = (message.get("chat") or {}).get("id")
+    clear_pending(user_id)
+    if pending.get("a") == "fxsticker":
+        st = message.get("sticker") or {}
+        if not st.get("file_id"):
+            return False
+        set_setting("fx_cand", json.dumps({"k": "sticker", "v": st["file_id"]}))
+        send_text(chat_id, "🎨 Ye sticker /start welcome pe dikhega. Set karein?",
+                  {"inline_keyboard": [[{"text": "✅ Accept", "callback_data": "ad:fxsy"}, {"text": "❌ Deny", "callback_data": "ad:fxsn"}]]})
+        return True
+    v = message.get("video") or message.get("animation") or {}
+    doc = message.get("document") or {}
+    if not v and str(doc.get("mime_type") or "").startswith("video/"):
+        v = doc
+    if not v.get("file_id"):
+        return False
+    if int(v.get("file_size") or 0) > 20 * 1024 * 1024:
+        send_text(chat_id, "❌ Video 20 MB se bada hai — chhota video bhejo.", fx_panel_markup())
+        return True
+    if int(v.get("duration") or 0) > 10:
+        send_text(chat_id, f"❌ Video {int(v['duration'])} sec ka hai — Telegram DP video max 10 sec. Trim karke bhejo.", fx_panel_markup())
+        return True
+    set_setting("fx_cand", json.dumps({"k": "dp", "f": v["file_id"], "s": int(v.get("file_size") or 0)}))
+    send_text(chat_id, "🎬 Ye video bot ki animated DP banegi (abhi wali DP badal jayegi). Lagayein?",
+              {"inline_keyboard": [[{"text": "✅ Accept", "callback_data": "ad:fxdy"}, {"text": "❌ Deny", "callback_data": "ad:fxdn"}]]})
+    return True
+
+
+def fx_set_dp(cand: Dict[str, Any]) -> Optional[str]:
+    """setMyProfilePhoto with an InputProfilePhotoAnimated (Bot API): the video is uploaded fresh (Telegram's rule)."""
+    data = download_file(cand.get("f"), cand.get("s"))
+    if not data:
+        return "video download nahi hua"
+    try:
+        res = telegram_upload("setMyProfilePhoto",
+                              {"photo": json.dumps({"type": "animated", "animation": "attach://fxdp", "main_frame_timestamp": 0.0})},
+                              "fxdp", "dp.mp4", data, timeout=25)
+    except Exception as exc:
+        return friendly_tg_error(exc)
+    if not (res or {}).get("ok", False):
+        return str((res or {}).get("description") or "Telegram ne mana kiya")[:200]
+    return None
+
+
 def admin_start_menu() -> Dict[str, Any]:
     return {"inline_keyboard": [list(r) for r in USER_KEYBOARD_ROWS] + [list(ADMIN_PANEL_BUTTON)]}
 
@@ -1531,7 +1893,9 @@ BACK_ROW = [{"text": "🔙 Admin Panel", "callback_data": "ad:panel"}]
 
 
 def user_menu() -> Dict[str, Any]:
-    return {"inline_keyboard": [list(r) for r in USER_KEYBOARD_ROWS]}
+    rows = [[dict(b) for b in r] for r in USER_KEYBOARD_ROWS]
+    fx_style(rows[0][0], "primary")           # ✨ blue 🔍 Book Search Karo
+    return {"inline_keyboard": rows}
 
 
 def admin_menu(user_id: Optional[int] = None) -> Dict[str, Any]:
@@ -1556,7 +1920,9 @@ def admin_menu(user_id: Optional[int] = None) -> Dict[str, Any]:
         [{"text": search_mode_label(user_id), "callback_data": "ad:smode"}],
         [{"text": "🔍 Admin: " + ("search cmd" if search_cmd_only(True) else "auto"), "callback_data": "ad:som"},
          {"text": "👥 Users: " + ("search cmd" if search_cmd_only(False) else "auto"), "callback_data": "ad:sum"}],
-    ] + ([[{"text": agent_label(), "callback_data": "ad:agent"}]] if (user_id is None or is_owner(user_id)) else []) + [
+    ] + ([[{"text": agent_label(), "callback_data": "ad:agent"}],
+          [{"text": "✨ Animations: " + ("ON" if fx_on() else "OFF"), "callback_data": "ad:fx"}]]
+         if (user_id is None or is_owner(user_id)) else []) + [
         [{"text": "🔍 Search Menu", "callback_data": "ad:usermenu"}],
     ]}
 
@@ -3938,6 +4304,7 @@ def send_results(chat_id: int, user_id: Optional[int], ctx: Dict[str, Any], keyw
     save_ctx(user_id, ctx)
     send_text(chat_id, note + f"🔎 <b>{len(rows)} file mili</b> — jo chahiye us par tap karo 👇",
               results_markup(page, len(rows) - len(page)), "HTML")
+    _FX.found = True                       # ✨ ⚡ reaction on the user's search message
     return True
 
 
@@ -4747,7 +5114,7 @@ def send_text(chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = 
     if parse_mode:
         payload["parse_mode"] = parse_mode
     try:
-        return telegram("sendMessage", payload)
+        return tg_fx("sendMessage", payload)
     except Exception as exc:
         # A formatting slip must never cost the user the message: resend as plain text.
         if parse_mode and "parse" in str(exc).lower():
@@ -4872,7 +5239,7 @@ def send_by_file_id(chat_id: int, row: Dict[str, Any]) -> None:
         method, field = "sendVideo", "video"
     elif mime.startswith("audio/"):
         method, field = "sendAudio", "audio"
-    telegram(method, {"chat_id": chat_id, field: row["telegram_file_id"], "caption": delivery_caption(row)})
+    tg_fx(method, {"chat_id": chat_id, field: row["telegram_file_id"], "caption": delivery_caption(row)})
 
 
 # ---- delivery under the CURRENT name (Aarav 7:32 PM Oct 26: "list me to name change h lekin jbb file received hoti h
@@ -4920,7 +5287,7 @@ def deliver_renamed(chat_id: int, row: Dict[str, Any], caption: str) -> bool:
     cached = renamed_copy(row)
     if cached:
         try:
-            res = telegram("sendDocument", {"chat_id": chat_id, "document": cached, "caption": caption})
+            res = tg_fx("sendDocument", {"chat_id": chat_id, "document": cached, "caption": caption})
             doc = ((res or {}).get("result") or {}).get("document") or {}
             _REQ["_dl"] = {"how": "renamed_file_id", "file_name": doc.get("file_name"),
                            "message_id": ((res or {}).get("result") or {}).get("message_id")}
@@ -4930,8 +5297,8 @@ def deliver_renamed(chat_id: int, row: Dict[str, Any], caption: str) -> bool:
         try:
             v = json.loads(get_setting(f"dlf:{row.get('id')}") or "null")
             if isinstance(v, dict) and v.get("c") and v.get("m"):
-                res = telegram("copyMessage", {"chat_id": chat_id, "from_chat_id": int(v["c"]), "message_id": int(v["m"]),
-                                               "caption": caption})
+                res = tg_fx("copyMessage", {"chat_id": chat_id, "from_chat_id": int(v["c"]), "message_id": int(v["m"]),
+                                            "caption": caption})
                 _REQ["_dl"] = {"how": "renamed_post_copy", "message_id": ((res or {}).get("result") or {}).get("message_id")}
                 return True
         except Exception:
@@ -4945,6 +5312,8 @@ def deliver_renamed(chat_id: int, row: Dict[str, Any], caption: str) -> bool:
         return False                       # the file already carries this name: a copy is enough
     if req_elapsed() > 8.0:
         return False
+    if getattr(_FX, "eff", None):
+        fx_action(chat_id, "upload_document")     # ✨ "sending file…" while the clean-name copy is made
     data = download_file(row.get("telegram_file_id"), row.get("file_size"))
     if not data:
         return False
@@ -4966,6 +5335,16 @@ def deliver_renamed(chat_id: int, row: Dict[str, Any], caption: str) -> bool:
 
 
 def deliver_result(chat_id: int, row: Dict[str, Any], user: Optional[Dict[str, Any]] = None) -> None:
+    uid = (user or {}).get("id") or chat_id
+    if fx_private(chat_id) and fx_on() and fx_throttle(f"fire:{uid}", FX_FIRE_EVERY):
+        fx_arm("fire")                        # ✨ 🔥 effect on the delivered file
+    try:
+        _deliver_result(chat_id, row, user)
+    finally:
+        fx_disarm()
+
+
+def _deliver_result(chat_id: int, row: Dict[str, Any], user: Optional[Dict[str, Any]] = None) -> None:
     caption = delivery_caption(row)
     try:
         if deliver_renamed(chat_id, row, caption):
@@ -4975,7 +5354,7 @@ def deliver_result(chat_id: int, row: Dict[str, Any], user: Optional[Dict[str, A
         log_error("deliver_renamed")
     try:
         # copyMessage works for both public and private source channels when permitted; caption = current name.
-        telegram("copyMessage", {
+        tg_fx("copyMessage", {
             "chat_id": chat_id,
             "from_chat_id": row["source_chat_id"],
             "message_id": row["source_message_id"],
@@ -4987,8 +5366,8 @@ def deliver_result(chat_id: int, row: Dict[str, Any], user: Optional[Dict[str, A
         log_error("copyMessage")
     try:
         if row.get("backup_chat_id") and row.get("backup_message_id"):
-            telegram("copyMessage", {"chat_id": chat_id, "from_chat_id": row["backup_chat_id"], "message_id": row["backup_message_id"],
-                                     "caption": caption})
+            tg_fx("copyMessage", {"chat_id": chat_id, "from_chat_id": row["backup_chat_id"], "message_id": row["backup_message_id"],
+                                  "caption": caption})
             log_delivery(chat_id, row, user)
             return
     except Exception:
@@ -5081,7 +5460,7 @@ def handle_private_message(message: Dict[str, Any]) -> None:
     if message.get("chat", {}).get("type") == "private" and user_id:
         try:
             prefetch_settings([f"hd:{user_id}", f"verified:{user_id}", f"gate:{user_id}", f"jrq:{user_id}", f"lastw:{user_id}",
-                               f"pending:{user_id}"])
+                               f"lastst:{user_id}", f"pending:{user_id}", "fx_mode"])
         except Exception:
             pass
         # 📝 HELP DESK (Aarav 11:05 / 11:26 AM): /request <msg> (and /admin <msg> for normal users) → straight to admin;
@@ -5121,6 +5500,8 @@ def handle_private_message(message: Dict[str, Any]) -> None:
         action = prompt_action(message)
         extra = None
         pending = get_pending(user_id)
+        if pending and action is None and pending.get("a") in ("fxsticker", "fxdp") and fx_admin_input(message, user_id, pending):
+            return
         if pending and action is None and pending.get("a") in ("hdreply", "bcast"):
             if pending.get("a") == "hdreply":
                 hd_admin_reply(message, user_id, pending.get("x"))
@@ -5199,9 +5580,9 @@ def handle_private_message(message: Dict[str, Any]) -> None:
     if command == "/start":
         if is_subadmin(user_id):
             clear_pending(user_id)
-            send_welcome(chat_id, user, welcome_text(user, admin=True), admin_start_menu())
+            send_welcome(chat_id, user, welcome_text(user, admin=True), admin_start_menu(), fx="start")
             return
-        send_welcome(chat_id, user, welcome_text(user), user_menu())
+        send_welcome(chat_id, user, welcome_text(user), user_menu(), fx="start")
         return
     is_private = message.get("chat", {}).get("type") == "private"
     if command_name(text) == "/search":
@@ -5219,7 +5600,7 @@ def handle_private_message(message: Dict[str, Any]) -> None:
                 send_text(chat_id, SEARCH_PROMPT, None, "HTML")
                 return
             try:
-                smart_reply(chat_id, user, sq)
+                fx_search(chat_id, user, sq, message.get("message_id"))
             except Exception:
                 log_error("smart_reply")
                 send_text(chat_id, "Database abhi available nahi hai. Admin se setup check karne ko kahen.")
@@ -5273,7 +5654,7 @@ def handle_private_message(message: Dict[str, Any]) -> None:
     if is_private and not command:
         # Understand first (free), search second, AI only if needed.
         try:
-            smart_reply(chat_id, user, query)
+            fx_search(chat_id, user, query, message.get("message_id"))
         except Exception:
             log_error("smart_reply")
             send_text(chat_id, "Database abhi available nahi hai. Admin se setup check karne ko kahen.")
@@ -5588,13 +5969,14 @@ CALLBACK_PATTERNS = [
     r"ad:wl:[0-9a-f]{8}:(a|\d{1,2})", r"ad:uplpw:(go|no)",
     r"hd_new", r"hd_cancel", r"ad:(gatt|gbl|bc|bcy|bcn|bcgo)", r"ad:gb:\d+", r"ad:gr:\d+(:l)?",
     r"ad:(hr|hdn|hb|hub):\d+", r"sq:[yn]", r"ad:(som|sum)",
+    r"ad:fx(t|p|s|sd|sy|sn|dp|dy|dn)?",
 ]
 _CB_RE = re.compile("(?:" + ")|(?:".join(CALLBACK_PATTERNS) + ")")
 STALE_ADMIN = "🔄 Ye button purana hai, /admin dobara kholo"
 STALE_USER = "🔄 Ye button purana hai, /start dobara karo"
 CONFIRM_TTL = 3600      # an ✅ Accept older than this (message date) asks to start again
 OWNER_ONLY_CMDS = ("keys", "key", "rt", "bigfix", "addadm", "rmadm:", "y:keyrm:", "y:rmadm:", "y:rt", "ub", "y:ublogout", "y:ubdel", "y:ubdx",
-                   "wl:", "uplpw", "bc", "som", "sum")
+                   "wl:", "uplpw", "bc", "som", "sum", "fx")
 # toast shown at once for buttons whose screen needs a few lookups; quick screens just stop the spinner
 CB_TOASTS = [("ad:status", "⏳ Status check ho raha hai..."), ("ad:keychk", "🔄 Keys check ho rahi hain..."),
              ("ad:aitest", "⏳ AI test ho raha hai..."), ("ad:report", "⏳"), ("ad:users", "⏳"), ("ad:bkold", "💾 Backup chal raha hai..."),
@@ -5718,7 +6100,7 @@ def _handle_callback_body(query: Dict[str, Any], data: str, chat_id: Any, user_i
             elif chat_id:
                 send_welcome(chat_id, query.get("from") or {"id": user_id},
                              "✅ <b>Shukriya!</b> Ab aap bot use kar sakte ho 🎉\n\n" + welcome_text(query.get("from"), admin=admin),
-                             admin_start_menu() if admin else user_menu())
+                             admin_start_menu() if admin else user_menu(), fx="granted")
         else:
             names = ", ".join(str(c.get("title") or "Channel") for c in missing)
             alert = "❌ Abhi join nahi kiya! Pehle channel join karo, phir Verify dabao."
@@ -5736,6 +6118,9 @@ def _handle_callback_body(query: Dict[str, Any], data: str, chat_id: Any, user_i
                         pass
                 st.update({"mid": tapped, "t": time.time()})
                 gate_save(user_id, st)
+        return
+    if data.startswith("ad:fx") and chat_id and is_subadmin(user_id):
+        fx_admin_cb(query, data, chat_id, user_id)
         return
     if data in ("ad:som", "ad:sum") and chat_id and is_subadmin(user_id):
         key = "search_mode_owner" if data == "ad:som" else "search_mode_users"
@@ -7633,6 +8018,10 @@ def health() -> Any:
     status["webhook_registered"] = registered
     status["self_heal"] = heal
     status["ai_name_retry"] = names
+    try:
+        status["animations"] = dict({"mode": "on" if fx_on() else "off"}, **FX_STATS)
+    except Exception:
+        pass
     status["ms"] = int((time.monotonic() - t_health) * 1000)
     return jsonify({"ok": True, "service": "telegram-book-bot", "status": status})
 
@@ -7959,6 +8348,7 @@ def setup_status() -> Dict[str, Any]:
         "ai": ("on (" + ai_provider() + ")") if ai_provider() else "off",
         "ai_keys_in_bot": len(db_ai_keys()),
         "ai_naming": "on" if ai_naming_on() else "off",
+        "animations": dict({"mode": "on" if fx_on() else "off"}, **FX_STATS),
         "admin_commands": "on",
         "agent_mode": "on" if agent_on() else "off",
     }
@@ -8425,7 +8815,11 @@ def telegram_upload(method: str, fields: Dict[str, Any], file_field: str, filena
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"HTTP {exc.code}: upload failed") from None
+        try:
+            why = str(json.loads(exc.read().decode("utf-8", "replace")).get("description") or "")[:200]
+        except Exception:
+            why = ""
+        raise RuntimeError(f"HTTP {exc.code}: {why or 'upload failed'}") from None
 
 
 # ---- retry queue for files the AI could not name at save time (bot_settings "ainame_queue")
@@ -15045,19 +15439,22 @@ def hd_admin_reply(message: Dict[str, Any], admin_id: int, uid: Any) -> None:
         send_text(chat_id, "❌ User nahi mila.")
         return
     text = message.get("text") or ""
+    fx_arm("heart")                            # ✨ ❤️ effect on the admin's reply
     try:
         if text and not any(message.get(k) for k in ("photo", "document", "video", "audio", "voice", "animation", "sticker")):
-            telegram("sendMessage", {"chat_id": uid, "text": "💬 <b>Admin ka jawab:</b>\n\n" + esc(text[:3800]), "parse_mode": "HTML",
-                                     "reply_markup": {"inline_keyboard": [[{"text": "📝 Admin ko reply karo", "callback_data": "hd_new"}]]}})
+            tg_fx("sendMessage", {"chat_id": uid, "text": "💬 <b>Admin ka jawab:</b>\n\n" + esc(text[:3800]), "parse_mode": "HTML",
+                                  "reply_markup": {"inline_keyboard": [[{"text": "📝 Admin ko reply karo", "callback_data": "hd_new"}]]}})
         else:
-            telegram("sendMessage", {"chat_id": uid, "text": "💬 <b>Admin ka jawab:</b>", "parse_mode": "HTML"})
+            tg_fx("sendMessage", {"chat_id": uid, "text": "💬 <b>Admin ka jawab:</b>", "parse_mode": "HTML"})
             telegram("copyMessage", {"chat_id": uid, "from_chat_id": chat_id, "message_id": message.get("message_id"),
                                      "reply_markup": {"inline_keyboard": [[{"text": "📝 Admin ko reply karo", "callback_data": "hd_new"}]]}})
     except Exception as exc:
+        fx_disarm()
         low = str(exc).lower()
         why = "user ne bot block kar diya" if ("blocked" in low or "deactivated" in low or "forbidden" in low) else friendly_tg_error(exc)
         send_text(chat_id, f"❌ Jawab nahi gaya: {why}", {"inline_keyboard": [BACK_ROW]})
         return
+    fx_disarm()
     audit_log(f"↩️ Help desk jawab → {uid} · {actor_label(admin_id)}")
     send_text(chat_id, f"✅ Jawab bhej diya (user {uid}).", {"inline_keyboard": [BACK_ROW]})
 
@@ -15368,6 +15765,23 @@ def webdiag() -> Any:
         out["saved"] = True
         out["source_after"] = diag_source()
         return jsonify(out)
+    if op == "fx":         # ✨ animations: switch, counters, which sticker /start uses, Telegram's answer for each pack (read only)
+        packs = {}
+        for name in FX_STICKER_SETS:
+            try:
+                st = (telegram("getStickerSet", {"name": name}) or {}).get("result") or {}
+                ss = st.get("stickers") or []
+                packs[name] = {"stickers": len(ss), "animated": sum(1 for x in ss if x.get("is_animated") or x.get("is_video")),
+                               "emoji": "".join(str(x.get("emoji") or "") for x in ss[:12])}
+            except Exception as exc:
+                packs[name] = {"error": str(exc)[:120]}
+        own = get_setting("fx_sticker")
+        auto = get_setting("fx_sticker_auto") or ""
+        out.update({"mode": "on" if fx_on() else "off", "stats": FX_STATS, "packs": packs,
+                    "sticker": "own" if own and own != "off" else ("auto" if auto and not auto.startswith("none:") else
+                                                                   ("none" if auto else "not_picked_yet")),
+                    "effects": FX_EFFECTS})
+        return jsonify(out)
     if op == "gate":       # join-gate check: per join channel the bot's own status + chat facts; users with an open prompt
         chans = []
         reqs = required_channels()
@@ -15621,7 +16035,7 @@ AGENT_TOOLS: Dict[str, Dict[str, Any]] = {
     "button": {"k": "flow", "fn": "button", "d": "koi bhi admin button dabao; args.data = callback_data (Accept wale nahi)"},
 }
 # buttons that change something the moment they're tapped (no confirm screen of their own)
-AGENT_DIRECT_CHANGE = ("ad:ubpause", "ad:ubbfp", "ad:ubbfs:", "ad:smode", "ad:agent", "ad:ainame:on", "ad:ainame:off",
+AGENT_DIRECT_CHANGE = ("ad:fxt", "ad:ubpause", "ad:ubbfp", "ad:ubbfs:", "ad:smode", "ad:agent", "ad:ainame:on", "ad:ainame:off",
                        "ad:mkreq:", "ad:rtl:", "ad:rtos:", "ad:rtms:")
 AGENT_ON_RE = re.compile(r"\b(?:ai\s*)?agent\s*(?:mode)?\s*(?:on|chalu|start|shuru)\b")
 AGENT_PRONOUN_RE = re.compile(r"\b(usko|usse|use|uska|uski|uske|isko|ise|isse|iska|iski|iske|unko|inko|unka|inka|wo|vo|woh|voh|"
