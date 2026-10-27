@@ -822,7 +822,7 @@ def missing_required(user_id: Optional[int], channels: Optional[List[Dict[str, A
 
 
 # ---- 🔒 JOIN REQUESTS + bypass + gate event log (Aarav 11:07 AM Oct 27: "dono channel join kiye phir bhi nahi")
-JREQ_TTL = 14 * 86400
+JREQ_TTL = 86400            # a pending join request counts as joined for 1 day (approved → real member; declined → gone)
 _APPROVE_TRY: Dict[Any, float] = {}
 
 
@@ -831,7 +831,7 @@ def jreq_get(user_id: Optional[int]) -> Dict[str, Any]:
     if not user_id:
         return {}
     try:
-        d = json.loads(get_setting(f"jreq:{user_id}") or "{}")
+        d = json.loads(get_setting(f"jrq:{user_id}") or "{}")
         now = time.time()
         return {k: v for k, v in (d.items() if isinstance(d, dict) else []) if now - float(v or 0) < JREQ_TTL}
     except Exception:
@@ -845,7 +845,7 @@ def jreq_mark(user_id: int, chat_id: Any, on: bool = True) -> None:
     else:
         d.pop(str(chat_id), None)
     try:
-        set_setting(f"jreq:{user_id}", json.dumps(d, separators=(",", ":")))
+        set_setting(f"jrq:{user_id}", json.dumps(d, separators=(",", ":")))
     except Exception:
         log_error("jreq_mark")
 
@@ -867,16 +867,14 @@ def try_approve_join(user_id: int, chat_id: Any, force: bool = False) -> bool:
     try:
         telegram("approveChatJoinRequest", {"chat_id": chat_id, "user_id": int(user_id)})
         gate_event("approved", user_id, chat_id)
-        jreq_mark(int(user_id), chat_id)
         return True
     except Exception as exc:
         low = str(exc).lower()
         if "user_already_participant" in low or "already a participant" in low:
-            # Telegram's own join system says the user IS inside, even when getChatMember answers "left" (seen live
-            # Oct 27 for Aarav's account in both join channels) → trust it and remember it (cleared on a real leave).
-            gate_event("participant", user_id, chat_id)
-            jreq_mark(int(user_id), chat_id)
-            return True
+            # NOT proof of membership (Aarav 11:28 AM: a non-member got in through this). Only getChatMember, a
+            # chat_member join event or this user's own join request count.
+            gate_event("no_request", user_id, chat_id, "already_participant")
+            return False
         if "hide_requester_missing" not in low and "user not found" not in low:
             gate_event("approve_err", user_id, chat_id, re.sub(r"\d{6,}", "<id>", str(exc))[:80])
         return False
@@ -1192,12 +1190,32 @@ def handle_chat_member(cm: Dict[str, Any]) -> None:
         return
     status = new.get("status")
     if not (status in JOINED_STATUSES or (status == "restricted" and new.get("is_member"))):
-        if status in ("left", "kicked") and str(cid) in jreq_get(uid):
-            jreq_mark(uid, cid, on=False)       # a real leave: the remembered request/participant mark goes too
+        if status in ("left", "kicked"):
+            if str(cid) in jreq_get(uid):
+                jreq_mark(uid, cid, on=False)       # a real leave: a remembered join request goes too
             gate_event("leave", uid, cid, status)
+            gate_on_leave(uid, user, cid)
         return
     gate_event("join", uid, cid, status)
     gate_recheck(uid, user)
+
+
+def gate_on_leave(uid: int, user: Dict[str, Any], cid: int) -> None:
+    """Aarav 11:28 AM: a user who LEAVES a join channel is asked to join again at once (not only at their next
+    message): users who had passed the gate get the "aapne channel chhod diya" prompt (max once per 6 h each)."""
+    if is_subadmin(uid) or is_gate_bypass(uid) or not was_verified(uid):
+        return
+    key = f"gateleave:{uid}"
+    try:
+        if time.time() - float(get_setting(key) or 0) < 6 * 3600:
+            return
+        set_setting(key, str(int(time.time())))
+        reqs = required_channels()
+        missing = missing_required(uid, reqs, approve=False)
+        if missing:
+            send_join_gate(uid, missing, left=True, total=len(reqs), user_id=uid, user=user, trig=f"leave{cid}")
+    except Exception:
+        log_error("gate leave")
 
 
 def gate_recheck(uid: int, user: Dict[str, Any], chat_id: Any = None) -> None:
@@ -1207,7 +1225,7 @@ def gate_recheck(uid: int, user: Dict[str, Any], chat_id: Any = None) -> None:
         return
     chat_id = chat_id or uid
     try:
-        prefetch_settings([f"gate:{uid}", f"verified:{uid}", f"jreq:{uid}"])
+        prefetch_settings([f"gate:{uid}", f"verified:{uid}", f"jrq:{uid}"])
     except Exception:
         pass
     st = gate_state(uid)
@@ -1264,7 +1282,7 @@ def gate_blocks(user_id: Optional[int], chat_id: int, ask: Optional[Dict[str, An
     reqs = required_channels()
     if reqs and user_id:
         try:
-            prefetch_settings([f"verified:{user_id}", f"gate:{user_id}", f"jreq:{user_id}", f"lastw:{user_id}"])   # one read
+            prefetch_settings([f"verified:{user_id}", f"gate:{user_id}", f"jrq:{user_id}", f"lastw:{user_id}"])   # one read
         except Exception:
             pass
     missing = missing_required(user_id, reqs) if reqs else []
