@@ -3962,6 +3962,8 @@ ADMIN_MENU = USER_MENU + [
     {"command": "rename", "description": "Admin: file ka naam badlo"},
     {"command": "files", "description": "Admin: saari files (10-10 page)"},
     {"command": "logs", "description": "Owner: update log (nayi file, naam badla, kisne li)"},
+    {"command": "link", "description": "Owner: link se file add (Drive, PDF link, webpage…)"},
+    {"command": "upload", "description": "Owner: phone se upload page (link + password)"},
     {"command": "addadmin", "description": "Owner: sub-admin jodo"},
     {"command": "removeadmin", "description": "Owner: sub-admin hatao"},
     {"command": "cancel", "description": "Admin: chal raha kaam cancel"},
@@ -4245,6 +4247,9 @@ def handle_private_message(message: Dict[str, Any]) -> None:
     if message.get("chat_shared") and is_subadmin(user_id):
         kb_clear(chat_id, user_id, force=True)   # a pick with no open step: just take the keyboard away
         return
+    if web_wants_links(user_id, message):
+        web_handle_links(chat_id, user_id, text)  # 🔗 owner sent file link(s): download → Inbox pipeline
+        return
 
     if gate_blocks(user_id, chat_id):
         return
@@ -4392,7 +4397,19 @@ def handle_admin_command(message: Dict[str, Any]) -> None:
             log_error(f"admin command {command}")
         send_text(chat_id, f"❌ Nahi hua: {str(exc)[:300]}")
 
-    if command in {"/admin", "/panel", "/menu"}:
+    if command in {"/link", "/upload", "/uploadpass"} and not is_owner(user_id):
+        send_text(chat_id, "Ye sirf owner ke liye hai.")
+    elif command == "/link":
+        web_handle_links(chat_id, user_id, arg)
+    elif command == "/upload":
+        if not upl_ready():
+            upl_set_password(upl_new_password())
+        send_text(chat_id, upl_bot_text(), None, "HTML")
+    elif command == "/uploadpass":
+        send_text(chat_id, "🔑 Upload page ka naya password banau? Purana password aur purane login band ho jayenge.",
+                  {"inline_keyboard": [[{"text": "✅ Haan, naya banao", "callback_data": "ad:uplpw:go"},
+                                        {"text": "❌ Nahi", "callback_data": "ad:uplpw:no"}]]})
+    elif command in {"/admin", "/panel", "/menu"}:
         send_text(chat_id, ADMIN_PANEL_TEXT, admin_menu(user_id), "HTML")
     elif command == "/cancel":
         send_text(chat_id, "✅ Cancel ho gaya.", admin_menu(user_id))
@@ -4602,12 +4619,14 @@ CALLBACK_PATTERNS = [
     r"ad:(ub|ublogin|ubrun|ubpause|ubbf|ubbfp|ubrv|ubsetin|ubsetal)", r"ad:ubbfs:-?\d+", r"ad:ubrv:\d+", r"ad:ubrf:\d+",
     r"ad:ubst:[a-z]+", r"ad:ubdl:[a-z]+",
     r"ad:y:(rtl:[a-z]|rtos:[a-z]*|rtms:[a-z]:(a|\d+))", r"ad:agent",
+    r"ad:wl:[0-9a-f]{8}:(a|\d{1,2})", r"ad:uplpw:(go|no)",
 ]
 _CB_RE = re.compile("(?:" + ")|(?:".join(CALLBACK_PATTERNS) + ")")
 STALE_ADMIN = "🔄 Ye button purana hai, /admin dobara kholo"
 STALE_USER = "🔄 Ye button purana hai, /start dobara karo"
 CONFIRM_TTL = 3600      # an ✅ Accept older than this (message date) asks to start again
-OWNER_ONLY_CMDS = ("keys", "key", "rt", "bigfix", "addadm", "rmadm:", "y:keyrm:", "y:rmadm:", "y:rt", "ub", "y:ublogout", "y:ubdel", "y:ubdx")
+OWNER_ONLY_CMDS = ("keys", "key", "rt", "bigfix", "addadm", "rmadm:", "y:keyrm:", "y:rmadm:", "y:rt", "ub", "y:ublogout", "y:ubdel", "y:ubdx",
+                   "wl:", "uplpw")
 # toast shown at once for buttons whose screen needs a few lookups; quick screens just stop the spinner
 CB_TOASTS = [("ad:status", "⏳ Status check ho raha hai..."), ("ad:keychk", "🔄 Keys check ho rahi hain..."),
              ("ad:aitest", "⏳ AI test ho raha hai..."), ("ad:report", "⏳"), ("ad:users", "⏳"), ("ad:bkold", "💾 Backup chal raha hai..."),
@@ -4690,6 +4709,16 @@ def handle_callback(query: Dict[str, Any]) -> None:
 
 
 def _handle_callback_body(query: Dict[str, Any], data: str, chat_id: Any, user_id: Any) -> None:
+    if data.startswith("ad:wl:"):
+        web_choose_tap(query, chat_id, user_id, data)      # 🌐 webpage file picker
+        return
+    if data.startswith("ad:uplpw:"):
+        if data.endswith(":go"):
+            show(chat_id, "🔑 Naya password bana raha hoon…", None, query)
+            upl_pass_reset(chat_id)
+        else:
+            show(chat_id, "👍 Theek hai, password wahi rahega.", None, query)
+        return
     if data == "verify_join":
         admin = is_subadmin(user_id)
         reqs = [] if admin else required_channels()
@@ -6519,7 +6548,8 @@ def health() -> Any:
     _REQ.clear()
     try:
         # the settings the keepalive work below reads, in one round trip
-        prefetch_settings(["webhook_fp", "commands_fp", "ainame_queue", "logfill_state", BIG_QUEUE_KEY, ROUTER_KEY, "ai_keys"])
+        prefetch_settings(["webhook_fp", "commands_fp", "ainame_queue", "logfill_state", BIG_QUEUE_KEY, ROUTER_KEY, "ai_keys",
+                           "webq", "webbigq", "upl:bucket", "upl:sweep", "upl:pw", "webbig_kick"])
     except Exception:
         pass
     if BOT_TOKEN:
@@ -6550,6 +6580,10 @@ def health() -> Any:
                 logfill_kick()
     except Exception:
         log_error("logfill keepalive")
+    try:
+        web_keepalive()        # 🌐 link jobs left behind / old upload temp files
+    except Exception:
+        log_error("web keepalive")
     _REQ.clear()
     if request.args.get("full") == "1":
         status = setup_status()     # every table, channel, AI key and diagnostics check (slow: ~15–20 s)
@@ -6580,7 +6614,8 @@ def light_status() -> Dict[str, Any]:
                                        "boot_ms": _BOOT_MS[0], "http_conns": dict(_POOL_STATS)}}
     if SUPABASE_URL and SUPABASE_KEY:
         try:
-            prefetch_settings([ROUTER_KEY, "ai_keys", BIG_QUEUE_KEY, "ai_naming", "ub:sess", "ub:state", "ub:paused", "ub:login"])
+            prefetch_settings([ROUTER_KEY, "ai_keys", BIG_QUEUE_KEY, "ai_naming", "ub:sess", "ub:state", "ub:paused", "ub:login",
+                               "webq", "webbigq", "upl:pw", "upl:bucket"])
             supabase("bot_settings", "GET", query="?select=key&limit=1")
             st["database"] = "ok"
         except Exception as exc:
@@ -6606,6 +6641,10 @@ def light_status() -> Dict[str, Any]:
         st["userbot_info"] = _ubi
     except Exception:
         log_error("userbot status")
+    try:
+        st["web_files"] = web_status()           # 🌐 link se file + ⬆️ upload page
+    except Exception:
+        log_error("web status")
     return st
 
 
@@ -6953,6 +6992,9 @@ def download_file(file_id: Optional[str], file_size: Optional[int]) -> Optional[
     """The file's bytes (≤20 MB, Telegram's limit for bots); None when bigger / unavailable."""
     if not file_id or not BOT_TOKEN or (file_size and int(file_size) > TG_FILE_LIMIT):
         return None
+    hit = (_REQ.get("prefetch") or {}).get(str(file_id))
+    if hit:
+        return hit           # 🌐 web file: the bytes we just uploaded (no second download)
     try:
         path = (telegram("getFile", {"file_id": file_id}).get("result") or {}).get("file_path")
         if not path:
@@ -7141,7 +7183,8 @@ def safe_filename(title: str, orig: str) -> str:
     return base + ext
 
 
-def telegram_upload(method: str, fields: Dict[str, Any], file_field: str, filename: str, data: bytes) -> Dict[str, Any]:
+def telegram_upload(method: str, fields: Dict[str, Any], file_field: str, filename: str, data: bytes,
+                    timeout: float = 12) -> Dict[str, Any]:
     """multipart/form-data upload (used to store the backup copy under its clean file name)."""
     boundary = "----filesbull" + hashlib.sha1(os.urandom(8)).hexdigest()
     parts: List[bytes] = []
@@ -7159,7 +7202,7 @@ def telegram_upload(method: str, fields: Dict[str, Any], file_field: str, filena
     req = urllib.request.Request(f"{TG_API}/{method}", data=b"".join(parts), method="POST",
                                  headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
     try:
-        with urllib.request.urlopen(req, timeout=12) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         raise RuntimeError(f"HTTP {exc.code}: upload failed") from None
@@ -9523,6 +9566,10 @@ def bigfile_job_api() -> Any:
                                                   [r.get("source_chat_id"), r.get("source_message_id")]) if x[0] and x[1]],
                              "to": target, "try": j["tries"]})
         bigq_save(q)
+    try:
+        jobs_out += webbig_claim(claims)      # 🌐 big web links: download the URL, upload into the Inbox
+    except Exception:
+        log_error("webbig claim")
     out: Dict[str, Any] = {"ok": True, "jobs": jobs_out}
     if jobs_out:
         creds: Dict[str, Any] = {}
@@ -9563,6 +9610,23 @@ def bigfile_done_api() -> Any:
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     _REQ.clear()
     _LOG_QUEUE.clear()
+    wq = webq_load(WEB_BIG_KEY)
+    wjob = next((j for j in wq if j.get("j") == jid), None)
+    if wjob:
+        if wjob.get("st") != "running":
+            return jsonify({"ok": True, "ignored": wjob.get("st")})
+        _REQ_T0[0] = time.monotonic()
+        try:
+            res = webbig_done(wjob, body)
+        except Exception:
+            log_error("webbig done")
+            webbig_fail(wjob, "bot me save nahi hua")
+            res = {"ok": True, "state": wjob.get("st")}
+        webq_save(wq, WEB_BIG_KEY)
+        if wjob.get("st") == "pending":
+            res["retry"] = bigfile_dispatch("web")
+        flush_request()
+        return jsonify(res)
     q = bigq_load()
     job = next((j for j in q if j.get("j") == jid), None)
     if not job:
@@ -10475,7 +10539,9 @@ def ub_catalog(record: Dict[str, Any], where: str) -> str:
         how = "fallback"
     record.pop("_bytes", None)
     record.pop("_text", None)
-    slug = record.pop("_cat", None) or "other"
+    forced = record.pop("_force_cat", None)          # ⬆️ upload page: the owner picked the category
+    slug = forced or record.pop("_cat", None) or "other"
+    record.pop("_cat", None)
     reason = ub_review_reason(record, how, slug)
     record.pop("_retry", None)
     record.pop("_pages", None)
@@ -11868,45 +11934,1621 @@ def webhook() -> Any:
     return jsonify({"ok": True})
 
 
-# ================================================================ 🌐 web-file platform probe (temporary, diag token only)
-@app.get("/api/webdiag")
-def webdiag_probe() -> Any:
-    tok = request.args.get("t", "")
-    if not tok or not hmac.compare_digest(hashlib.sha256(tok.encode()).hexdigest(), DIAG_TOKEN_SHA256):
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-    op = request.args.get("op", "")
-    out: Dict[str, Any] = {"ok": True, "op": op}
-    if op == "sleep":
-        n = min(int(request.args.get("n", "5") or 5), 280)
-        tag = re.sub(r"[^a-z0-9]", "", request.args.get("tag", "x"))[:12] or "x"
-        set_setting("webdiag:" + tag, json.dumps({"start": int(time.time()), "n": n}))
-        t0 = time.monotonic()
-        while time.monotonic() - t0 < n:
-            time.sleep(1)
-            if int(time.monotonic() - t0) % 10 == 0:
-                set_setting("webdiag:" + tag, json.dumps({"start": int(time.time() - (time.monotonic() - t0)), "n": n,
-                                                          "alive": int(time.monotonic() - t0)}))
-        set_setting("webdiag:" + tag, json.dumps({"start": int(time.time() - n), "n": n, "end": int(time.time())}))
-        out["slept"] = n
-    elif op == "read":
-        tag = re.sub(r"[^a-z0-9]", "", request.args.get("tag", "x"))[:12] or "x"
-        out["v"] = get_setting("webdiag:" + tag)
-    elif op == "storage":
-        hdr = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+# ================================================================ 🌐 WEB FILES (Aarav 9:02 AM Oct 27 2026: "dono ke do")
+# 1) 🔗 LINK SE FILE — the OWNER (ADMIN_USER_IDS) sends any file link in the bot chat (or /link <url>, many links in one
+#    message): the bot downloads it server-side and puts it into the SAME pipeline as userbot files: upload into the
+#    📥 Inbox storage → ub_catalog (same dedupe, AI naming, category, ❓ review) → settle into Backup. Share links are
+#    turned into the real file: Google Drive file / folder / Docs-Sheets-Slides (PDF export), Dropbox, OneDrive,
+#    MediaFire, GitHub, public t.me post links; a normal web page is scanned for file links (one → added, many →
+#    buttons). Scribd-type paid document sites and anything behind a login / paywall / DRM are refused (no logins,
+#    no bypass). SSRF-safe: every hop is resolved and must be a public IP; the socket is pinned to that IP.
+#    ≤ WEB_INLINE_MAX: done here (Bot API upload ≤ 50 MB); bigger: the MTProto GitHub Action (bigfile workflow)
+#    downloads the link and uploads it into the Inbox (≤ 1.9 GB).
+# 2) ⬆️ UPLOAD PAGE — /upload, password (hash + encrypted copy in bot_settings "upl:pw"; env UPLOAD_PASSWORD overrides)
+#    or a one-time bot link (/upload). Browser → signed upload straight into a private Supabase Storage bucket (Vercel's
+#    4.5 MB body limit never applies) → /upload/api/done → the same Inbox pipeline → the temp copy is deleted.
+#    Wrong passwords: 5 per IP / 15 min, 20 in total / hour → locked (Log Chat told once an hour).
+import ipaddress as _ipa
+import socket as _socket
+import ssl as _ssl
+
+WEB_INLINE_MAX = int(os.environ.get("WEB_INLINE_MAX_MB", "49") or 49) * 1024 * 1024
+WEB_MAX = 1900 * 1024 * 1024
+UPLOAD_MAX = 50 * 1024 * 1024
+WEB_Q_KEY = "webq"
+WEB_BIG_KEY = "webbigq"
+WEB_BUCKET = "filesbull-uploads"
+WEB_DL_DEADLINE = 150.0
+WEB_WORKER_BUDGET = 200.0
+WEB_MAX_LINKS = 10
+WEB_FOLDER_MAX = 50
+WEB_PORTS = {80, 443, 8080, 8443}
+WEB_UA = ("Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) "
+          "Chrome/126.0 Mobile Safari/537.36 filesbull-bot")
+WEB_DOC_EXTS = (".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".zip", ".rar", ".7z", ".epub", ".txt",
+                ".rtf", ".odt", ".csv")
+WEB_IMG_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif")
+WEB_EXTS = WEB_DOC_EXTS + WEB_IMG_EXTS
+WEB_MIME_EXT = {
+    "application/pdf": ".pdf", "application/x-pdf": ".pdf", "application/msword": ".doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/vnd.ms-excel": ".xls", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    "application/vnd.ms-powerpoint": ".ppt",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+    "application/zip": ".zip", "application/x-zip-compressed": ".zip", "application/x-rar-compressed": ".rar",
+    "application/vnd.rar": ".rar", "application/x-rar": ".rar", "application/x-7z-compressed": ".7z",
+    "application/epub+zip": ".epub", "text/plain": ".txt", "application/rtf": ".rtf", "text/rtf": ".rtf",
+    "application/vnd.oasis.opendocument.text": ".odt", "text/csv": ".csv",
+    "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "image/gif": ".gif"}
+WEB_PAID_HOSTS = ("scribd.com", "everand.com", "slideshare.net", "slideshare.com", "scribdassets.com", "coursehero.com",
+                  "studocu.com", "chegg.com", "issuu.com", "docsity.com", "perlego.com", "bartleby.com", "academia.edu",
+                  "kopykitab.com", "dokumen.pub", "pdfdrive.com", "z-lib.org", "z-library.sk", "libgen.is", "libgen.rs",
+                  "annas-archive.org")
+WEB_TG_HOSTS = ("t.me", "telegram.me", "telegram.dog")
+WEB_PAID_TEXT = ("🙏 Ye Scribd jaisi paid / premium document site ka link hai. Wahan ki files dusre logon ki copyright wali "
+                 "hoti hain — inhe bot me add nahi kar sakte (na login, na paywall bypass).\n"
+                 "✅ Free govt PDF, apne notes ya jinki permission ho — unka link bhejo.")
+_WEB_URL_RE = re.compile(r"https?://[^\s<>\"'`]+", re.I)
+_WEB_TG_POST_RE = re.compile(r"^https?://(?:t\.me|telegram\.me|telegram\.dog)/(?:s/)?([A-Za-z][A-Za-z0-9_]{3,})/(\d+)(?:[/?#].*)?$", re.I)
+_WEB_OUT: List[str] = []           # diag: replies collected instead of sent (chat None)
+
+
+class WebErr(Exception):
+    """A link problem with a friendly Hinglish reason for the owner."""
+
+
+def web_host_of(url: str) -> str:
+    try:
+        return (urllib.parse.urlsplit(url).hostname or "").lower().rstrip(".")
+    except Exception:
+        return ""
+
+
+def _host_in(host: str, roots: tuple) -> bool:
+    return any(host == r or host.endswith("." + r) for r in roots)
+
+
+def web_is_paid(url: str) -> bool:
+    return _host_in(web_host_of(url), WEB_PAID_HOSTS)
+
+
+def web_link_urls(text: str) -> List[str]:
+    """File links in an owner message: every http(s) URL except Telegram chat/invite links (those stay with the old
+    source/join features); a public t.me post link (t.me/<channel>/<n>) IS a file link."""
+    out: List[str] = []
+    for m in _WEB_URL_RE.finditer(text or ""):
+        u = m.group(0).rstrip(").,;:!?»”’]}>")
+        if _host_in(web_host_of(u), WEB_TG_HOSTS) and not _WEB_TG_POST_RE.match(u):
+            continue
+        if u not in out:
+            out.append(u)
+    return out
+
+
+def web_wants_links(user_id: Any, message: Dict[str, Any]) -> bool:
+    """Owner, private chat, plain text with at least one file link (not a forward / file / pick / command)."""
+    if not is_admin(user_id) or (message.get("chat") or {}).get("type") != "private":
+        return False
+    if file_info(message) or message.get("chat_shared") or forwarded_source(message):
+        return False
+    text = (message.get("text") or "").strip()
+    if command_name(text):
+        return False
+    return bool(web_link_urls(text))
+
+
+# ---- SSRF-safe fetching: every hop resolved, every address must be public, the socket is pinned to that address
+def web_ip_ok(ip: str) -> bool:
+    try:
+        a = _ipa.ip_address(str(ip).split("%")[0])
+    except ValueError:
+        return False
+    if isinstance(a, _ipa.IPv6Address) and a.ipv4_mapped:
+        a = a.ipv4_mapped
+    return bool(a.is_global) and not (a.is_private or a.is_loopback or a.is_link_local or a.is_multicast or
+                                      a.is_reserved or a.is_unspecified)
+
+
+WEB_GETADDRINFO = [_socket.getaddrinfo]
+
+
+def web_resolve(host: str, port: int) -> str:
+    if not host:
+        raise WebErr("❌ Link sahi nahi hai.")
+    low = host.lower()
+    if low == "localhost" or low.endswith((".local", ".internal", ".localhost", ".lan", ".home", ".corp")):
+        raise WebErr("🚫 Ye link private/local network ka hai — isse file nahi le sakta.")
+    try:
+        infos = WEB_GETADDRINFO[0](host, port, 0, _socket.SOCK_STREAM)
+    except Exception:
+        raise WebErr("❌ Ye website mili nahi (link ka naam check karo).") from None
+    ips = [i[4][0] for i in infos]
+    if not ips or not all(web_ip_ok(ip) for ip in ips):
+        raise WebErr("🚫 Ye link private/local network ka hai — isse file nahi le sakta.")
+    v4 = [ip for ip in ips if ":" not in ip]
+    return (v4 or ips)[0]
+
+
+class _PinnedHTTPS(http.client.HTTPSConnection):
+    def __init__(self, host: str, ip: str, port: int, timeout: float) -> None:
+        super().__init__(host, port, timeout=timeout, context=_ssl.create_default_context())
+        self._pin = ip
+
+    def connect(self) -> None:
+        sock = _socket.create_connection((self._pin, self.port), self.timeout)
+        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+
+
+class _PinnedHTTP(http.client.HTTPConnection):
+    def __init__(self, host: str, ip: str, port: int, timeout: float) -> None:
+        super().__init__(host, port, timeout=timeout)
+        self._pin = ip
+
+    def connect(self) -> None:
+        self.sock = _socket.create_connection((self._pin, self.port), self.timeout)
+
+
+def _web_open_real(url: str, timeout: float = 25.0, headers: Optional[Dict[str, str]] = None) -> tuple:
+    """GET with manual redirects (max 7), every hop checked. Returns (response, connection, final url)."""
+    for _hop in range(8):
+        u = urllib.parse.urlsplit(url)
+        if u.scheme not in ("http", "https"):
+            raise WebErr("❌ Sirf http/https link chalega.")
+        if u.username or u.password:
+            raise WebErr("🔒 Link me login/password hai — public link bhejo.")
+        if web_is_paid(url):
+            raise WebErr(WEB_PAID_TEXT)
         try:
-            b = http_json(f"{SUPABASE_URL}/storage/v1/bucket", "GET", None, hdr)
-            out["buckets"] = [{"id": x.get("id"), "public": x.get("public"), "limit": x.get("file_size_limit")} for x in (b or [])]
-        except Exception as exc:
-            out["buckets_err"] = str(exc)[:200]
-        out["mem_mb"] = None
+            port = u.port or (443 if u.scheme == "https" else 80)
+        except ValueError:
+            raise WebErr("❌ Link sahi nahi hai.") from None
+        if port not in WEB_PORTS:
+            raise WebErr("🚫 Is port wala link allowed nahi.")
+        ip = web_resolve(u.hostname or "", port)
+        conn = (_PinnedHTTPS if u.scheme == "https" else _PinnedHTTP)(u.hostname or "", ip, port, timeout)
+        path = (u.path or "/") + ("?" + u.query if u.query else "")
+        h = {"User-Agent": WEB_UA, "Accept": "*/*", "Accept-Language": "en-IN,en;q=0.9,hi;q=0.8", "Connection": "close"}
+        h.update(headers or {})
         try:
-            import resource
-            out["mem_mb"] = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024)
+            conn.request("GET", path, headers=h)
+            resp = conn.getresponse()
+        except (_socket.timeout, TimeoutError):
+            conn.close()
+            raise WebErr("⏳ Website ne time pe jawab nahi diya. Thodi der baad dobara bhejo.") from None
+        except _ssl.SSLError:
+            conn.close()
+            raise WebErr("🔒 Website ka SSL/HTTPS kharab hai — file nahi le paya.") from None
+        except Exception:
+            conn.close()
+            raise WebErr("❌ Website se connect nahi ho paya. Link check karke dobara bhejo.") from None
+        if resp.status in (301, 302, 303, 307, 308) and resp.getheader("Location"):
+            nxt = urllib.parse.urljoin(url, resp.getheader("Location").strip())
+            resp.close()
+            conn.close()
+            url = nxt
+            continue
+        return resp, conn, url
+    raise WebErr("❌ Link bahut baar redirect ho raha hai — direct link bhejo.")
+
+
+WEB_OPEN = [_web_open_real]       # harness hook
+
+
+def web_login_url(url: str) -> bool:
+    low = (url or "").lower()
+    return any(x in low for x in ("accounts.google.com/", "servicelogin", "/login", "/signin", "/sign-in",
+                                  "login.microsoftonline.com", "login.live.com", "/account/login"))
+
+
+def web_status_error(status: int, final: str) -> Optional[str]:
+    if 200 <= status < 300:
+        return None
+    if status in (401, 403):
+        if "google" in final:
+            return "🔒 File public nahi hai — Drive me sharing \"Anyone with the link\" karo, phir link bhejo."
+        return "🔒 Website ne file dene se mana kiya (login/permission chahiye). Public link bhejo."
+    if status in (404, 410):
+        return "❌ Is link pe file nahi mili (404). Link check karo."
+    if status == 429:
+        return "⏳ Website abhi busy hai (bahut requests). Thodi der baad dobara bhejo."
+    if status >= 500:
+        return f"❌ Website ki taraf se error ({status}). Thodi der baad dobara try karo."
+    return f"❌ Website ne file nahi di (HTTP {status})."
+
+
+def web_cd_name(cd: str) -> str:
+    cd = cd or ""
+    m = re.search(r"filename\*\s*=\s*([\w-]+)''([^;]+)", cd, re.I)
+    if m:
+        try:
+            return urllib.parse.unquote(m.group(2).strip().strip('"'), encoding=m.group(1) or "utf-8")
         except Exception:
             pass
-        import shutil as _sh
-        out["tmp_free_mb"] = int(_sh.disk_usage("/tmp").free / 1048576)
-        out["region"] = os.environ.get("VERCEL_REGION")
+    m = re.search(r'filename\s*=\s*"([^"]+)"', cd, re.I) or re.search(r"filename\s*=\s*([^;]+)", cd, re.I)
+    if m:
+        v = m.group(1).strip()
+        try:
+            v = v.encode("latin-1").decode("utf-8")
+        except Exception:
+            pass
+        return v
+    return ""
+
+
+def web_url_name(url: str) -> str:
+    try:
+        p = urllib.parse.urlsplit(url).path
+        return urllib.parse.unquote(p.rstrip("/").rsplit("/", 1)[-1])
+    except Exception:
+        return ""
+
+
+def web_sniff_ext(head: bytes) -> str:
+    sigs = ((b"%PDF", ".pdf"), (b"PK\x03\x04", ".zip"), (b"Rar!", ".rar"), (b"7z\xbc\xaf\x27\x1c", ".7z"),
+            (b"\xff\xd8\xff", ".jpg"), (b"\x89PNG", ".png"), (b"GIF8", ".gif"), (b"\xd0\xcf\x11\xe0", ".doc"),
+            (b"{\\rtf", ".rtf"))
+    for sig, ext in sigs:
+        if head.startswith(sig):
+            return ext
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return ".webp"
+    return ""
+
+
+def web_looks_html(head: bytes, ctype: str) -> bool:
+    if ctype in ("text/html", "application/xhtml+xml"):
+        return True
+    h = head[:600].lstrip().lower()
+    return h.startswith((b"<!doctype html", b"<html", b"<head")) or (h.startswith(b"<?xml") and b"<html" in head[:4000].lower())
+
+
+def web_fix_name(name: str, ctype: str, head: bytes) -> str:
+    name = re.sub(r"[\\/:*?\"<>|\r\n\t]+", " ", str(name or "")).strip()[:150]
+    ext = os.path.splitext(name)[1].lower()
+    real = web_sniff_ext(head) or WEB_MIME_EXT.get(ctype, "")
+    if ext in WEB_EXTS:
+        if real == ".zip" and ext in (".docx", ".xlsx", ".pptx", ".epub", ".odt"):
+            return name
+        if real == ".doc" and ext in (".xls", ".ppt"):
+            return name
+        if real == ".jpg" and ext == ".jpeg":
+            return name
+        if real and real != ext and head:
+            return os.path.splitext(name)[0] + real
+        return name
+    if real:
+        return (name or "file") + real
+    return name
+
+
+def web_probe(url: str, cap: int, deadline: float = WEB_DL_DEADLINE) -> Dict[str, Any]:
+    """Fetch a link → {kind: file|html|big, ...}; WebErr with the reason otherwise.
+    big = bigger than cap (or too slow): the rest of the body is NOT read, the GitHub Action takes it."""
+    t0 = time.monotonic()
+    resp, conn, final = WEB_OPEN[0](url)
+    try:
+        if final != url and web_login_url(final):
+            if "google." in web_host_of(final):
+                raise WebErr("🔒 File public nahi hai — Drive me sharing \"Anyone with the link\" karo, phir link bhejo.")
+            raise WebErr("🔒 Ye link login maang raha hai — sirf public link chalega (login/paywall bypass nahi karte).")
+        err = web_status_error(resp.status, final)
+        if err:
+            raise WebErr(err)
+        ctype = (resp.getheader("Content-Type") or "").split(";")[0].strip().lower()
+        try:
+            clen = int(resp.getheader("Content-Length") or 0)
+        except ValueError:
+            clen = 0
+        name = web_cd_name(resp.getheader("Content-Disposition") or "") or web_url_name(final) or web_url_name(url)
+        if ctype in ("text/html", "application/xhtml+xml"):
+            raw = resp.read(2_000_000)
+            return {"kind": "html", "html": raw.decode("utf-8", "replace"), "final": final, "ctype": ctype}
+        if clen and clen > WEB_MAX:
+            raise WebErr(f"❌ File bahut badi hai ({human_size(clen)}). Limit {human_size(WEB_MAX)} hai.")
+        if clen and clen > cap:
+            return {"kind": "big", "size": clen, "name": web_fix_name(name, ctype, b""), "final": final, "ctype": ctype}
+        chunks: List[bytes] = []
+        got = 0
+        while True:
+            try:
+                piece = resp.read(262144)
+            except (_socket.timeout, TimeoutError):
+                raise WebErr("⏳ Download beech me ruk gaya (website slow hai). Thodi der baad dobara bhejo.") from None
+            except Exception:
+                raise WebErr("❌ Download beech me toot gaya. Dobara bhejo.") from None
+            if not piece:
+                break
+            chunks.append(piece)
+            got += len(piece)
+            if got > cap or time.monotonic() - t0 > deadline:
+                return {"kind": "big", "size": max(got, clen), "name": web_fix_name(name, ctype, chunks[0][:64]),
+                        "final": final, "ctype": ctype, "why": "size" if got > cap else "slow"}
+        data = b"".join(chunks)
+        if not data:
+            raise WebErr("❌ Link se khali file aayi.")
+        if clen and len(data) < clen:
+            raise WebErr("❌ Download adhoora aaya. Dobara bhejo.")
+        if web_looks_html(data[:5000], ctype):
+            return {"kind": "html", "html": data[:2_000_000].decode("utf-8", "replace"), "final": final, "ctype": "text/html"}
+        name = web_fix_name(name, ctype, data[:64])
+        if os.path.splitext(name)[1].lower() not in WEB_EXTS:
+            raise WebErr("❌ Ye file type support nahi hai. PDF, Word, PPT, Excel, ZIP/RAR, EPUB, TXT ya photo (JPG/PNG) bhejo.")
+        return {"kind": "file", "data": data, "name": name, "ctype": ctype, "size": len(data), "final": final}
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+        conn.close()
+
+
+# ---- share links → the real file link
+def web_drive_id(url: str) -> Optional[str]:
+    m = re.search(r"/file/d/([A-Za-z0-9_-]{10,})", url) or re.search(r"[?&]id=([A-Za-z0-9_-]{10,})", url)
+    return m.group(1) if m else None
+
+
+def web_rewrite(url: str) -> Dict[str, Any]:
+    """What the link really is: {kind: file|folder|tgpost|mega|paid|page, url, ...}."""
+    host = web_host_of(url)
+    if web_is_paid(url):
+        return {"kind": "paid", "url": url}
+    if _host_in(host, ("mega.nz", "mega.co.nz", "mega.io")):
+        return {"kind": "mega", "url": url}
+    m = _WEB_TG_POST_RE.match(url)
+    if m:
+        return {"kind": "tgpost", "url": url, "chat": "@" + m.group(1), "msg": int(m.group(2))}
+    if host in ("drive.google.com", "docs.google.com", "drive.usercontent.google.com"):
+        fm = re.search(r"/folders/([A-Za-z0-9_-]{10,})", url) or re.search(r"embeddedfolderview\?id=([A-Za-z0-9_-]{10,})", url)
+        if fm:
+            return {"kind": "folder", "url": url, "id": fm.group(1)}
+        dm = re.search(r"docs\.google\.com/(document|spreadsheets|presentation)/(?:u/\d+/)?d/([A-Za-z0-9_-]{10,})", url)
+        if dm:
+            kind, did = dm.group(1), dm.group(2)
+            exp = {"document": f"https://docs.google.com/document/d/{did}/export?format=pdf",
+                   "spreadsheets": f"https://docs.google.com/spreadsheets/d/{did}/export?format=pdf",
+                   "presentation": f"https://docs.google.com/presentation/d/{did}/export/pdf"}[kind]
+            return {"kind": "file", "url": exp, "drive": did, "gdoc": kind}
+        fid = web_drive_id(url)
+        if fid:
+            return {"kind": "file", "url": f"https://drive.usercontent.google.com/download?id={fid}&export=download&confirm=t",
+                    "drive": fid}
+    if _host_in(host, ("dropbox.com",)) and ("/s/" in url or "/scl/" in url):
+        u = re.sub(r"([?&])dl=0", r"\1dl=1", url)
+        if "dl=1" not in u:
+            u += ("&" if "?" in u else "?") + "dl=1"
+        return {"kind": "file", "url": u}
+    if host == "1drv.ms" or _host_in(host, ("onedrive.live.com",)):
+        enc = base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
+        return {"kind": "file", "url": f"https://api.onedrive.com/v1.0/shares/u!{enc}/root/content"}
+    if _host_in(host, ("sharepoint.com",)) and "download=1" not in url:
+        return {"kind": "file", "url": url + ("&" if "?" in url else "?") + "download=1"}
+    if host == "github.com":
+        gm = re.match(r"https?://github\.com/([^/]+)/([^/]+)/(?:blob|raw)/(.+)$", url)
+        if gm:
+            return {"kind": "file", "url": f"https://raw.githubusercontent.com/{gm.group(1)}/{gm.group(2)}/{gm.group(3)}"}
+    return {"kind": "page", "url": url}
+
+
+def web_drive_confirm(html_text: str) -> Optional[str]:
+    """Google's "can't scan this file for viruses" page: its Download form rebuilt as a URL."""
+    fm = re.search(r'<form[^>]+id="download-form"[^>]+action="([^"]+)"(.*?)</form>', html_text, re.S)
+    if not fm:
+        return None
+    fields = dict(re.findall(r'<input[^>]+name="([^"]+)"[^>]+value="([^"]*)"', fm.group(2)))
+    if not fields.get("id"):
+        return None
+    return html.unescape(fm.group(1)) + "?" + urllib.parse.urlencode(fields)
+
+
+def web_page_links(html_text: str, base: str) -> List[Dict[str, str]]:
+    """File links on a web page (documents first; photos only when the page has no documents)."""
+    found: List[Dict[str, str]] = []
+    seen = set()
+    for m in re.finditer(r'https?://download\d*\.mediafire\.com/[^"\'\s<>]+', html_text):
+        u = html.unescape(m.group(0))
+        if u not in seen:
+            seen.add(u)
+            found.append({"u": u, "n": web_url_name(u)[:60], "img": ""})
+    for m in re.finditer(r'<a\b[^>]*?href\s*=\s*["\']([^"\'#]+)["\'][^>]*>(.*?)</a>', html_text, re.S | re.I):
+        href = html.unescape(m.group(1).strip())
+        if href.lower().startswith(("javascript:", "mailto:", "tel:", "data:")):
+            continue
+        absu = urllib.parse.urljoin(base, href)
+        if not absu.lower().startswith(("http://", "https://")) or absu in seen:
+            continue
+        label = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", m.group(2)))).strip()
+        ext = os.path.splitext(urllib.parse.urlsplit(absu).path.lower())[1]
+        rw = web_rewrite(absu)
+        if rw["kind"] == "paid":
+            continue
+        if ext in WEB_EXTS or (rw["kind"] == "file" and rw.get("drive")) or "mediafire.com/file/" in absu:
+            seen.add(absu)
+            name = web_url_name(absu) if ext in WEB_EXTS else ""
+            found.append({"u": absu, "n": (label if label and len(label) > 3 else (name or label or absu))[:60],
+                          "img": "1" if ext in WEB_IMG_EXTS else ""})
+    docs = [f for f in found if not f["img"]]
+    return (docs or found)[:30]
+
+
+def web_drive_folder(fid: str) -> Dict[str, Any]:
+    """A public Drive folder → its files (the folder's embed view; no API key, no login)."""
+    deny = "🔒 Folder public nahi hai — Drive me folder ki sharing \"Anyone with the link\" karo, phir link bhejo."
+    try:
+        r = web_probe(f"https://drive.google.com/embeddedfolderview?id={fid}", 2_000_000, 30.0)
+    except WebErr:
+        raise WebErr(deny) from None
+    if r.get("kind") != "html" or web_login_url(r.get("final", "")):
+        raise WebErr(deny)
+    page = r["html"]
+    files: List[Dict[str, str]] = []
+    folders = 0
+    for m in re.finditer(r'<div class="flip-entry" id="entry-([A-Za-z0-9_-]+)".*?<a href="([^"]+)".*?'
+                         r'<div class="flip-entry-title">(.*?)</div>', page, re.S):
+        href = html.unescape(m.group(2))
+        title = html.unescape(re.sub(r"<[^>]+>", "", m.group(3))).strip()
+        if "/folders/" in href:
+            folders += 1
+            continue
+        files.append({"u": f"https://drive.google.com/file/d/{m.group(1)}/view", "n": title[:80]})
+    if not files and not folders and "flip-entry" not in page:
+        raise WebErr(deny)
+    return {"files": files, "folders": folders}
+
+
+def web_mediafire_direct(html_text: str) -> Optional[str]:
+    m = re.search(r'href="(https?://download\d*\.mediafire\.com/[^"]+)"', html_text)
+    return html.unescape(m.group(1)) if m else None
+
+
+# ---- the shared pipeline: bytes → 📥 Inbox post → ub_catalog → settle (exactly like a userbot file)
+def web_reply(chat: Any, text: str, markup: Optional[Dict[str, Any]] = None, parse_mode: Optional[str] = None) -> None:
+    if chat is None:
+        _WEB_OUT.append(text)
+        return
+    try:
+        send_text(int(chat), text, markup, parse_mode)
+    except Exception:
+        log_error("web reply")
+
+
+def web_dup_title(name: str, size: int) -> str:
+    try:
+        rows = supabase("books", "GET", query=f"?select=id,title,file_name&file_size=eq.{int(size)}&limit=20")
+        want = _norm_nm(name)
+        for r in rows:
+            if want and want in (_norm_nm(str(r.get("file_name") or "")), _norm_nm(str(r.get("title") or ""))):
+                return str(r.get("title") or r.get("file_name") or "")
+        if rows:
+            return str(rows[0].get("title") or "")
+    except Exception:
+        pass
+    return ""
+
+
+def web_book_id(uniq: Any) -> Optional[int]:
+    try:
+        got = supabase("books", "GET", query="?telegram_file_unique_id=eq." + urllib.parse.quote(str(uniq)) + "&select=id&limit=1")
+        return int(got[0]["id"]) if got else None
+    except Exception:
+        log_error("web book id")
+        return None
+
+
+def web_settle(book_id: Optional[int]) -> str:
+    """'backup' | 'big' | 'inbox' — settle at once (same ub_settle_now the review Accept uses); else the next run does."""
+    if not book_id:
+        return "inbox"
+    try:
+        st = ub_state()
+        _REQ_T0[0] = time.monotonic()
+        r = ub_settle_now(int(book_id), st)
+        ub_save_state(st)
+        return {"settled": "backup", "big": "big"}.get(r, "inbox")
+    except Exception:
+        log_error("web settle")
+        return "inbox"
+
+
+def web_catalog_post(msg: Dict[str, Any], inbox: int, src_title: str, caption: str = "", force_cat: str = "") -> Dict[str, Any]:
+    """A file post now sitting in the 📥 Inbox (uploaded by us / the Action) → catalog + settle."""
+    info = file_info(msg) or {}
+    channel = {"id": int(inbox), "title": src_title, "username": None, "type": "channel"}
+    fake = dict(msg, caption=caption or "", chat=channel)
+    fake.pop("forward_origin", None)
+    fake.pop("forward_from_chat", None)
+    record = build_metadata(fake, channel)
+    record["source_link"] = None
+    record["backup_chat_id"], record["backup_message_id"] = int(inbox), int(msg["message_id"])
+    if force_cat and known_category(force_cat):
+        record["_force_cat"] = force_cat
+    _REQ_T0[0] = time.monotonic()          # the naming steps budget against the request clock
+    res = ub_catalog(record, src_title)
+    out: Dict[str, Any] = {"title": str(record.get("title") or info.get("file_name") or "file"), "size": info.get("file_size")}
+    book_id = web_book_id(info.get("file_unique_id"))
+    out["id"] = book_id
+    if book_id:
+        try:
+            out["cat"] = book_category(dict(record, id=book_id), {} if has_category_col() else catmap())
+        except Exception:
+            pass
+    out["state"] = "review" if res == "review" else web_settle(book_id)
+    return out
+
+
+def web_ingest(data: bytes, name: str, src: str, caption: str = "", force_cat: str = "", src_url: str = "") -> Dict[str, Any]:
+    """{state: backup|big|inbox|review|dup|failed, title, size, cat, why}."""
+    size = len(data)
+    name = (name or "file.pdf")[:150]
+    out: Dict[str, Any] = {"size": size, "name": name, "title": os.path.splitext(name)[0]}
+    sha = hashlib.sha256(data).hexdigest()[:24]
+    had = get_setting("wsha:" + sha)
+    if had:
+        try:
+            r = supabase("books", "GET", query=f"?id=eq.{int(had)}&select=id,title&limit=1")
+        except Exception:
+            r = []
+        if r:
+            return dict(out, state="dup", title=str(r[0].get("title") or name))
+    if ub_known([{"n": name, "s": size}])[0]:
+        return dict(out, state="dup", title=web_dup_title(name, size) or out["title"])
+    inbox = ub_inbox()
+    src_title = "🔗 Web link" if src == "link" else "⬆️ Upload page"
+    target = inbox or (sorted(ADMIN_USER_IDS)[0] if ADMIN_USER_IDS else None)
+    if not target:
+        return dict(out, state="failed", why="📥 Inbox storage set nahi hai")
+    host = web_host_of(src_url) if src_url else ""
+    post_cap = (f"📥 {name}\n" + (f"🔗 {host}" if host else src_title) + (f"\n📝 {caption}" if caption else ""))[:1000]
+    try:
+        res = telegram_upload("sendDocument", {"chat_id": int(target), "caption": post_cap, "disable_notification": "true"},
+                              "document", name, data, timeout=240)
+    except Exception as exc:
+        log_error("web upload")
+        big = "413" in str(exc) or "too large" in str(exc).lower()
+        return dict(out, state="failed", why="Telegram pe upload nahi hua" + (" (file bahut badi)" if big else " — dobara try karo"))
+    msg = (res or {}).get("result") or {}
+    info = file_info(msg)
+    if not info or not msg.get("message_id"):
+        return dict(out, state="failed", why="Telegram ne file nahi li")
+    _REQ.setdefault("prefetch", {})[str(info.get("file_id"))] = data      # naming / settle reuse these bytes
+    if not inbox:
+        # no 📥 Inbox storage yet: the old admin-upload path (file sent to the owner's bot chat → index_file)
+        record = build_metadata(dict(msg, caption=caption or ""), {"id": int(target), "title": src_title, "username": None})
+        record["source_link"] = None
+        _REQ_T0[0] = time.monotonic()
+        backup = index_file(record, int(target), msg["message_id"], src_title)
+        r2 = {"title": str(record.get("title") or name), "state": "review" if backup == "review" else
+              ("backup" if backup in ("saved", "dup") else "inbox")}
+    else:
+        r2 = web_catalog_post(msg, int(inbox), src_title, caption, force_cat)
+    out.update({k: v for k, v in r2.items() if v is not None and k != "size"})
+    if out.get("id"):
+        try:
+            set_setting("wsha:" + sha, str(int(out["id"])))
+        except Exception:
+            pass
+    try:
+        mark = {"backup": "✅ Backup", "big": "⏳ Backup (badi file, 1–3 min)", "inbox": "📥 Inbox (settle baad me)",
+                "review": "❓ review"}.get(out["state"], str(out["state"]))
+        inbox_alert(f"{'🔗 Link' if src == 'link' else '⬆️ Upload page'} se: {str(out['title'])[:80]} · {human_size(size)}"
+                    + (f" · {host}" if host else "") + f" → {mark}")
+    except Exception:
+        pass
+    return out
+
+
+def web_result_text(r: Dict[str, Any], prefix: str = "") -> str:
+    st = r.get("state")
+    title = str(r.get("title") or r.get("name") or "file")[:120]
+    size = human_size(r.get("size"))
+    cat = cat_label(r["cat"]) if r.get("cat") and r.get("cat") != "other" else ""
+    head = f"{prefix}📄 {title}\n📦 {size}" + (f" · 🗂️ {cat}" if cat else "")
+    if st == "backup":
+        return "✅ File add ho gayi\n" + head + "\n📍 Inbox → Backup me save ✅ (users ko search me milegi)"
+    if st == "big":
+        return "✅ File add ho gayi\n" + head + "\n📍 Inbox me hai — badi file, 1–3 min me Backup me settle hogi"
+    if st == "inbox":
+        return "✅ File add ho gayi\n" + head + "\n📍 📥 Inbox me hai — agle run me Backup me settle hogi"
+    if st == "review":
+        return ("📥 File aa gayi, par naam/subject clear nahi\n" + head +
+                "\n📍 ❓ Review me (search me milti hai) → /admin → 👤 Userbot → ❓ Samajh nahi aayi files se naam do")
+    if st == "dup":
+        return f"♻️ Ye file pehle se bot me hai: {title}\n(dobara add nahi ki)"
+    return f"❌ File add nahi hui: {title}\nWajah: {r.get('why') or 'pata nahi'}"
+
+
+def web_short_line(r: Dict[str, Any]) -> str:
+    t = str(r.get("title") or r.get("name") or "file")[:60]
+    s = human_size(r.get("size"))
+    return {"backup": f"✅ {t} · {s} → Backup", "big": f"✅ {t} · {s} → Backup (1–3 min)", "inbox": f"✅ {t} → 📥 Inbox",
+            "review": f"❓ {t} → review", "dup": f"♻️ {t} (pehle se)",
+            "bigq": f"⏳ {t} · {s} → badi file (5–15 min)"}.get(r.get("state"), f"❌ {t}: {r.get('why') or ''}"[:160])
+
+
+# ---- 🔗 link jobs: queued from the chat, worked one by one in a fresh function call (kick; keepalive picks up leftovers)
+def webq_load(key: str = WEB_Q_KEY) -> List[Dict[str, Any]]:
+    try:
+        v = json.loads(get_setting(key) or "[]")
+        return v if isinstance(v, list) else []
+    except Exception:
+        return []
+
+
+def webq_save(q: List[Dict[str, Any]], key: str = WEB_Q_KEY) -> None:
+    open_ = [j for j in q if j.get("st") in ("pending", "running")]
+    done = [j for j in q if j.get("st") not in ("pending", "running")][-30:]
+    set_setting(key, json.dumps(sorted(open_ + done, key=lambda j: j.get("t", 0)), ensure_ascii=False, separators=(",", ":")))
+
+
+def web_kick_key() -> str:
+    return hmac.new((WEBHOOK_SECRET or "x").encode(), b"webfile", hashlib.sha256).hexdigest()[:24]
+
+
+def _web_kick_real() -> None:
+    try:
+        urllib.request.urlopen(urllib.request.Request(PUBLIC_HOME + "api/webfile?k=" + web_kick_key(),
+                                                      headers={"User-Agent": "filesbull-bot/1.0"}), timeout=1.5).read()
+    except Exception:
+        pass
+
+
+WEB_KICK = [_web_kick_real]
+
+
+def web_kick() -> None:
+    if _DIAG["dry"]:
+        _DIAG["sent"].append({"ms": 0, "m": "web_kick"})
+        return
+    WEB_KICK[0]()
+
+
+def webq_add(urls: List[str], chat: Any, uid: Any, batch: str = "", names: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    q = webq_load()
+    added = []
+    now = int(time.time())
+    for n, u in enumerate(urls):
+        j = {"j": hashlib.sha1(os.urandom(12)).hexdigest()[:10], "u": u[:2000], "chat": chat, "uid": uid, "t": now,
+             "st": "pending", "tries": 0}
+        if batch:
+            j["b"], j["bn"] = batch, len(urls)
+        if names and n < len(names) and names[n]:
+            j["nm"] = str(names[n])[:120]
+        q.append(j)
+        added.append(j)
+    webq_save(q)
+    return added
+
+
+def web_handle_links(chat_id: Any, user_id: Any, text: str) -> None:
+    urls = web_link_urls(text)
+    if not urls:
+        web_reply(chat_id, LINK_HELP, None, "HTML")
+        return
+    paid = [u for u in urls if web_is_paid(u)]
+    urls = [u for u in urls if not web_is_paid(u)]
+    if paid:
+        web_reply(chat_id, WEB_PAID_TEXT)
+    if not urls:
+        return
+    extra = ""
+    if len(urls) > WEB_MAX_LINKS:
+        extra = f"\n(ek baar me {WEB_MAX_LINKS} link — baaki dobara bhejo)"
+        urls = urls[:WEB_MAX_LINKS]
+    webq_add(urls, chat_id, user_id)
+    web_reply(chat_id, ("🔗 Link mil gaya — file la raha hoon…" if len(urls) == 1 else
+                        f"🔗 {len(urls)} link mile — ek-ek karke la raha hoon…") + extra)
+    web_kick()
+
+
+def web_batch_note(job: Dict[str, Any], line: str) -> None:
+    """Folder / 'Sab add karo' jobs: one summary message per 10 files (and at the end), not one per file."""
+    key = "wb:" + str(job["b"])
+    try:
+        st = json.loads(get_setting(key) or "{}")
+    except Exception:
+        st = {}
+    st.setdefault("l", []).append(line[:200])
+    st["n"] = int(st.get("n") or 0) + 1
+    total = int(job.get("bn") or 0)
+    if len(st["l"]) >= 10 or st["n"] >= total:
+        web_reply(job.get("chat"), f"📦 {st['n']}/{total} files:\n" + "\n".join(st["l"]) + ("\n\n🎉 Sab ho gaya." if st["n"] >= total else ""))
+        st["l"] = []
+    if st["n"] >= total:
+        supabase("bot_settings", "DELETE", query="?key=eq." + urllib.parse.quote(key))
+    else:
+        set_setting(key, json.dumps(st, ensure_ascii=False))
+
+
+def web_queue_big(url: str, info: Dict[str, Any], chat: Any, uid: Any, caption: str = "") -> Dict[str, Any]:
+    """> WEB_INLINE_MAX (or a slow site): the bigfile GitHub Action downloads it and uploads it into the Inbox."""
+    name = info.get("name") or "file.pdf"
+    if os.path.splitext(name)[1].lower() not in WEB_EXTS:
+        name = os.path.splitext(name)[0] + (WEB_MIME_EXT.get(info.get("ctype") or "") or ".pdf")
+    if not bigfile_ready() or not ub_inbox():
+        return {"state": "failed", "name": name, "size": info.get("size"),
+                "why": f"file {human_size(info.get('size'))} ki hai — bot seedha {human_size(WEB_INLINE_MAX)} tak le sakta hai"
+                       + ("" if ub_inbox() else " (📥 Inbox storage bhi set nahi)")}
+    if info.get("size") and ub_known([{"n": name, "s": int(info["size"])}])[0]:
+        return {"state": "dup", "name": name, "title": web_dup_title(name, int(info["size"])) or name, "size": info.get("size")}
+    q = webq_load(WEB_BIG_KEY)
+    j = {"j": hashlib.sha1(os.urandom(12)).hexdigest()[:12], "u": (info.get("final") or url)[:2000], "fn": name[:150],
+         "sz": int(info.get("size") or 0), "st": "pending", "tries": 0, "chat": chat, "uid": uid, "t": int(time.time()),
+         "cap": caption[:300]}
+    q.append(j)
+    webq_save(q, WEB_BIG_KEY)
+    return {"state": "bigq", "name": name, "title": os.path.splitext(name)[0], "size": info.get("size"),
+            "dispatch": bigfile_dispatch("web")}
+
+
+def web_tg_post(chat: Any, ref: Dict[str, Any]) -> Dict[str, Any]:
+    """A public t.me/<channel>/<n> post: copy it into the Inbox (the Bot API reads public channels), then catalog it."""
+    inbox = ub_inbox()
+    if not inbox:
+        raise WebErr("📥 Pehle Inbox storage set karo (/admin → 👤 Userbot).")
+    try:
+        res = telegram("copyMessage", {"chat_id": int(inbox), "from_chat_id": ref["chat"], "message_id": int(ref["msg"]),
+                                       "disable_notification": True})
+    except Exception:
+        raise WebErr("❌ Ye Telegram post bot nahi padh pa raha (private channel / post delete). "
+                     "File bot ko forward karo, ya channel ko 📡 Source me add karo.") from None
+    mid = ((res or {}).get("result") or {}).get("message_id")
+    msg = ub_read_post(inbox, mid) if mid else {}
+    info = file_info(msg)
+    if not info:
+        raise WebErr("❌ Is Telegram post me koi file nahi hai.")
+    if ub_known([{"u": info.get("file_unique_id"), "n": info.get("file_name"), "s": info.get("file_size")}])[0]:
+        return {"state": "dup", "title": info.get("file_name"), "size": info.get("file_size")}
+    try:
+        src = telegram("getChat", {"chat_id": ref["chat"]}).get("result") or {}
+    except Exception:
+        src = {}
+    channel = {"id": int(src.get("id") or 0), "title": str(src.get("title") or ref["chat"]), "username": src.get("username"),
+               "type": "channel"}
+    record = build_metadata(dict(msg, message_id=int(ref["msg"]), chat=channel), channel)
+    record["backup_chat_id"], record["backup_message_id"] = int(inbox), int(mid)
+    _REQ_T0[0] = time.monotonic()
+    r = ub_catalog(record, channel["title"])
+    out = {"title": record.get("title"), "size": info.get("file_size")}
+    out["state"] = "review" if r == "review" else web_settle(web_book_id(info.get("file_unique_id")))
+    return out
+
+
+def web_fetch_one(url: str, chat: Any, uid: Any, name_hint: str = "", depth: int = 0) -> Dict[str, Any]:
+    """One link, start to end → a result dict (or {state: choose|folder|paid|bigq})."""
+    rw = web_rewrite(url)
+    if rw["kind"] == "paid":
+        return {"state": "paid"}
+    if rw["kind"] == "mega":
+        return {"state": "failed", "title": "Mega link", "why": "Mega.nz abhi support nahi hai (wahan file encrypted hoti hai). "
+                                                                 "File Drive/Dropbox pe daal ke link bhejo, ya seedha bot ko bhejo."}
+    if rw["kind"] == "tgpost":
+        return web_tg_post(chat, rw)
+    if rw["kind"] == "folder":
+        got = web_drive_folder(rw["id"])
+        return {"state": "folder", "files": got["files"], "folders": got["folders"]}
+    r = web_probe(rw["url"], WEB_INLINE_MAX)
+    if r["kind"] == "html" and rw.get("drive"):
+        conf = web_drive_confirm(r["html"])
+        if conf:
+            r = web_probe(conf, WEB_INLINE_MAX)
+        if r["kind"] == "html":
+            if web_login_url(r.get("final", "")) or "accounts.google.com" in r["html"][:30000]:
+                raise WebErr("🔒 File public nahi hai — Drive me sharing \"Anyone with the link\" karo, phir link bhejo.")
+            raise WebErr("❌ Drive ne file nahi di (shayad download limit / file hata di). Thodi der baad try karo.")
+    if r["kind"] == "html" and "mediafire.com" in web_host_of(r.get("final", "")):
+        direct = web_mediafire_direct(r["html"])
+        if direct:
+            r = web_probe(direct, WEB_INLINE_MAX)
+    if r["kind"] == "html":
+        if web_login_url(r.get("final", "")):
+            raise WebErr("🔒 Ye page login maangta hai — sirf public link chalega.")
+        if depth > 0:
+            raise WebErr("❌ Ye direct file link nahi hai (webpage hai).")
+        links = web_page_links(r["html"], r["final"])
+        if not links:
+            raise WebErr("❌ Ye direct file link nahi hai — ye ek webpage hai, aur isme koi PDF/file link nahi mila.\n"
+                         "File ka seedha link bhejo (jo .pdf pe khatam ho ya kholte hi download ho).")
+        if len(links) == 1:
+            res = web_fetch_one(links[0]["u"], chat, uid, links[0]["n"], depth + 1)
+            res["from_page"] = 1
+            return res
+        return {"state": "choose", "links": links, "page": r["final"]}
+    if r["kind"] == "big":
+        return web_queue_big(rw["url"], r, chat, uid)
+    name = r["name"]
+    stem, ext = os.path.splitext(name)
+    hint = re.sub(r"[\\/:*?\"<>|\r\n\t]+", " ", name_hint or "").strip()
+    if rw.get("gdoc") and hint:
+        name = os.path.splitext(hint)[0][:120] + ext
+    elif hint and (not stem or is_junk_name(stem) or stem.lower() in ("download", "content", "file", "uc", "export", "view")):
+        name = (os.path.splitext(hint)[0] if os.path.splitext(hint)[1].lower() in WEB_EXTS else hint)[:120] + ext
+    return web_ingest(r["data"], name, "link", src_url=url)
+
+
+def web_choose_markup(lid: str, links: List[Dict[str, str]]) -> Dict[str, Any]:
+    rows = [[{"text": f"📄 {(l['n'] or web_url_name(l['u']) or 'file')[:40]}", "callback_data": f"ad:wl:{lid}:{n}"}]
+            for n, l in enumerate(links[:10])]
+    rows.append([{"text": f"✅ Sab add karo ({min(len(links), 30)})", "callback_data": f"ad:wl:{lid}:a"}])
+    return {"inline_keyboard": rows}
+
+
+def web_run_job(job: Dict[str, Any]) -> None:
+    chat, uid = job.get("chat"), job.get("uid")
+    url = job.get("u") or ""
+    try:
+        r = web_fetch_one(url, chat, uid, job.get("nm") or "")
+    except WebErr as exc:
+        r = {"state": "failed", "why": str(exc), "title": job.get("nm") or web_url_name(url) or web_host_of(url)}
+    except Exception:
+        log_error("web job")
+        r = {"state": "failed", "why": "kuch gadbad hui — dobara bhejo", "title": job.get("nm") or web_url_name(url)}
+    st = r.get("state")
+    if st == "paid":
+        web_reply(chat, WEB_PAID_TEXT)
+        return
+    if st == "folder":
+        files = r["files"][:WEB_FOLDER_MAX]
+        if not files:
+            web_reply(chat, "📁 Folder me koi file nahi mili" + (f" ({r['folders']} sub-folder hain — unka link alag bhejo)" if r["folders"] else "") + ".")
+            return
+        bid = hashlib.sha1(os.urandom(8)).hexdigest()[:8]
+        webq_add([f["u"] for f in files], chat, uid, batch=bid, names=[f["n"] for f in files])
+        web_reply(chat, f"📁 Drive folder: {len(files)} file mili" +
+                  (f" (pehli {WEB_FOLDER_MAX} li)" if len(r["files"]) > WEB_FOLDER_MAX else "") +
+                  (f", {r['folders']} sub-folder chhode (unka link alag bhejo)" if r["folders"] else "") +
+                  " — ek-ek karke add kar raha hoon, har 10 file pe update dunga.")
+        return
+    if st == "choose":
+        lid = hashlib.sha1(os.urandom(8)).hexdigest()[:8]
+        set_setting("wlist:" + lid, json.dumps({"l": r["links"][:30], "t": int(time.time()), "chat": chat}, ensure_ascii=False))
+        lines = "\n".join(f"{n + 1}. {(l['n'] or web_url_name(l['u']))[:60]}" for n, l in enumerate(r["links"][:10]))
+        more = f"\n…aur {len(r['links']) - 10}" if len(r["links"]) > 10 else ""
+        web_reply(chat, f"🌐 Ye webpage hai — isme {len(r['links'])} file link mile:\n{lines}{more}\n\nKaunsi add karun? Tap karo 👇",
+                  web_choose_markup(lid, r["links"]))
+        return
+    if job.get("b"):
+        web_batch_note(job, web_short_line(r))
+        return
+    if st == "bigq":
+        web_reply(chat, f"⏳ Badi file: {str(r.get('title'))[:80]} ({human_size(r.get('size'))})\n"
+                        f"GitHub wale route se Inbox me aa rahi hai — {'2–10 min' if r.get('dispatch') == 'dispatched' else '5–15 min'}. "
+                        "Ho jaane pe yahin bataunga.")
+        return
+    web_reply(chat, web_result_text(r, "🌐 Page me 1 file mili:\n" if r.get("from_page") else ""))
+
+
+def web_worker(budget: float = WEB_WORKER_BUDGET) -> Dict[str, Any]:
+    """Work pending link jobs one by one until the queue is empty or the budget is used; then kick the next call."""
+    t0 = time.monotonic()
+    lock = get_setting("webq_lock")
+    if lock and time.time() - float(lock or 0) < WEB_DL_DEADLINE + 90:
+        return {"busy": True}
+    set_setting("webq_lock", str(time.time()))
+    done = 0
+    try:
+        while done == 0 or time.monotonic() - t0 < budget - WEB_DL_DEADLINE * 0.6:
+            q = webq_load()
+            now = time.time()
+            for j in q:            # a job whose call died: once more, then ❌
+                if j.get("st") == "running" and now - float(j.get("ct") or 0) > WEB_WORKER_BUDGET + 120:
+                    if int(j.get("tries") or 0) >= 2:
+                        j["st"] = "failed"
+                        web_reply(j.get("chat"), f"❌ Link se file nahi aa payi (bahut der lagi): {(web_url_name(j.get('u', '')) or j.get('u', ''))[:80]}")
+                    else:
+                        j["st"] = "pending"
+            job = next((j for j in q if j.get("st") == "pending"), None)
+            if not job:
+                webq_save(q)
+                break
+            job["st"], job["ct"], job["tries"] = "running", int(now), int(job.get("tries") or 0) + 1
+            webq_save(q)
+            _REQ.pop("prefetch", None)
+            try:
+                web_run_job(job)
+            finally:
+                _REQ.pop("prefetch", None)
+                q = webq_load()
+                for j in q:
+                    if j.get("j") == job["j"]:
+                        j["st"], j["dt"] = "done", int(time.time())
+                webq_save(q)
+                flush_request()
+            done += 1
+            set_setting("webq_lock", str(time.time()))
+    finally:
+        supabase("bot_settings", "DELETE", query="?key=eq.webq_lock")
+    left = sum(1 for j in webq_load() if j.get("st") == "pending")
+    if left:
+        web_kick()
+    return {"done": done, "left": left}
+
+
+@app.get("/api/webfile")
+def web_worker_api() -> Any:
+    tok = request.args.get("k", "")
+    if not tok or not hmac.compare_digest(tok, web_kick_key()):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    _REQ.clear()
+    _LOG_QUEUE.clear()
+    _REQ_T0[0] = time.monotonic()
+    try:
+        out = web_worker()
+    except Exception:
+        log_error("web worker")
+        out = {"error": True}
+    flush_request()
+    return jsonify(dict(out, ok=True))
+
+
+def web_keepalive() -> None:
+    """GET / (every ~5–10 min): link jobs nobody is working on get a kick; old upload temp files are removed."""
+    q = webq_load()
+    now = time.time()
+    if any(j.get("st") == "pending" and now - float(j.get("t") or 0) > 60 for j in q) or \
+            any(j.get("st") == "running" and now - float(j.get("ct") or 0) > WEB_WORKER_BUDGET + 120 for j in q):
+        web_kick()
+    if any(j.get("st") == "pending" for j in webq_load(WEB_BIG_KEY)) and now - float(get_setting("webbig_kick") or 0) > 600:
+        set_setting("webbig_kick", str(now))
+        bigfile_dispatch("web")
+    if get_setting("upl:bucket") == "1" and now - float(get_setting("upl:sweep") or 0) > 3600:
+        set_setting("upl:sweep", str(now))
+        upl_sweep()
+
+
+def web_choose_tap(query: Dict[str, Any], chat_id: Any, user_id: Any, data: str) -> None:
+    parts = data.split(":")
+    lid, which = parts[2], parts[3]
+    try:
+        v = json.loads(get_setting("wlist:" + lid) or "{}")
+    except Exception:
+        v = {}
+    links = v.get("l") or []
+    if not links:
+        show(chat_id, "⌛ Ye list purani ho gayi — link dobara bhejo.", None, query)
+        return
+    if which == "a":
+        picked = links[:30]
+        bid = hashlib.sha1(os.urandom(8)).hexdigest()[:8] if len(picked) > 1 else ""
+        webq_add([l["u"] for l in picked], chat_id, user_id, batch=bid, names=[l["n"] for l in picked])
+        show(chat_id, f"✅ {len(picked)} file add kar raha hoon — har 10 file pe update dunga.", None, query)
+    else:
+        n = int(which)
+        if n >= len(links):
+            show(chat_id, "⌛ Ye button purana hai — link dobara bhejo.", None, query)
+            return
+        webq_add([links[n]["u"]], chat_id, user_id, names=[links[n]["n"]])
+        web_reply(chat_id, f"🔗 {(links[n]['n'] or 'file')[:60]} — la raha hoon…")
+    web_kick()
+
+
+LINK_HELP = ("🔗 <b>Link se file</b>\n"
+             "Bas file ka link bhejo (ek msg me kai link bhi chalenge) — ya /link &lt;link&gt;.\n\n"
+             "✅ Chalta hai: direct PDF/Word/PPT/ZIP/photo link, Google Drive (file, folder, Docs/Sheets/Slides), "
+             "Dropbox, OneDrive, MediaFire, GitHub, public Telegram post link (t.me/channel/123), "
+             "aur koi bhi webpage (usme se PDF links dhoondh ke dikhata hoon).\n"
+             "❌ Nahi: Scribd jaisi paid sites, login/paywall wale link, Mega.\n"
+             "📦 49 MB tak turant, usse badi (1.9 GB tak) 5–15 min me.\n\n"
+             "⬆️ Phone se upload: /upload")
+
+
+# ---- 🌐 big links through the MTProto GitHub Action (bigfile workflow); own queue "webbigq"
+def webbig_fail(job: Dict[str, Any], reason: str) -> None:
+    reason = _scrub(reason)[:200] or "pata nahi"
+    job["err"] = reason
+    if int(job.get("tries") or 0) < 2:
+        job["st"] = "pending"
+        return
+    job["st"] = "failed"
+    web_reply(job.get("chat"), f"❌ Badi file link se nahi aa payi: {str(job.get('fn'))[:80]}\nWajah: {reason}")
+
+
+def webbig_claim(claims: Dict[str, Any]) -> List[Dict[str, Any]]:
+    q = webq_load(WEB_BIG_KEY)
+    now = time.time()
+    changed = False
+    for j in q:
+        if j.get("st") == "running" and now - float(j.get("ct") or 0) > 45 * 60:
+            webbig_fail(j, "GitHub Action ne time pe jawab nahi diya")
+            changed = True
+    out: List[Dict[str, Any]] = []
+    inbox = ub_inbox()
+    for j in [j for j in q if j.get("st") == "pending"][:3]:
+        if not inbox:
+            break
+        j["st"], j["ct"], j["tries"] = "running", int(now), int(j.get("tries") or 0) + 1
+        j["run"] = str(claims.get("run_id") or "")
+        changed = True
+        out.append({"j": j["j"], "k": big_job_key(j["j"]), "kind": "web", "url": j["u"], "file_name": j["fn"],
+                    "caption": f"📥 {j['fn']}\n🔗 {web_host_of(j['u'])}"[:1000], "size": int(j.get("sz") or 0),
+                    "max": WEB_MAX, "to": int(inbox), "try": j["tries"]})
+    if changed:
+        webq_save(q, WEB_BIG_KEY)
+    return out
+
+
+def webbig_done(job: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
+    if not (body.get("ok") and body.get("chat_id") and body.get("message_id")):
+        webbig_fail(job, str(body.get("error") or "GitHub Action fail hua"))
+        return {"ok": True, "state": job.get("st")}
+    msg = ub_read_post(body["chat_id"], body["message_id"])
+    info = file_info(msg)
+    if not info:
+        webbig_fail(job, "Inbox post me file nahi mili")
+        return {"ok": True, "state": job.get("st")}
+    job["st"], job["dt"] = "done", int(time.time())
+    if ub_known([{"u": info.get("file_unique_id"), "n": info.get("file_name"), "s": info.get("file_size")}])[0]:
+        r = {"state": "dup", "title": info.get("file_name"), "size": info.get("file_size")}
+    else:
+        r = web_catalog_post(msg, int(body["chat_id"]), "🔗 Web link", job.get("cap") or "")
+        try:
+            inbox_alert(f"🔗 Link se (badi file): {str(r.get('title'))[:80]} · {human_size(info.get('file_size'))} · {web_host_of(job.get('u', ''))}")
+        except Exception:
+            pass
+    web_reply(job.get("chat"), web_result_text(r))
+    return {"ok": True, "state": "done", "file_name": info.get("file_name")}
+
+
+# ================================================================ ⬆️ UPLOAD PAGE
+UPL_PW_KEY = "upl:pw"
+UPL_RL_KEY = "upl:rl"
+UPL_SESSION_H = 12
+UPL_IP_FAILS = 5
+UPL_IP_WINDOW = 15 * 60
+UPL_ALL_FAILS = 20
+UPL_ALL_LOCK = 30 * 60
+UPL_PBKDF2 = 120_000
+UPL_MAGIC_TTL = 15 * 60
+
+
+def upl_pw_rec() -> Dict[str, Any]:
+    try:
+        v = json.loads(get_setting(UPL_PW_KEY) or "{}")
+        return v if isinstance(v, dict) else {}
+    except Exception:
+        return {}
+
+
+def upl_hash(pw: str, salt: Optional[bytes] = None) -> str:
+    salt = salt or os.urandom(16)
+    dk = hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), salt, UPL_PBKDF2)
+    return f"pbkdf2_sha256${UPL_PBKDF2}${salt.hex()}${dk.hex()}"
+
+
+def upl_check_hash(pw: str, h: str) -> bool:
+    try:
+        _algo, it, salt, dk = h.split("$")
+        got = hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), bytes.fromhex(salt), int(it))
+        return hmac.compare_digest(got.hex(), dk)
+    except Exception:
+        return False
+
+
+def upl_env_pw() -> str:
+    return os.environ.get("UPLOAD_PASSWORD", "").strip()
+
+
+def upl_ready() -> bool:
+    return bool(upl_env_pw() or upl_pw_rec().get("h"))
+
+
+def upl_version() -> str:
+    if upl_env_pw():
+        return "e" + hashlib.sha256(upl_env_pw().encode()).hexdigest()[:6]
+    return str(upl_pw_rec().get("v") or 0)
+
+
+def upl_password_ok(pw: str) -> bool:
+    if not pw:
+        return False
+    env = upl_env_pw()
+    if env:
+        return hmac.compare_digest(pw.encode(), env.encode())
+    rec = upl_pw_rec()
+    return bool(rec.get("h")) and upl_check_hash(pw, rec["h"])
+
+
+def upl_set_password(pw: str) -> None:
+    rec = upl_pw_rec()
+    set_setting(UPL_PW_KEY, json.dumps({"h": upl_hash(pw), "e": ub_encrypt(pw), "v": int(rec.get("v") or 0) + 1,
+                                        "t": int(time.time())}))
+
+
+def upl_new_password() -> str:
+    alphabet = "abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return "-".join("".join(alphabet[b % len(alphabet)] for b in os.urandom(5)) for _ in range(4))
+
+
+def upl_current_password() -> Optional[str]:
+    if upl_env_pw():
+        return None
+    e = upl_pw_rec().get("e")
+    return ub_decrypt(e) if e else None
+
+
+def upl_key() -> bytes:
+    master = os.environ.get("UPLOAD_SECRET", "").strip() or f"filesbull-upload:{BOT_TOKEN}"
+    return hashlib.sha256(master.encode()).digest()
+
+
+def upl_session_make() -> str:
+    exp = int(time.time()) + UPL_SESSION_H * 3600
+    v = upl_version()
+    sig = hmac.new(upl_key(), f"upl:{exp}:{v}".encode(), hashlib.sha256).hexdigest()[:40]
+    return f"{exp}.{v}.{sig}"
+
+
+def upl_session_ok(tok: str) -> bool:
+    try:
+        exp, v, sig = (tok or "").split(".")
+        if int(exp) < time.time() or v != upl_version():
+            return False
+        want = hmac.new(upl_key(), f"upl:{exp}:{v}".encode(), hashlib.sha256).hexdigest()[:40]
+        return hmac.compare_digest(sig, want)
+    except Exception:
+        return False
+
+
+def upl_magic_link() -> str:
+    tok = base64.urlsafe_b64encode(os.urandom(24)).decode().rstrip("=")
+    set_setting("uplm:" + hashlib.sha256(tok.encode()).hexdigest()[:32], str(int(time.time()) + UPL_MAGIC_TTL))
+    return PUBLIC_HOME + "upload?m=" + tok
+
+
+def upl_client_ip() -> str:
+    ip = (request.headers.get("X-Forwarded-For") or request.headers.get("X-Real-Ip") or request.remote_addr or "?").split(",")[0].strip()
+    return hashlib.sha256(("upl" + ip).encode()).hexdigest()[:12]
+
+
+def upl_rl() -> Dict[str, Any]:
+    try:
+        v = json.loads(get_setting(UPL_RL_KEY) or "{}")
+        return v if isinstance(v, dict) else {}
+    except Exception:
+        return {}
+
+
+def upl_locked(rl: Dict[str, Any], ip: str) -> int:
+    now = time.time()
+    for e in (rl.get("_all") or [0, 0, 0], rl.get(ip) or [0, 0, 0]):
+        if float(e[2] or 0) > now:
+            return int(float(e[2]) - now)
+    return 0
+
+
+def upl_note_fail(rl: Dict[str, Any], ip: str) -> None:
+    now = time.time()
+    e = rl.get(ip) or [0, now, 0]
+    if now - float(e[1] or 0) > UPL_IP_WINDOW:
+        e = [0, now, 0]
+    e[0] = int(e[0]) + 1
+    if e[0] >= UPL_IP_FAILS:
+        e[2] = now + UPL_IP_WINDOW
+    rl[ip] = e
+    g = rl.get("_all") or [0, now, 0]
+    if now - float(g[1] or 0) > 3600:
+        g = [0, now, 0]
+    g[0] = int(g[0]) + 1
+    if g[0] >= UPL_ALL_FAILS and float(g[2] or 0) < now:
+        g[2] = now + UPL_ALL_LOCK
+    rl["_all"] = g
+    for k in [k for k, v in rl.items() if k != "_all" and now - float(v[1] or 0) > 2 * 3600]:
+        rl.pop(k, None)
+    set_setting(UPL_RL_KEY, json.dumps(rl))
+    if e[0] == UPL_IP_FAILS or g[0] == UPL_ALL_FAILS:
+        try:
+            if now - float(get_setting("upl:alert") or 0) > 3600:
+                set_setting("upl:alert", str(now))
+                audit_log(f"⚠️ Upload page pe bar-bar galat password · {ist_now()}\n"
+                          "Page kuch der ke liye lock. Aap ho to bot me /upload se bina password wala link lo.")
+        except Exception:
+            log_error("upl alert")
+
+
+def upl_storage(method: str, path: str, body: Any = None, timeout: float = 60) -> Any:
+    return UPL_HTTP[0](method, f"{SUPABASE_URL}/storage/v1/{path}", body,
+                       {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout)
+
+
+def _upl_http_real(method: str, url: str, body: Any, hdr: Dict[str, str], timeout: float) -> Any:
+    if method in ("GETBYTES", "DELETEOBJ"):
+        req = urllib.request.Request(url, method="GET" if method == "GETBYTES" else "DELETE",
+                                     headers=dict(hdr, **{"User-Agent": "filesbull-bot/1.0"}))
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read(UPLOAD_MAX + 1)
+    return http_json(url, method, body, hdr, timeout)
+
+
+UPL_HTTP = [_upl_http_real]
+
+
+def upl_bucket_ready() -> bool:
+    if get_setting("upl:bucket") == "1":
+        return True
+    try:
+        upl_storage("POST", "bucket", {"id": WEB_BUCKET, "name": WEB_BUCKET, "public": False, "file_size_limit": UPLOAD_MAX})
+    except Exception as exc:
+        low = str(exc).lower()
+        if "exist" not in low and "409" not in low and "duplicate" not in low:
+            log_error("upl bucket")
+            return False
+    set_setting("upl:bucket", "1")
+    return True
+
+
+def upl_delete(path: str) -> None:
+    try:
+        upl_storage("DELETEOBJ", f"object/{WEB_BUCKET}/{path}", None, 20)
+    except Exception:
+        log_error("upl delete")
+
+
+def upl_sweep() -> int:
+    """Temp uploads older than 6 h (page closed before 'done') are removed."""
+    n = 0
+    try:
+        rows = upl_storage("POST", f"object/list/{WEB_BUCKET}", {"prefix": "u", "limit": 100, "offset": 0}) or []
+        for r in rows:
+            m = re.match(r"(\d+)-", str(r.get("name") or ""))
+            if m and time.time() - int(m.group(1)) > 6 * 3600:
+                upl_delete("u/" + r["name"])
+                n += 1
+    except Exception:
+        log_error("upl sweep")
+    return n
+
+
+def upl_path_sig(path: str) -> str:
+    return hmac.new(upl_key(), ("path:" + path).encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def upl_categories() -> List[tuple]:
+    out: List[tuple] = []
+    seen = set()
+    regs: List[str] = []
+    try:
+        regs = list(EXTRA_LABEL) + list(cat_registry())
+    except Exception:
+        pass
+    for s in list(SUBJECT_LABEL) + regs:
+        if s and s != "other" and s not in seen:
+            seen.add(s)
+            out.append((s, cat_label(s)))
+    return out
+
+
+def upl_authed() -> bool:
+    return upl_session_ok(request.cookies.get("fbup", ""))
+
+
+def _upl_cookie(resp: Any, tok: str) -> Any:
+    resp.set_cookie("fbup", tok, max_age=UPL_SESSION_H * 3600, httponly=True, secure=True, samesite="Lax", path="/upload")
+    return resp
+
+
+UPL_CSS = """*{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,'Segoe UI',Roboto,'Noto Sans Devanagari',sans-serif;
+background:#0f1020;color:#eef;min-height:100dvh}main{max-width:560px;margin:0 auto;padding:18px 14px 40px}
+h1{font-size:22px;margin:6px 0 2px}.sub{color:#aab;font-size:14px;margin:0 0 14px;line-height:1.45}.card{background:#1a1b33;
+border:1px solid #2c2e55;border-radius:16px;padding:16px;margin:12px 0}label{display:block;font-size:14px;color:#ccd;margin:10px 0 6px}
+input,select{width:100%;font-size:16px;padding:12px;border-radius:12px;border:1px solid #3a3d70;background:#0f1020;color:#fff}
+button,.pick{display:block;width:100%;font-size:17px;font-weight:600;padding:14px;border:0;border-radius:14px;
+background:linear-gradient(90deg,#7b5cff,#c58bff);color:#fff;margin-top:14px;text-align:center;cursor:pointer}
+button:disabled{opacity:.45}.pick{background:#25275a;border:2px dashed #7b5cff;margin-top:0}.err{color:#ff8a8a;font-size:14px;margin-top:10px}
+.ok{color:#8affc1}.f{background:#14152b;border-radius:12px;padding:10px;margin-top:10px;font-size:14px;overflow-wrap:anywhere}
+.bar{height:8px;background:#2c2e55;border-radius:6px;overflow:hidden;margin:8px 0 4px}.bar i{display:block;height:100%;width:0;
+background:linear-gradient(90deg,#7b5cff,#5ce1e6);transition:width .2s}.st{color:#bbc;font-size:13px;white-space:pre-line}
+.f input{padding:8px;font-size:15px;margin-top:6px}.top{display:flex;justify-content:space-between;align-items:center;gap:8px}
+.top a{color:#aab;font-size:13px}small{color:#889}"""
+
+UPL_LOGIN_HTML = """<!doctype html><html lang="hi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex"><title>filesbull · Upload</title><style>%%CSS%%</style></head><body><main>
+<h1>⬆️ filesbull Upload</h1><p class="sub">Sirf admin ke liye. Password daalo.</p>
+<form class="card" method="post" action="/upload/login" autocomplete="off">
+<label for="p">🔑 Password</label><input id="p" name="password" type="password" required autofocus autocomplete="current-password">
+<button type="submit">Login</button>%%ERR%%</form>
+<p class="sub">💡 Telegram bot me <b>/upload</b> bhejo — password + bina password wala link (15 min, ek baar) mil jayega.</p>
+</main></body></html>"""
+
+UPL_PAGE_HTML = """<!doctype html><html lang="hi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex"><title>filesbull · Upload</title><style>%%CSS%%</style></head><body><main>
+<div class="top"><h1>⬆️ File upload</h1><a href="/upload/logout">Logout</a></div>
+<p class="sub">Phone se files chuno → bot ke 📥 Inbox me jayengi → naam + category → Backup. Ek file max 50 MB.</p>
+<div class="card"><label class="pick" for="fi">📂 Files chuno (ek ya zyada)</label>
+<input id="fi" type="file" multiple style="display:none" accept=".pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.zip,.rar,.7z,.epub,.txt,.rtf,.odt,.csv,image/*">
+<label for="cat">🗂️ Category</label><select id="cat"><option value="">🤖 Auto (bot khud samjhega)</option>%%OPTS%%</select>
+<div id="list"></div><button id="go" disabled>⬆️ Upload karo</button><div id="msg" class="err"></div></div>
+<p class="sub"><small>Har file ke neeche naam/caption likh sakte ho (optional) — wahi file ka naam banega.</small></p>
+</main><script>
+const MAX=%%MAX%%;const fi=document.getElementById('fi'),list=document.getElementById('list'),go=document.getElementById('go'),msg=document.getElementById('msg');
+let items=[];
+function sz(n){return n>=1048576?(n/1048576).toFixed(1)+' MB':Math.max(1,Math.round(n/1024))+' KB'}
+function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[c])}
+fi.onchange=()=>{items=[];list.innerHTML='';for(const f of fi.files){const d=document.createElement('div');d.className='f';
+const big=f.size>MAX;d.innerHTML='<b>📄 '+esc(f.name)+'</b> · '+sz(f.size)+(big?'<div class="err">❌ 50 MB se badi — ye file Telegram me seedha bot ko bhejo ya uska link bhejo</div>':
+'<input placeholder="Naam / caption (optional)" maxlength="120"><div class="bar"><i></i></div><div class="st">Taiyaar</div>');
+list.appendChild(d);items.push({f,d,big})}go.disabled=!items.some(i=>!i.big);msg.textContent=''};
+function set(it,t,p){it.d.querySelector('.st').textContent=t;if(p!=null)it.d.querySelector('.bar i').style.width=Math.round(p*100)+'%'}
+async function api(u,b){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json','X-Fb':'1'},body:JSON.stringify(b),credentials:'same-origin'});
+if(r.status==401){location.href='/upload';throw new Error('login')}return r.json()}
+function put(url,f,on){return new Promise((ok,bad)=>{const x=new XMLHttpRequest();x.open('PUT',url);x.setRequestHeader('x-upsert','false');
+x.setRequestHeader('Content-Type',f.type||'application/octet-stream');x.upload.onprogress=e=>{if(e.lengthComputable)on(e.loaded/e.total)};
+x.onload=()=>x.status<300?ok():bad(new Error('upload '+x.status));x.onerror=()=>bad(new Error('network'));x.send(f)})}
+async function one(it,cat){const f=it.f;const cap=(it.d.querySelector('input')||{}).value||'';
+try{set(it,'⏳ Taiyaari…',0.02);const s=await api('/upload/api/sign',{name:f.name,size:f.size,type:f.type});
+if(s.dup){set(it,'♻️ Pehle se bot me hai: '+s.title,1);return}if(!s.ok){set(it,'❌ '+(s.error||'nahi hua'),0);return}
+await put(s.upload_url,f,p=>set(it,'⬆️ Upload '+Math.round(p*100)+'%',p*0.85));
+set(it,'🤖 Bot me save ho rahi hai (naam + category)…',0.9);
+const d=await api('/upload/api/done',{path:s.path,sig:s.sig,name:f.name,caption:cap,category:cat});
+set(it,(d.ok?'':'❌ ')+(d.text||d.error||'?'),d.ok?1:0);if(d.ok)it.d.querySelector('.st').classList.add('ok')}
+catch(e){set(it,'❌ Nahi hua ('+e.message+') — dobara try karo',0)}}
+go.onclick=async()=>{go.disabled=true;fi.disabled=true;const cat=document.getElementById('cat').value;
+for(const it of items){if(it.big)continue;await one(it,cat)}msg.innerHTML='<span class="ok">✅ Ho gaya. Aur files ke liye dobara chuno.</span>';fi.disabled=false;fi.value=''};
+</script></body></html>"""
+
+
+def upl_html(body: str, status: int = 200) -> Any:
+    from flask import make_response
+    resp = make_response(body, status)
+    resp.headers["Content-Type"] = "text/html; charset=utf-8"
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["X-Robots-Tag"] = "noindex"
+    return resp
+
+
+def upl_login_page(err: str = "", status: int = 200) -> Any:
+    return upl_html(UPL_LOGIN_HTML.replace("%%CSS%%", UPL_CSS).replace("%%ERR%%", f'<div class="err">{esc(err)}</div>' if err else ""), status)
+
+
+def upl_redirect_home(tok: Optional[str] = None) -> Any:
+    from flask import redirect
+    resp = redirect("/upload", code=303)
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    return _upl_cookie(resp, tok) if tok else resp
+
+
+@app.get("/upload")
+def upload_page() -> Any:
+    _REQ.clear()
+    m = request.args.get("m", "")
+    if m:
+        ok = False
+        if re.fullmatch(r"[A-Za-z0-9_-]{20,64}", m):
+            key = "uplm:" + hashlib.sha256(m.encode()).hexdigest()[:32]
+            exp = get_setting(key)
+            if exp:
+                supabase("bot_settings", "DELETE", query="?key=eq." + urllib.parse.quote(key))
+                ok = float(exp) > time.time()
+        if not ok:
+            return upl_login_page("⌛ Ye link purana ya pehle use ho chuka hai. Bot me /upload dobara bhejo.", 403)
+        return upl_redirect_home(upl_session_make())
+    if not upl_ready():
+        return upl_login_page("Upload page ka password abhi set nahi hai — bot me /upload bhejo.")
+    if not upl_authed():
+        return upl_login_page()
+    opts = "".join(f'<option value="{esc(s)}">{esc(l)}</option>' for s, l in upl_categories())
+    return upl_html(UPL_PAGE_HTML.replace("%%CSS%%", UPL_CSS).replace("%%OPTS%%", opts).replace("%%MAX%%", str(UPLOAD_MAX)))
+
+
+@app.post("/upload/login")
+def upload_login() -> Any:
+    _REQ.clear()
+    _LOG_QUEUE.clear()
+    ip = upl_client_ip()
+    rl = upl_rl()
+    wait = upl_locked(rl, ip)
+    if wait:
+        return upl_login_page(f"🔒 Bahut baar galat password. {max(1, wait // 60)} min baad try karo (ya bot me /upload).", 429)
+    pw = (request.form.get("password") or "")[:200]
+    if not upl_ready() or not upl_password_ok(pw):
+        upl_note_fail(rl, ip)
+        flush_request()
+        return upl_login_page("❌ Password galat hai.", 401)
+    return upl_redirect_home(upl_session_make())
+
+
+@app.get("/upload/logout")
+def upload_logout() -> Any:
+    resp = upl_redirect_home()
+    resp.set_cookie("fbup", "", max_age=0, path="/upload")
+    return resp
+
+
+def upl_api_guard() -> Optional[Any]:
+    if request.headers.get("X-Fb") != "1" or not upl_authed():
+        return jsonify({"ok": False, "error": "login chahiye"}), 401
+    return None
+
+
+def upl_clean_name(v: Any) -> str:
+    return re.sub(r"[\\/:*?\"<>|\r\n\t]+", " ", str(v or "file")).strip()[:150] or "file"
+
+
+@app.post("/upload/api/sign")
+def upload_sign() -> Any:
+    _REQ.clear()
+    g = upl_api_guard()
+    if g:
+        return g
+    b = request.get_json(silent=True) or {}
+    name = upl_clean_name(b.get("name"))
+    try:
+        size = int(b.get("size") or 0)
+    except (TypeError, ValueError):
+        size = 0
+    ext = os.path.splitext(name)[1].lower()
+    if ext not in WEB_EXTS:
+        return jsonify({"ok": False, "error": "ye file type support nahi (PDF, Word, PPT, Excel, ZIP/RAR, EPUB, TXT, photo)"})
+    if size <= 0:
+        return jsonify({"ok": False, "error": "khali file"})
+    if size > UPLOAD_MAX:
+        return jsonify({"ok": False, "error": f"file {human_size(size)} ki hai — limit 50 MB (badi file Telegram me seedha bot ko bhejo)"})
+    try:
+        if ub_known([{"n": name, "s": size}])[0]:
+            return jsonify({"ok": True, "dup": True, "title": web_dup_title(name, size) or name})
+    except Exception:
+        log_error("upl dup")
+    if not upl_bucket_ready():
+        return jsonify({"ok": False, "error": "storage abhi taiyaar nahi — thodi der baad try karo"})
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.splitext(name)[0])[:60].strip("._") or "file"
+    path = f"u/{int(time.time())}-{os.urandom(6).hex()}-{safe}{ext}"
+    try:
+        rel = (upl_storage("POST", f"object/upload/sign/{WEB_BUCKET}/{path}", {}) or {}).get("url") or ""
+        if not rel:
+            raise RuntimeError("no url")
+    except Exception:
+        log_error("upl sign")
+        return jsonify({"ok": False, "error": "upload link nahi bana — dobara try karo"})
+    return jsonify({"ok": True, "upload_url": f"{SUPABASE_URL}/storage/v1{rel}", "path": path, "sig": upl_path_sig(path)})
+
+
+@app.post("/upload/api/done")
+def upload_done() -> Any:
+    _REQ.clear()
+    _LOG_QUEUE.clear()
+    _REQ_T0[0] = time.monotonic()
+    g = upl_api_guard()
+    if g:
+        return g
+    b = request.get_json(silent=True) or {}
+    path = str(b.get("path") or "")
+    if not re.fullmatch(r"u/\d+-[0-9a-f]{12}-[A-Za-z0-9._-]+", path) or \
+            not hmac.compare_digest(str(b.get("sig") or ""), upl_path_sig(path)):
+        return jsonify({"ok": False, "error": "galat request"}), 400
+    name = upl_clean_name(b.get("name"))
+    if os.path.splitext(name)[1].lower() != os.path.splitext(path)[1].lower():
+        name = os.path.splitext(name)[0] + os.path.splitext(path)[1]
+    caption = re.sub(r"\s+", " ", str(b.get("caption") or "")).strip()[:300]
+    cat = str(b.get("category") or "").strip()[:40]
+    try:
+        data = upl_storage("GETBYTES", f"object/{WEB_BUCKET}/{path}", None, 90)
+    except Exception:
+        log_error("upl get")
+        return jsonify({"ok": False, "error": "upload hui file nahi mili — dobara upload karo"})
+    try:
+        if not data:
+            return jsonify({"ok": False, "error": "khali file"})
+        if len(data) > UPLOAD_MAX:
+            return jsonify({"ok": False, "error": "file 50 MB se badi"})
+        if web_looks_html(data[:5000], ""):
+            return jsonify({"ok": False, "error": "ye webpage (HTML) hai, file nahi"})
+        name = web_fix_name(name, "", data[:64])
+        _REQ.pop("prefetch", None)
+        r = web_ingest(data, name, "upload", caption=caption, force_cat=cat)
+    except Exception:
+        log_error("upl done")
+        r = {"state": "failed", "why": "kuch gadbad hui — dobara try karo", "title": name}
+    finally:
+        _REQ.pop("prefetch", None)
+        upl_delete(path)
+    flush_request()
+    return jsonify({"ok": r.get("state") not in ("failed",), "state": r.get("state"), "title": r.get("title"),
+                    "text": web_short_line(r) if r.get("state") != "failed" else f"Nahi hua: {r.get('why')}"})
+
+
+# ---- bot side: /upload (link + password), /uploadpass (new password, owner)
+def upl_bot_text() -> str:
+    pw = upl_current_password()
+    lines = ["⬆️ <b>Upload page</b> — phone se files bot me daalo", "",
+             "🔗 Bina password (15 min, ek baar): " + esc(upl_magic_link()), "",
+             "🌐 Hamesha wala page: " + esc(PUBLIC_HOME + "upload")]
+    if upl_env_pw():
+        lines.append("🔑 Password: Vercel env UPLOAD_PASSWORD wala")
+    elif pw:
+        lines.append(f"🔑 Password: <code>{esc(pw)}</code>")
+    else:
+        lines.append("🔑 Password abhi set nahi — /uploadpass se banao")
+    lines += ["", "Steps: page kholo → 📂 Files chuno → (Category / naam optional) → ⬆️ Upload karo. Ek file max 50 MB.",
+              "Naya password chahiye (purana band): /uploadpass"]
+    return "\n".join(lines)
+
+
+def upl_pass_reset(chat_id: Any) -> None:
+    pw = upl_new_password()
+    upl_set_password(pw)
+    audit_log(f"🔑 Upload page ka password badla · {ist_now()}")
+    send_text(int(chat_id), f"✅ Naya upload password: <code>{esc(pw)}</code>\nPurana password aur purane login ab band.\n"
+                            f"Page: {esc(PUBLIC_HOME + 'upload')}", None, "HTML")
+
+
+# ---- diag (token): web-file status, route dry run, link probe (no save), real link run, set the upload password (POST)
+def web_status() -> Dict[str, Any]:
+    q, bq = webq_load(), webq_load(WEB_BIG_KEY)
+    cnt = lambda qq: {s: sum(1 for j in qq if j.get("st") == s) for s in ("pending", "running", "done", "failed") if any(j.get("st") == s for j in qq)}
+    return {"links": "on (owner chat)", "queue": cnt(q), "big_queue": cnt(bq), "inline_max_mb": WEB_INLINE_MAX // 1048576,
+            "upload_page": ("ready" if upl_ready() else "no_password") + (" (env)" if upl_env_pw() else ""),
+            "upload_storage": "ok" if get_setting("upl:bucket") == "1" else "not_created_yet"}
+
+
+@app.route("/api/webdiag", methods=["GET", "POST"])
+def webdiag() -> Any:
+    body = request.get_json(silent=True) or {} if request.method == "POST" else {}
+    tok = request.args.get("t", "") or str(body.get("t") or "")
+    if not tok or not hmac.compare_digest(hashlib.sha256(tok.encode()).hexdigest(), DIAG_TOKEN_SHA256):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    _REQ.clear()
+    _LOG_QUEUE.clear()
+    _REQ_T0[0] = time.monotonic()
+    op = request.args.get("op", "") or str(body.get("op") or "")
+    out: Dict[str, Any] = {"ok": True, "op": op}
+    if op == "status":
+        out["web"] = web_status()
+    elif op == "route":
+        uid = 1 if request.args.get("as") == "user" else (min(ADMIN_USER_IDS) if ADMIN_USER_IDS else 1)
+        text = request.args.get("text", "")
+        msg = {"chat": {"id": uid, "type": "private"}, "from": {"id": uid}, "text": text}
+        urls = web_link_urls(text)
+        out.update({"as": "user" if uid == 1 else "owner", "takes_link": web_wants_links(uid, msg), "urls": urls,
+                    "kinds": [web_rewrite(u)["kind"] for u in urls]})
+    elif op == "probe":
+        url = request.args.get("url", "")
+        rw = web_rewrite(url)
+        out["rewrite"] = {k: v for k, v in rw.items() if k != "url"}
+        try:
+            if rw["kind"] == "folder":
+                f = web_drive_folder(rw["id"])
+                out["folder"] = {"files": len(f["files"]), "first": [x["n"] for x in f["files"][:5]], "subfolders": f["folders"]}
+            elif rw["kind"] in ("file", "page"):
+                r = web_probe(rw["url"], WEB_INLINE_MAX)
+                if r["kind"] == "html" and rw.get("drive"):
+                    conf = web_drive_confirm(r["html"])
+                    out["drive_confirm"] = bool(conf)
+                    if conf:
+                        r = web_probe(conf, WEB_INLINE_MAX)
+                out["kind"] = r["kind"]
+                out["final_host"] = web_host_of(r.get("final", ""))
+                if r["kind"] == "file":
+                    out.update({"name": r["name"], "size": r["size"], "ctype": r["ctype"]})
+                elif r["kind"] == "big":
+                    out.update({"name": r["name"], "size": r["size"]})
+                else:
+                    links = web_page_links(r["html"], r["final"])
+                    out["page_links"] = [{"n": l["n"], "host": web_host_of(l["u"])} for l in links[:12]]
+                    out["mediafire_direct"] = bool(web_mediafire_direct(r["html"]))
+        except WebErr as exc:
+            out["refused"] = str(exc)
+    elif op == "link" and request.method == "POST":
+        url = str(body.get("url") or "")
+        _WEB_OUT.clear()
+        job = {"j": "diag", "u": url, "chat": None, "uid": min(ADMIN_USER_IDS) if ADMIN_USER_IDS else 0, "nm": str(body.get("nm") or "")}
+        if web_is_paid(url):
+            _WEB_OUT.append(WEB_PAID_TEXT)
+        else:
+            web_run_job(job)
+        out["replies"] = list(_WEB_OUT)
+        out["ms"] = int((time.monotonic() - _REQ_T0[0]) * 1000)
+        flush_request()
+    elif op == "set_pw" and request.method == "POST":
+        pw = str(body.get("pw") or "")
+        if len(pw) < 16:
+            return jsonify({"ok": False, "error": "too short"}), 400
+        upl_set_password(pw)
+        out["set"] = True
+        out["v"] = upl_version()
+    else:
+        out["ok"] = False
+        out["error"] = "ops: status | route&text= | probe&url= | POST link {url} | POST set_pw {pw}"
     return jsonify(out)
 
 

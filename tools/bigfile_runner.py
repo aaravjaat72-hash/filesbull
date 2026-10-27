@@ -8,6 +8,7 @@ in over MTProto (Telethon, in-memory session) where bots may download/upload up 
   2. per job: download the file from its Backup channel post (or source post), upload it as a document named
      "<clean name>.<ext>" with the caption "📄 name / 🗂️ subject" to the Backup channel, delete the temp file
   3. report to POST {BOT_URL}/api/bigfile-done, signed HMAC-SHA256 with the one-job key the bot gave.
+Also 🌐 big web links (kind "web", > 49 MB): download the URL (public addresses only) and upload it into the 📥 Inbox.
 Secrets are never printed (and are masked in the log).
 """
 import asyncio, hashlib, hmac, json, os, shutil, subprocess, sys, tempfile, time, urllib.request, urllib.error
@@ -78,7 +79,91 @@ async def resolve(client, chat_id):
     return await client.get_input_entity(int(chat_id))
 
 
+def _ip_ok(ip):
+    import ipaddress
+    try:
+        a = ipaddress.ip_address(ip.split("%")[0])
+    except ValueError:
+        return False
+    if getattr(a, "ipv4_mapped", None):
+        a = a.ipv4_mapped
+    return a.is_global and not (a.is_private or a.is_loopback or a.is_link_local or a.is_multicast or a.is_reserved)
+
+
+def web_download(job, path):
+    """🌐 big web link (bot gave the already-resolved file URL): stream it to disk. Every redirect hop must resolve to
+    public addresses only; size capped at job['max']."""
+    import socket, urllib.parse
+    url, cap = job["url"], int(job.get("max") or 1900 * 1048576)
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **k):
+            return None
+    opener = urllib.request.build_opener(NoRedirect)
+    for _ in range(8):
+        u = urllib.parse.urlsplit(url)
+        if u.scheme not in ("http", "https") or not u.hostname:
+            raise RuntimeError("link http/https nahi")
+        ips = [i[4][0] for i in socket.getaddrinfo(u.hostname, u.port or (443 if u.scheme == "https" else 80), 0, socket.SOCK_STREAM)]
+        if not ips or not all(_ip_ok(ip) for ip in ips):
+            raise RuntimeError("private/local address")
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Chrome/126.0 filesbull-bot", "Accept": "*/*"})
+        try:
+            r = opener.open(req, timeout=60)
+        except urllib.error.HTTPError as e:
+            if e.code in (301, 302, 303, 307, 308) and e.headers.get("Location"):
+                url = urllib.parse.urljoin(url, e.headers["Location"])
+                continue
+            raise RuntimeError(f"website ne HTTP {e.code} diya")
+        break
+    else:
+        raise RuntimeError("bahut redirect")
+    ctype = (r.headers.get("Content-Type") or "").split(";")[0].lower()
+    if ctype in ("text/html", "application/xhtml+xml"):
+        raise RuntimeError("link file nahi, webpage hai")
+    got = 0
+    t0 = time.time()
+    with open(path, "wb") as f:
+        while True:
+            piece = r.read(1 << 20)
+            if not piece:
+                break
+            got += len(piece)
+            if got > cap:
+                raise RuntimeError("file limit se badi")
+            f.write(piece)
+    if got == 0:
+        raise RuntimeError("khali file")
+    with open(path, "rb") as f:
+        head = f.read(600).lstrip().lower()
+    if head.startswith((b"<!doctype html", b"<html")):
+        raise RuntimeError("link file nahi, webpage hai")
+    print(f"web download {got / 1048576:.1f} MB in {time.time() - t0:.1f}s")
+    return got
+
+
+async def do_web_job(client, job, tmp):
+    from telethon.tl.types import DocumentAttributeFilename
+    name = job["file_name"]
+    work = os.path.join(tmp, job["j"])
+    os.makedirs(work, exist_ok=True)
+    path = os.path.join(work, "dl.bin")
+    size = await asyncio.get_running_loop().run_in_executor(None, web_download, job, path)
+    target = await resolve(client, job["to"])
+    t1 = time.time()
+    sent = await client.send_file(target, path, caption=job.get("caption") or "", force_document=True,
+                                  attributes=[DocumentAttributeFilename(name)], parse_mode=None)
+    print(f"uploaded in {time.time() - t1:.1f}s")
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    return {"ok": True, "chat_id": int(job["to"]), "message_id": int(sent.id), "file_name": name, "size": size}
+
+
 async def do_job(client, job, tmp):
+    if job.get("kind") == "web":
+        return await do_web_job(client, job, tmp)
     from telethon.tl.types import DocumentAttributeFilename
     src_msg = None
     last_err = "file post nahi mila"
