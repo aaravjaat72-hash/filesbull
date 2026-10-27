@@ -6990,11 +6990,11 @@ REUPLOAD_LIMIT = 15 * 1024 * 1024
 
 def download_file(file_id: Optional[str], file_size: Optional[int]) -> Optional[bytes]:
     """The file's bytes (≤20 MB, Telegram's limit for bots); None when bigger / unavailable."""
+    hit = (_REQ.get("prefetch") or {}).get(str(file_id or ""))
+    if hit:
+        return hit           # 🌐 web file: the bytes we just uploaded (no second download; also > 20 MB, ≤ 49 MB)
     if not file_id or not BOT_TOKEN or (file_size and int(file_size) > TG_FILE_LIMIT):
         return None
-    hit = (_REQ.get("prefetch") or {}).get(str(file_id))
-    if hit:
-        return hit           # 🌐 web file: the bytes we just uploaded (no second download)
     try:
         path = (telegram("getFile", {"file_id": file_id}).get("result") or {}).get("file_path")
         if not path:
