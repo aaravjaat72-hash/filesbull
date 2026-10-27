@@ -867,10 +867,15 @@ def try_approve_join(user_id: int, chat_id: Any, force: bool = False) -> bool:
     try:
         telegram("approveChatJoinRequest", {"chat_id": chat_id, "user_id": int(user_id)})
         gate_event("approved", user_id, chat_id)
+        jreq_mark(int(user_id), chat_id)
         return True
     except Exception as exc:
         low = str(exc).lower()
         if "user_already_participant" in low or "already a participant" in low:
+            # Telegram's own join system says the user IS inside, even when getChatMember answers "left" (seen live
+            # Oct 27 for Aarav's account in both join channels) → trust it and remember it (cleared on a real leave).
+            gate_event("participant", user_id, chat_id)
+            jreq_mark(int(user_id), chat_id)
             return True
         if "hide_requester_missing" not in low and "user not found" not in low:
             gate_event("approve_err", user_id, chat_id, re.sub(r"\d{6,}", "<id>", str(exc))[:80])
@@ -1187,6 +1192,9 @@ def handle_chat_member(cm: Dict[str, Any]) -> None:
         return
     status = new.get("status")
     if not (status in JOINED_STATUSES or (status == "restricted" and new.get("is_member"))):
+        if status in ("left", "kicked") and str(cid) in jreq_get(uid):
+            jreq_mark(uid, cid, on=False)       # a real leave: the remembered request/participant mark goes too
+            gate_event("leave", uid, cid, status)
         return
     gate_event("join", uid, cid, status)
     gate_recheck(uid, user)
@@ -14611,7 +14619,8 @@ def webdiag() -> Any:
                     except Exception as exc:
                         _raw[str(ch.get("title"))[:30] + " member"] = "ERR " + str(exc)[:80]
                 row_u["raw"] = _raw
-            row_u["missing"] = [c.get("title") for c in missing_required(u, reqs, approve=False)]
+            row_u["missing_by_getchatmember"] = [c.get("title") for c in missing_required(u, reqs, approve=False)]
+            row_u["missing"] = [c.get("title") for c in missing_required(u, reqs)]
             users.append(row_u)
         out["users"] = users
         try:
