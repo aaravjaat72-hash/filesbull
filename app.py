@@ -60,6 +60,87 @@ WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip() or (
 )
 
 
+# ================================================================ CONFIG REGISTRY (universal repo, Oct 27 2026)
+# EVERY setting this bot reads, in one place. A fork / a new bot = deploy this repo on Vercel and fill the
+# REQUIRED ones (see .env.example + README). Nothing secret has a default in code: tokens/keys come only from the
+# environment (or are derived from BOT_TOKEN when that is noted). Non-secret values are read at runtime
+# (Vercel system vars, Telegram getMe) so a fork needs nothing for them.
+# (name, need, default, secret, what it does — where to get it)   need: required | recommended | optional
+CONFIG_VARS: List[tuple] = [
+    ("BOT_TOKEN", "required", "", True, "Telegram bot token — @BotFather → /newbot (or /token)"),
+    ("SUPABASE_URL", "required", "", False, "Supabase project URL — supabase.com → Project Settings → API → Project URL"),
+    ("SUPABASE_SERVICE_ROLE_KEY", "required", "", True, "Supabase service_role / secret key (server only) — Project Settings → API keys"),
+    ("ADMIN_USER_IDS", "required", "", False, "Owner Telegram numeric id(s), comma separated — @userinfobot, or send /myid to your bot"),
+    ("WEBHOOK_SECRET", "optional", "derived from BOT_TOKEN", True, "Secret Telegram sends with every update (forged updates are refused)"),
+    ("PUBLIC_URL", "optional", "auto: VERCEL_PROJECT_PRODUCTION_URL", False, "Public https address of the bot (only if not on Vercel / custom domain)"),
+    ("BOT_NAME", "optional", "auto: the bot's Telegram name (getMe)", False, "Display name in welcome / setup texts"),
+    ("GROQ_API_KEY", "recommended", "", True, "AI (free) — console.groq.com/keys. Also GROQ_API_KEY_2, GROQ_API_KEY_3 as backups"),
+    ("GROQ_API_KEY_2", "optional", "", True, "Groq backup key"),
+    ("GROQ_API_KEY_3", "optional", "", True, "Groq backup key"),
+    ("GROQ_MODEL", "optional", "auto", False, "Pin a Groq model (normally the bot picks)"),
+    ("GEMINI_API_KEY", "optional", "", True, "AI — aistudio.google.com/apikey (also GEMINI_API_KEY_2 / GOOGLE_API_KEY)"),
+    ("GEMINI_API_KEY_2", "optional", "", True, "Gemini backup key"),
+    ("GOOGLE_API_KEY", "optional", "", True, "Gemini key (other name)"),
+    ("MISTRAL_API_KEY", "optional", "", True, "AI — console.mistral.ai → API Keys (also MISTRAL_API_KEY_2)"),
+    ("MISTRAL_API_KEY_2", "optional", "", True, "Mistral backup key"),
+    ("OPENROUTER_API_KEY", "optional", "", True, "AI — openrouter.ai/keys (also OPENROUTER_API_KEY_2)"),
+    ("OPENROUTER_API_KEY_2", "optional", "", True, "OpenRouter backup key"),
+    ("NVIDIA_API_KEY", "optional", "", True, "AI — build.nvidia.com → Get API Key (also NVIDIA_API_KEY_2)"),
+    ("NVIDIA_API_KEY_2", "optional", "", True, "NVIDIA backup key"),
+    ("OPENAI_API_KEY", "optional", "", True, "AI (paid) — platform.openai.com/api-keys"),
+    ("OPENAI_MODEL", "optional", "gpt-5-mini", False, "OpenAI model"),
+    ("AI_DAILY_PER_USER", "optional", "12", False, "AI chat calls per user per day"),
+    ("AI_DAILY_LIMIT", "optional", "2000", False, "AI calls per day, whole bot"),
+    ("AI_UNDERSTAND", "optional", "1", False, "1 = AI reads each search message first (0 = local parser only)"),
+    ("AI_UNDERSTAND_DAILY", "optional", "40", False, "AI message readings per user per day"),
+    ("AI_RANK", "optional", "off", False, "1 = AI re-ranks search results"),
+    ("ADMIN_AI_DAILY", "optional", "60", False, "AI admin commands per day"),
+    ("AI_NAME_DAILY", "optional", "600", False, "AI file namings per day"),
+    ("AGENT_AI_DAILY", "optional", "300", False, "AI agent-mode turns per day (admin chat)"),
+    ("TG_API_ID", "recommended", "", False, "Telegram API id — my.telegram.org → API development tools (userbot + files > 20 MB)"),
+    ("TG_API_HASH", "recommended", "", True, "Telegram API hash — same page as TG_API_ID"),
+    ("GH_TOKEN", "recommended", "", True, "GitHub token that may start this repo's Actions (fine-grained: Actions + Variables read/write on this repo). Also read: GH_DISPATCH_TOKEN, GITHUB_TOKEN, GH_PAT, GITHUB_PAT"),
+    ("GH_REPO", "optional", "auto: VERCEL_GIT_REPO_OWNER/VERCEL_GIT_REPO_SLUG", False, "owner/repo whose GitHub Actions run the userbot + big files"),
+    ("GH_BRANCH", "optional", "main", False, "Branch the Actions run on"),
+    ("USERBOT_SECRET", "optional", "derived from BOT_TOKEN", True, "Key that encrypts the saved userbot session (set it if you may change BOT_TOKEN later)"),
+    ("BIGFILE_SECRET", "optional", "derived from BOT_TOKEN", True, "Key that signs big-file job reports"),
+    ("UPLOAD_PASSWORD", "optional", "auto (bot makes one; /upload shows it)", True, "Password of the /upload page"),
+    ("UPLOAD_SECRET", "optional", "derived from BOT_TOKEN", True, "Key that signs /upload logins"),
+    ("UPLOAD_BUCKET", "optional", "filesbull-uploads", False, "Private Supabase Storage bucket for /upload temp files (auto-created)"),
+    ("WEB_INLINE_MAX_MB", "optional", "49", False, "Link files up to this size go in directly; bigger ones via the GitHub Action"),
+    ("UB_MAX_PER_RUN", "optional", "40", False, "Max files the userbot forwards per run (~10 min)"),
+    ("DIAG_TOKEN", "optional", "off", True, "Token for the /api/*diag endpoints (developer only). Or DIAG_TOKEN_SHA256 = its sha256"),
+    ("DIAG_TOKEN_SHA256", "optional", "off", False, "sha256 hex of the diag token (instead of DIAG_TOKEN)"),
+    ("SUPABASE_ACCESS_TOKEN", "optional", "", True, "Supabase personal access token — lets the bot create its tables itself (else run setup.sql once)"),
+]
+CONFIG_NAMES = {c[0] for c in CONFIG_VARS}
+# Platform variables read but never set by you: Vercel (VERCEL_*), GitHub Actions (GITHUB_*, ACTIONS_*), PORT (local).
+
+
+def config_missing() -> List[str]:
+    """Names of REQUIRED settings that are empty (names only, never values)."""
+    return [n for n, need, *_ in CONFIG_VARS if need == "required" and not os.environ.get(n, "").strip()]
+
+
+def _host_only(v: str) -> str:
+    return str(v or "").replace("https://", "").replace("http://", "").strip().strip("/")
+
+
+def public_host_source() -> tuple:
+    """(host, source) of the bot's public address: PUBLIC_URL → Vercel production URL → the original host."""
+    for n in ("PUBLIC_URL", "VERCEL_PROJECT_PRODUCTION_URL"):
+        v = _host_only(os.environ.get(n, ""))
+        if v:
+            return v, "env:" + n
+    return LEGACY_PUBLIC_HOST, "default"
+
+
+LEGACY_PUBLIC_HOST = "filesbull.vercel.app"     # the original deployment (non-secret; used only when nothing else is known)
+LEGACY_REPO = "aaravjaat72-hash/filesbull"      # the original repo (non-secret; used only when nothing else is known)
+LEGACY_BOT_USERNAME = "filesbull_bot"
+LEGACY_BRAND = "Files Bull"
+
+
 def log_error(where: str) -> None:
     # Printed tracebacks show up in Vercel -> Project -> Logs. Never print the token.
     text = traceback.format_exc()
@@ -168,7 +249,7 @@ def http_json(url: str, method: str = "GET", payload: Optional[Dict[str, Any]] =
     body = None
     # A browser-like/app User-Agent: Cloudflare-fronted APIs (Groq) answer 403 "error code 1010"
     # to Python's default "Python-urllib" agent.
-    final_headers = {"Content-Type": "application/json", "User-Agent": "filesbull-bot/1.0 (+https://filesbull.vercel.app)"}
+    final_headers = {"Content-Type": "application/json", "User-Agent": "filesbull-bot/1.0 (+https://" + public_host_source()[0] + ")"}
     if headers:
         final_headers.update(headers)
     if payload is not None:
@@ -500,6 +581,50 @@ def bot_mention() -> str:
         return "bot"
 
 
+def bot_username() -> str:
+    try:
+        return str(bot_info().get("username") or "")
+    except Exception:
+        return ""
+
+
+def brand() -> str:
+    """Display name: env BOT_NAME → "Files Bull" for the original @filesbull_bot → the bot's own Telegram name."""
+    v = os.environ.get("BOT_NAME", "").strip()
+    if v:
+        return v
+    try:
+        info = bot_info()
+    except Exception:
+        info = {}
+    un = str(info.get("username") or "")
+    if not un or un.lower() == LEGACY_BOT_USERNAME:
+        return LEGACY_BRAND
+    return str(info.get("first_name") or un)
+
+
+def brandify(text: str) -> str:
+    """Original names in fixed texts → this deployment's names (no change for the original @filesbull_bot)."""
+    t = str(text)
+    if "filesbull" not in t.lower() and LEGACY_BRAND not in t:
+        return t
+    un = bot_username()
+    if un:
+        t = t.replace("@" + LEGACY_BOT_USERNAME, "@" + un)
+    b = brand()
+    if b != LEGACY_BRAND:
+        t = t.replace(LEGACY_BRAND, b).replace("filesbull ", brand_tag() + " ")
+    return t
+
+
+def brand_tag() -> str:
+    """Short name used in chat / channel titles: "filesbull" for the original bot, else the display name."""
+    if os.environ.get("BOT_NAME", "").strip():
+        return brand()
+    b = brand()
+    return "filesbull" if b == LEGACY_BRAND else b
+
+
 def role_of(user_id: Optional[int]) -> str:
     if is_admin(user_id):
         return "owner"
@@ -800,8 +925,14 @@ def welcome_text(user: Optional[Dict[str, Any]], admin: bool = False) -> str:
     if admin:
         return (f"👋 <b>Namaste Admin, {first_name(user)}!</b>\n\n"
                 "Book / PDF ka naam likho — ya ⚙️ Admin Panel kholo.")
-    return (f"📚 <b>Files Bull me swagat hai, {first_name(user)}!</b>\n\n"
+    text = (f"📚 <b>{html.escape(brand())} me swagat hai, {first_name(user)}!</b>\n\n"
             "Book / PDF ka naam, subject ya exam likho — main turant dhoondh dunga 🔍")
+    if not ADMIN_USER_IDS and user and user.get("id"):
+        # first run of a new deployment: nobody is owner yet → tell the person how to become owner (their own id only)
+        text += (f"\n\n🛠️ <b>Setup:</b> abhi koi owner set nahi hai. Aapka Telegram ID: <code>{int(user['id'])}</code>\n"
+                 "Vercel → Settings → Environment Variables me <code>ADMIN_USER_IDS</code> = ye ID daalo aur Redeploy karo.\n"
+                 "(No owner yet. Put this ID in ADMIN_USER_IDS on Vercel and redeploy.)")
+    return text
 
 
 def admin_start_menu() -> Dict[str, Any]:
@@ -933,6 +1064,7 @@ PICK_ACTIONS = {"ubinbox": 71, "ubalert": 73, "addsrc": 75, "addreq": 77, "setba
 
 def ask_input(chat_id: int, user_id: int, action: str, extra: Any = None, prefix: str = "") -> None:
     text, placeholder = PROMPTS[action]
+    text = brandify(text)
     set_pending(user_id, action, extra)
     if action in PICK_ACTIONS:
         ask_pick(chat_id, user_id, action, prefix)
@@ -946,6 +1078,7 @@ def ask_pick(chat_id: int, user_id: int, action: str, prefix: str = "") -> None:
     any other message (Aarav 11:17 PM Oct 26: it must never stay stuck under the input box)."""
     rid = PICK_ACTIONS[action]
     text, placeholder = PROMPTS[action]
+    text = brandify(text)
     send_text(chat_id, prefix + text + "\n\n👇 Niche se group/channel chuno (ya post forward karo)",
               {"keyboard": [[{"text": "👥 Group chuno", "request_chat": {"request_id": rid, "chat_is_channel": False}}],
                             [{"text": "📢 Channel chuno", "request_chat": {"request_id": rid + 1, "chat_is_channel": True}}]],
@@ -1334,7 +1467,7 @@ def handle_admin_input(message: Dict[str, Any], action: str, extra: Any) -> None
             if chat.get("type") == "channel" and member.get("status") == "administrator" and member.get("can_post_messages") is False:
                 raise InputError(f"Bot \"{chat.get('title', 'channel')}\" me admin hai par \"Post Messages\" permission off hai. Use on karke dobara bhejo.")
             try:
-                telegram("sendMessage", {"chat_id": chat["id"], "text": "✅ Files Bull backup channel set ho gaya. Bot ki saari files yahan ek-ek baar (bina duplicate) save hongi.",
+                telegram("sendMessage", {"chat_id": chat["id"], "text": brandify("✅ Files Bull backup channel set ho gaya. Bot ki saari files yahan ek-ek baar (bina duplicate) save hongi."),
                                          "disable_notification": True})
             except Exception as exc:
                 raise InputError("Bot is channel me message nahi bhej pa raha.\n" + friendly_tg_error(exc)) from None
@@ -1355,7 +1488,7 @@ def handle_admin_input(message: Dict[str, Any], action: str, extra: Any) -> None
                 chat = resolve_chat(message, text)
             role_guard(chat, "log")
             try:
-                telegram("sendMessage", {"chat_id": chat["id"], "text": "✅ filesbull log chat set ho gaya. Yahan logs aayenge."})
+                telegram("sendMessage", {"chat_id": chat["id"], "text": brandify("✅ filesbull log chat set ho gaya. Yahan logs aayenge.")})
             except Exception as exc:
                 raise InputError("Bot is chat me message nahi bhej pa raha. Bot ko wahan add/admin karo.\n" + friendly_tg_error(exc)) from None
             set_setting("log_chat_id", str(chat["id"]))
@@ -2707,7 +2840,7 @@ def drop_model(p: str, key: str, model: str) -> None:
 def _auth(p: str, key: str) -> Dict[str, str]:
     h = {"Authorization": f"Bearer {key}"}
     if p == "openrouter":
-        h.update({"HTTP-Referer": PUBLIC_HOME, "X-Title": "filesbull"})
+        h.update({"HTTP-Referer": PUBLIC_HOME, "X-Title": brand_tag()})
     return h
 
 
@@ -4042,6 +4175,7 @@ USER_MENU = [
 ADMIN_MENU = USER_MENU + [
     {"command": "admin", "description": "Admin Panel (saare buttons)"},
     {"command": "status", "description": "Admin: ID, role, channels status"},
+    {"command": "setup", "description": "Owner: setup checklist (naye bot ke liye)"},
     {"command": "restart", "description": "Admin: bot restart (webhook dobara set)"},
     {"command": "keys", "description": "Owner: AI keys jodo/hatao"},
     {"command": "requirechannel", "description": "Admin: join channel jodo"},
@@ -4504,6 +4638,11 @@ def handle_admin_command(message: Dict[str, Any]) -> None:
         send_text(chat_id, "🔑 Upload page ka naya password banau? Purana password aur purane login band ho jayenge.",
                   {"inline_keyboard": [[{"text": "✅ Haan, naya banao", "callback_data": "ad:uplpw:go"},
                                         {"text": "❌ Nahi", "callback_data": "ad:uplpw:no"}]]})
+    elif command == "/setup":
+        if not is_owner(user_id):
+            send_text(chat_id, "Ye sirf owner ke liye hai.")
+        else:
+            send_text(chat_id, setup_text(), None, "HTML")
     elif command in {"/admin", "/panel", "/menu"}:
         send_text(chat_id, ADMIN_PANEL_TEXT, admin_menu(user_id), "HTML")
     elif command == "/cancel":
@@ -4608,7 +4747,7 @@ def handle_admin_command(message: Dict[str, Any]) -> None:
     elif command == "/setlogchat" and not arg and message.get("chat", {}).get("type") in {"group", "supergroup", "channel"}:
         # Sent inside the group itself → this group becomes the Log Chat (no forwarding needed for groups).
         try:
-            telegram("sendMessage", {"chat_id": chat_id, "text": "✅ Ye group ab filesbull ka 📝 Log Chat hai. Saari updates yahan aayengi."})
+            telegram("sendMessage", {"chat_id": chat_id, "text": brandify("✅ Ye group ab filesbull ka 📝 Log Chat hai. Saari updates yahan aayengi.")})
             set_setting("log_chat_id", str(chat_id))
             _log_chat_mark(True)
         except Exception as exc:
@@ -6559,8 +6698,7 @@ def handle_admin_callback_v6(query: Dict[str, Any], cmd: str, chat_id: int, user
 
 
 
-PUBLIC_HOME = "https://" + (os.environ.get("PUBLIC_URL") or os.environ.get("VERCEL_PROJECT_PRODUCTION_URL")
-                            or "filesbull.vercel.app").replace("https://", "").replace("http://", "").strip("/") + "/"
+PUBLIC_HOME = "https://" + public_host_source()[0] + "/"   # PUBLIC_URL → Vercel production URL → this deployment
 ALLOWED_UPDATES = ["message", "channel_post", "callback_query"]
 
 
@@ -6570,8 +6708,8 @@ def webhook_url() -> str:
         req_host = request.host
     except RuntimeError:
         req_host = ""
-    host = os.environ.get("PUBLIC_URL") or os.environ.get("VERCEL_PROJECT_PRODUCTION_URL") or req_host or "filesbull.vercel.app"
-    host = host.replace("https://", "").replace("http://", "").strip("/")
+    host = (_host_only(os.environ.get("PUBLIC_URL", "")) or _host_only(os.environ.get("VERCEL_PROJECT_PRODUCTION_URL", ""))
+            or _host_only(req_host) or public_host_source()[0])
     return f"https://{host}/api/webhook"
 
 
@@ -6647,7 +6785,7 @@ def health() -> Any:
     try:
         # the settings the keepalive work below reads, in one round trip
         prefetch_settings(["webhook_fp", "commands_fp", "ainame_queue", "logfill_state", BIG_QUEUE_KEY, ROUTER_KEY, "ai_keys",
-                           "webq", "webbigq", "upl:bucket", "upl:sweep", "upl:pw", "webbig_kick"])
+                           "webq", "webbigq", "upl:bucket", "upl:sweep", "upl:pw", "webbig_kick", "gh:botvar", "diag_sha"])
     except Exception:
         pass
     if BOT_TOKEN:
@@ -6682,6 +6820,11 @@ def health() -> Any:
         web_keepalive()        # 🌐 link jobs left behind / old upload temp files
     except Exception:
         log_error("web keepalive")
+    try:
+        if GH_DISPATCH_TOKEN and SUPABASE_URL and SUPABASE_KEY and req_elapsed() < 6.0:
+            gh_sync_bot_url()  # repo variable BOT_URL for the Actions (at most every 6 h)
+    except Exception:
+        log_error("gh bot_url var")
     _REQ.clear()
     if request.args.get("full") == "1":
         status = setup_status()     # every table, channel, AI key and diagnostics check (slow: ~15–20 s)
@@ -6701,7 +6844,7 @@ def health() -> Any:
 def light_status() -> Dict[str, Any]:
     """The quick health page (GET /): env names, database reachable, AI on/off, big-file rename, keep-warm.
     Never secrets. Everything else (tables, channels, per-key checks, counts) is at /?full=1."""
-    st: Dict[str, Any] = {"mode": "light (full report: /?full=1)",
+    st: Dict[str, Any] = {"mode": "light (full report: /?full=1, setup checklist: /setup)",
                           "build": os.environ.get("VERCEL_GIT_COMMIT_SHA", "")[:7] or "local",
                           "env": {n: bool(v) for n, v in (("BOT_TOKEN", BOT_TOKEN), ("SUPABASE_URL", SUPABASE_URL),
                                                           ("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_KEY),
@@ -6718,6 +6861,8 @@ def light_status() -> Dict[str, Any]:
             st["database"] = "ok"
         except Exception as exc:
             st["database"] = "error: " + str(exc)[:120]
+            if re.search(r"PGRST205|42P01|does not exist|Could not find the table|404", str(exc)):
+                st["database_setup"] = db_autosetup()      # fresh project: tables made here when SUPABASE_ACCESS_TOKEN is set
     else:
         st["database"] = "not configured"
     try:
@@ -6743,7 +6888,188 @@ def light_status() -> Dict[str, Any]:
         st["web_files"] = web_status()           # 🌐 link se file + ⬆️ upload page
     except Exception:
         log_error("web status")
+    try:
+        cs = config_status()                     # universal repo: where each non-secret value comes from (names only)
+        st["config"] = {k: cs[k] for k in ("missing_required", "public_url_source", "github_repo", "github_repo_source",
+                                           "github_bot_url_var", "bot_name_source", "diag")}
+        if cs["missing_required"]:
+            st["setup_needed"] = "Missing: " + ", ".join(cs["missing_required"]) + " — see /setup and README"
+    except Exception:
+        log_error("config status")
     return st
+
+
+# ================================================================ FIRST-RUN SETUP (universal repo, Oct 27 2026)
+# A new deployment: open https://<your-app>.vercel.app/setup once (or send /setup to the bot as owner). It sets the
+# webhook, checks every required variable + database table, creates the tables itself when SUPABASE_ACCESS_TOKEN is
+# set (else shows "run setup.sql once"), and lists what is still left (owner, Backup channel, userbot, Actions).
+SETUP_SQL = '-- filesbull / universal Telegram file bot — ONE-TIME DATABASE SETUP (Supabase → SQL Editor → New query → paste → Run)\n-- Safe to run again any time (everything is "if not exists"). The bot can also run this itself when the\n-- optional Vercel variable SUPABASE_ACCESS_TOKEN is set. Same text as SETUP_SQL in app.py.\n\ncreate table if not exists public.channels (\n  id bigint generated by default as identity primary key,\n  chat_id bigint not null unique,\n  title text not null,\n  username text,\n  active boolean not null default true,\n  created_at timestamptz not null default now()\n);\n\ncreate table if not exists public.required_channels (\n  id bigint generated by default as identity primary key,\n  chat_id bigint not null unique,\n  title text not null,\n  username text,\n  invite_link text,\n  active boolean not null default true,\n  created_at timestamptz not null default now()\n);\n\ncreate table if not exists public.admins (\n  user_id bigint primary key,\n  role text not null default \'subadmin\',\n  can_manage_files boolean not null default true,\n  can_manage_channels boolean not null default false,\n  created_at timestamptz not null default now()\n);\n\ncreate table if not exists public.bot_settings (\n  key text primary key,\n  value text,\n  updated_at timestamptz not null default now()\n);\n\ncreate table if not exists public.books (\n  id bigint generated by default as identity primary key,\n  source_chat_id bigint not null,\n  source_chat_title text,\n  source_chat_username text,\n  source_message_id bigint not null,\n  source_link text,\n  telegram_file_id text,\n  telegram_file_unique_id text unique,\n  file_name text,\n  mime_type text,\n  file_size bigint,\n  title text not null,\n  caption text,\n  keywords text,\n  content_text text,\n  language text,\n  status text not null default \'indexed\',\n  created_at timestamptz not null default now(),\n  updated_at timestamptz not null default now()\n);\n\ncreate index if not exists books_title_idx on public.books(title);\ncreate index if not exists books_keywords_idx on public.books(keywords);\ncreate index if not exists books_source_chat_idx on public.books(source_chat_id);\n\nalter table public.books add column if not exists content_text text;\nalter table public.books add column if not exists backup_chat_id bigint;\nalter table public.books add column if not exists backup_message_id bigint;\n\ncreate table if not exists public.delivery_logs (\n  id bigint generated by default as identity primary key,\n  user_id bigint,\n  username text,\n  query text,\n  book_id bigint,\n  book_title text,\n  created_at timestamptz not null default now()\n);\n\nalter table public.channels enable row level security;\nalter table public.books enable row level security;\nalter table public.required_channels enable row level security;\nalter table public.admins enable row level security;\nalter table public.bot_settings enable row level security;\nalter table public.delivery_logs enable row level security;\n\n-- The server uses the Supabase service-role key and does not expose these tables directly to users.\n-- Never put SUPABASE_SERVICE_ROLE_KEY in browser/client code.\n\n-- ---- users table + delivery log columns (was migrate_users.sql)\ncreate table if not exists public.bot_users (\n  user_id bigint primary key,\n  first_name text,\n  last_name text,\n  username text,\n  first_seen timestamptz not null default now(),\n  last_seen timestamptz not null default now(),\n  verified boolean not null default false,\n  searches integer not null default 0,\n  files_received integer not null default 0\n);\ncreate index if not exists bot_users_last_seen_idx on public.bot_users (last_seen desc);\ncreate index if not exists bot_users_first_seen_idx on public.bot_users (first_seen desc);\nalter table public.bot_users enable row level security;\n\n-- delivery log: who got which file, for which search\nalter table public.delivery_logs add column if not exists username text;\nalter table public.delivery_logs add column if not exists query text;\ncreate index if not exists delivery_logs_user_idx on public.delivery_logs (user_id, created_at desc);\ncreate index if not exists delivery_logs_created_idx on public.delivery_logs (created_at desc);\n\n-- backup: find files not yet copied to the backup channel quickly\ncreate index if not exists books_backup_msg_idx on public.books (backup_message_id);\n\n-- ---- subject category column (was migrate_category.sql)\nalter table public.books add column if not exists category text;\ncreate index if not exists books_category_idx on public.books (category);\n'
+CORE_TABLES = ("books", "channels", "required_channels", "admins", "bot_settings", "delivery_logs")
+_SETUP_RUN: Dict[str, Any] = {"t": 0.0, "res": None}
+
+
+def db_missing_tables() -> Dict[str, str]:
+    """{table: "missing" | "error: …"} for core tables that can't be read (names only)."""
+    out: Dict[str, str] = {}
+    for t in CORE_TABLES + ("bot_users",):
+        try:
+            supabase(t, "GET", query="?select=*&limit=1")
+        except Exception as exc:
+            s = str(exc)
+            out[t] = "missing" if re.search(r"PGRST205|42P01|does not exist|Could not find the table|404", s) else "error: " + s[:80]
+    return out
+
+
+def db_autosetup(missing: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """Run SETUP_SQL through Supabase's Management API when SUPABASE_ACCESS_TOKEN is set (at most every 10 min)."""
+    tok = os.environ.get("SUPABASE_ACCESS_TOKEN", "").strip()
+    m = re.match(r"https://([a-z0-9]{8,40})\.supabase\.co", SUPABASE_URL or "")
+    if not tok:
+        return {"ran": False, "why": "SUPABASE_ACCESS_TOKEN not set — run setup.sql once in Supabase → SQL Editor"}
+    if not m:
+        return {"ran": False, "why": "SUPABASE_URL is not a *.supabase.co project URL — run setup.sql yourself"}
+    if time.time() - _SETUP_RUN["t"] < 600 and _SETUP_RUN["res"]:
+        return dict(_SETUP_RUN["res"], cached=True)
+    _SETUP_RUN["t"] = time.time()
+    try:
+        http_json(f"https://api.supabase.com/v1/projects/{m.group(1)}/database/query", "POST", {"query": SETUP_SQL},
+                  {"Authorization": f"Bearer {tok}", "Content-Type": "application/json", "User-Agent": "filesbull-setup"}, timeout=25)
+        res = {"ran": True, "ok": True}
+    except Exception as exc:
+        res = {"ran": True, "ok": False, "error": type(exc).__name__ + ": " + str(exc)[:120].replace(tok, "***")}
+    _SETUP_RUN["res"] = res
+    return res
+
+
+def config_status() -> Dict[str, Any]:
+    """Names, sources and yes/no only — never a value of a secret."""
+    host, hsrc = public_host_source()
+    repo, rsrc = gh_repo_source()
+    try:
+        bvar = json.loads(_setting_or_none("gh:botvar") or "{}")
+    except Exception:
+        bvar = {}
+    return {"missing_required": config_missing(),
+            "set": {n: bool(os.environ.get(n, "").strip()) for n, *_ in CONFIG_VARS},
+            "public_url": "https://" + host, "public_url_source": hsrc,
+            "github_repo": repo, "github_repo_source": rsrc, "github_branch": GH_BRANCH,
+            "github_bot_url_var": bvar.get("st") or "not checked",
+            "bot_name_source": "env:BOT_NAME" if os.environ.get("BOT_NAME", "").strip() else "telegram",
+            "diag": diag_source()}
+
+
+def gh_sync_bot_url(force: bool = False) -> str:
+    """Put this bot's address in the repo's Actions variable BOT_URL (so a fork's workflows find their bot with no
+    file edits). Needs GH_TOKEN with Variables write; at most every 6 h; result stored in bot_settings "gh:botvar"."""
+    if not GH_DISPATCH_TOKEN or not (SUPABASE_URL and SUPABASE_KEY):
+        return "no GH_TOKEN"
+    want = PUBLIC_HOME.rstrip("/")
+    try:
+        prev = json.loads(_setting_or_none("gh:botvar") or "{}")
+    except Exception:
+        prev = {}
+    if not force and prev.get("url") == want and time.time() - float(prev.get("t") or 0) < 6 * 3600:
+        return str(prev.get("st") or "")
+    hdr = {"Authorization": f"Bearer {GH_DISPATCH_TOKEN}", "Accept": "application/vnd.github+json",
+           "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "filesbull-bot", "Content-Type": "application/json"}
+    base = f"https://api.github.com/repos/{GH_REPO}/actions/variables"
+
+    def call(method: str, url: str, body: Optional[Dict[str, Any]] = None) -> tuple:
+        req = urllib.request.Request(url, data=json.dumps(body).encode() if body is not None else None, headers=hdr, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=6) as r:
+                raw = r.read()
+                return r.status, (json.loads(raw) if raw else {})
+        except urllib.error.HTTPError as e:
+            return e.code, {}
+
+    try:
+        st, cur = call("GET", base + "/BOT_URL")
+        if st == 200 and str(cur.get("value") or "").rstrip("/") == want:
+            res = "ok"
+        elif st == 200:
+            st2, _ = call("PATCH", base + "/BOT_URL", {"name": "BOT_URL", "value": want})
+            res = "updated" if st2 in (200, 204) else f"no permission (HTTP {st2})"
+        elif st == 404:
+            st2, _ = call("POST", base, {"name": "BOT_URL", "value": want})
+            res = "created" if st2 in (200, 201, 204) else f"no permission (HTTP {st2})"
+        else:
+            res = f"no permission (HTTP {st})"
+    except Exception as exc:
+        res = "error: " + type(exc).__name__
+    try:
+        set_setting("gh:botvar", json.dumps({"url": want, "st": res, "t": time.time()}))
+    except Exception:
+        pass
+    return res
+
+
+def setup_checklist(fix: bool = True) -> List[Dict[str, Any]]:
+    """[{ok: True/False/None, hi, en, fix}] — the first-run checklist (names and yes/no only)."""
+    items: List[Dict[str, Any]] = []
+
+    def add(ok: Any, hi: str, en: str, fixtxt: str = "") -> None:
+        items.append({"ok": ok, "hi": hi, "en": en, "fix": fixtxt})
+
+    miss = config_missing()
+    add(not miss, "Zaroori variables (Vercel)", "Required variables (Vercel)",
+        ("Missing: " + ", ".join(miss) + " → Vercel → Settings → Environment Variables → add → Redeploy") if miss else "")
+    if BOT_TOKEN:
+        try:
+            ensure_webhook()
+            me = bot_info()
+            add(True, f"Bot token sahi hai (@{me.get('username')}) + webhook set", f"Bot token OK (@{me.get('username')}) + webhook set")
+        except Exception as exc:
+            add(False, "Bot token / webhook", "Bot token / webhook", "BotFather token check karo: " + str(exc)[:80].replace(BOT_TOKEN, "***"))
+    db_ok = False
+    if SUPABASE_URL and SUPABASE_KEY:
+        missing = db_missing_tables()
+        core_missing = [t for t in CORE_TABLES if t in missing]
+        if core_missing and fix:
+            r = db_autosetup(missing)
+            if r.get("ran") and r.get("ok"):
+                missing = db_missing_tables()
+                core_missing = [t for t in CORE_TABLES if t in missing]
+        db_ok = not core_missing
+        add(db_ok, "Database tables", "Database tables",
+            "" if db_ok else ("Missing: " + ", ".join(core_missing) + " → Supabase → SQL Editor → setup.sql paste karke Run "
+                              "(ya SUPABASE_ACCESS_TOKEN set karo, bot khud bana dega)"))
+    add(bool(ADMIN_USER_IDS), "Owner set (ADMIN_USER_IDS)", "Owner set (ADMIN_USER_IDS)",
+        "" if ADMIN_USER_IDS else "Bot ko /start bhejo — wo aapka ID batayega → ADMIN_USER_IDS me daalo → Redeploy")
+    if db_ok:
+        add(bool(_setting_or_none("backup_chat_id")), "💾 Backup channel", "💾 Backup channel",
+            "/admin → 💾 Backup → private channel banao, bot ko admin banao, uski post forward karo")
+        add(bool(_setting_or_none("log_chat_id")) or None, "📝 Log Chat (optional)", "📝 Log Chat (optional)", "/admin → 📝 Log Chat")
+        try:
+            add(len(source_channels()) > 0 or None, "📢 Source channels (optional)", "📢 Source channels (optional)",
+                "/admin → Channels → ➕ Source")
+        except Exception:
+            pass
+    add(bool(TG_API_ID and TG_API_HASH) or None, "Telegram API ID/HASH (userbot + >20 MB files) — optional", "Telegram API ID/HASH (userbot + >20 MB files) — optional",
+        "my.telegram.org → API development tools → TG_API_ID + TG_API_HASH Vercel me")
+    try:
+        ubs = ub_health_info().get("state") if db_ok else None
+        add(True if ubs == "ready" else (False if ubs == "error" else None), "👤 Userbot login (optional)", "👤 Userbot login (optional)", "" if ubs == "ready" else "/admin → 👤 Userbot → Login")
+    except Exception:
+        pass
+    add(bool(GH_DISPATCH_TOKEN) or None, "GitHub token (Actions turant chalane ke liye) — optional", "GitHub token (start Actions instantly) — optional",
+        "github.com/settings/personal-access-tokens → this repo → Actions + Variables: Read and write → GH_TOKEN in Vercel")
+    if GH_DISPATCH_TOKEN and db_ok and fix:
+        v = gh_sync_bot_url()
+        add(v in ("ok", "created", "updated") or None, "GitHub variable BOT_URL", "GitHub variable BOT_URL",
+            "" if v in ("ok", "created", "updated") else f"GitHub repo → Settings → Secrets and variables → Actions → Variables → BOT_URL = {PUBLIC_HOME.rstrip('/')} ({v})")
+    return items
+
+
+def setup_text() -> str:
+    lines = [f"🛠️ <b>Setup check — {html.escape(brand())}</b>", ""]
+    for it in setup_checklist():
+        mark = "✅" if it["ok"] is True else ("❌" if it["ok"] is False else "➖")
+        lines.append(f"{mark} {html.escape(it['hi'])}")
+        if it["ok"] is not True and it.get("fix"):
+            lines.append("   ↳ " + html.escape(it["fix"]))
+    lines += ["", "Poori guide: GitHub repo ka README (Hindi + English)."]
+    return "\n".join(lines)
 
 
 def diagnostics() -> Dict[str, Any]:
@@ -8040,7 +8366,43 @@ def ai_test_text() -> str:
 
 
 # ================================================================ AI diagnostics (no keys ever shown)
-DIAG_TOKEN_SHA256 = "4d4e81e91187974473b09468e5c04a92865425fe8b02960c1359de6abdb68f41"
+# Developer diagnostics (/api/aidiag, /api/cbdiag, /api/ubdiag, /api/webdiag, /api/logfill?t=): OFF unless a token is set.
+# env DIAG_TOKEN (plain) or DIAG_TOKEN_SHA256 (its sha256) → else the sha256 kept in bot_settings "diag_sha"
+# (written once through an authorised diag call: POST /api/webdiag {op:"diag_persist"}). No token is built into the code.
+DIAG_TOKEN_SHA256 = (hashlib.sha256(os.environ["DIAG_TOKEN"].strip().encode()).hexdigest() if os.environ.get("DIAG_TOKEN", "").strip()
+                     else os.environ.get("DIAG_TOKEN_SHA256", "").strip().lower())
+_LEGACY_DIAG_SHA = "4d4e81e91187974473b09468e5c04a92865425fe8b02960c1359de6abdb68f41"   # removed after diag_persist (2-step rollout)
+
+
+def diag_hashes() -> List[str]:
+    out = [DIAG_TOKEN_SHA256] if re.fullmatch(r"[0-9a-f]{64}", DIAG_TOKEN_SHA256 or "") else []
+    try:
+        v = str(get_setting("diag_sha") or "").strip().lower() if (SUPABASE_URL and SUPABASE_KEY) else ""
+        if re.fullmatch(r"[0-9a-f]{64}", v):
+            out.append(v)
+    except Exception:
+        pass
+    if _LEGACY_DIAG_SHA:
+        out.append(_LEGACY_DIAG_SHA)
+    return out
+
+
+def diag_ok(tok: str) -> bool:
+    if not tok:
+        return False
+    h = hashlib.sha256(str(tok).encode()).hexdigest()
+    return any(hmac.compare_digest(h, x) for x in diag_hashes())
+
+
+def diag_source() -> str:
+    if DIAG_TOKEN_SHA256:
+        return "env"
+    try:
+        if SUPABASE_URL and SUPABASE_KEY and get_setting("diag_sha"):
+            return "db"
+    except Exception:
+        pass
+    return "legacy" if _LEGACY_DIAG_SHA else "off"
 
 
 def _err_class(exc: Exception, key: str = "") -> str:
@@ -8137,7 +8499,7 @@ def naming_diag(ids: str = "") -> Dict[str, Any]:
 @app.get("/api/aidiag")
 def aidiag() -> Any:
     tok = request.args.get("t", "")
-    if not tok or not hmac.compare_digest(hashlib.sha256(tok.encode()).hexdigest(), DIAG_TOKEN_SHA256):
+    if not diag_ok(tok):
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     _REQ_T0[0] = time.monotonic()
     res: Dict[str, Any] = {"ok": True, "build": os.environ.get("VERCEL_GIT_COMMIT_SHA", "")[:7]}
@@ -8317,7 +8679,7 @@ def run_cb_diag(data: str, uid: int, msg_text: str = "") -> Dict[str, Any]:
 def cbdiag() -> Any:
     """Owner-free live timing of button taps: GET /api/cbdiag?t=<diag token>&cb=ad:panel&cb=ad:files:1[&as=user]."""
     tok = request.args.get("t", "")
-    if not tok or not hmac.compare_digest(hashlib.sha256(tok.encode()).hexdigest(), DIAG_TOKEN_SHA256):
+    if not diag_ok(tok):
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     t_req = time.monotonic()
     uid = 1 if request.args.get("as") == "user" else (min(ADMIN_USER_IDS) if ADMIN_USER_IDS else 1)
@@ -8465,7 +8827,7 @@ def log_test() -> Dict[str, Any]:
         else:
             out["chat_error"] = log_chat_reason(exc)
     try:
-        log_chat_send("✅ Log Chat connected — filesbull yahan updates bhejega (" + ist_now() + " IST)", silent=False)
+        log_chat_send(brandify("✅ Log Chat connected — filesbull yahan updates bhejega (") + ist_now() + " IST)", silent=False)
         out["ok"] = True
     except Exception as exc:
         out.update(ok=False, reason=log_chat_reason(exc))
@@ -8992,7 +9354,7 @@ def logfill_active(st: Optional[Dict[str, Any]] = None) -> bool:
 
 
 def setlog_steps_text() -> str:
-    return ("📝 Log Chat abhi set nahi hai, isliye purani updates kahin nahi bhej sakta.\n\n"
+    return brandify("📝 Log Chat abhi set nahi hai, isliye purani updates kahin nahi bhej sakta.\n\n"
             "Set karne ke steps:\n"
             "1️⃣ Telegram me naya private channel banao (jaise \"Files Bull Logs\")\n"
             "2️⃣ Channel → Administrators → Add Admin → " + bot_mention() + " → \"Post Messages\" on → Save\n"
@@ -9252,7 +9614,7 @@ def logfill_endpoint() -> Any:
     diag = request.args.get("t", "")
     ok = bool(tok) and hmac.compare_digest(tok, logfill_kick_key())
     if not ok and diag:
-        ok = hmac.compare_digest(hashlib.sha256(diag.encode()).hexdigest(), DIAG_TOKEN_SHA256)
+        ok = diag_ok(diag)
     if not ok:
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     _REQ_T0[0] = time.monotonic()
@@ -9309,7 +9671,21 @@ def log_setting_view() -> Any:
 #      later send uses it (the Bot API can send any size by file_id). Failure → one retry, then "❌" + reason to the owner.
 TG_API_ID = os.environ.get("TG_API_ID", "").strip()
 TG_API_HASH = os.environ.get("TG_API_HASH", "").strip()
-GH_REPO = os.environ.get("GH_REPO", "aaravjaat72-hash/filesbull").strip()
+
+
+def gh_repo_source() -> tuple:
+    """(owner/repo, source) for the GitHub Actions: env GH_REPO → the repo Vercel deployed from → the original repo."""
+    v = os.environ.get("GH_REPO", "").strip().strip("/")
+    if v:
+        return v.replace("https://github.com/", ""), "env:GH_REPO"
+    o, s = os.environ.get("VERCEL_GIT_REPO_OWNER", "").strip(), os.environ.get("VERCEL_GIT_REPO_SLUG", "").strip()
+    if o and s and os.environ.get("VERCEL_GIT_PROVIDER", "github").strip().lower() in ("github", ""):
+        return f"{o}/{s}", "vercel_git"
+    return LEGACY_REPO, "default"
+
+
+GH_REPO = gh_repo_source()[0]
+GH_BRANCH = os.environ.get("GH_BRANCH", "").strip() or "main"
 GH_TOKEN_NAMES = ("GH_TOKEN", "GH_DISPATCH_TOKEN", "GITHUB_TOKEN", "GH_PAT", "GITHUB_PAT")
 GH_DISPATCH_TOKEN = next((os.environ.get(n, "").strip() for n in GH_TOKEN_NAMES if os.environ.get(n, "").strip()), "")
 BIG_WORKFLOW = "bigfile-rename.yml"
@@ -9434,7 +9810,7 @@ def bigfile_dispatch(job_id: str = "") -> str:
         _DIAG["sent"].append({"ms": 0, "m": "bigfile_dispatch"})
         return "dispatched"
     url = f"https://api.github.com/repos/{GH_REPO}/actions/workflows/{BIG_WORKFLOW}/dispatches"
-    body = json.dumps({"ref": "main", "inputs": {"job": str(job_id or "queue")}}).encode()
+    body = json.dumps({"ref": GH_BRANCH, "inputs": {"job": str(job_id or "queue"), "bot_url": PUBLIC_HOME.rstrip("/")}}).encode()
     req = urllib.request.Request(url, data=body, method="POST", headers={
         "Authorization": f"Bearer {GH_DISPATCH_TOKEN}", "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "filesbull-bot", "Content-Type": "application/json"})
@@ -9574,9 +9950,10 @@ def verify_oidc(token: str, workflow: str = "", aud_want: str = "") -> Dict[str,
         raise InputError("bad issuer/audience")
     if not (float(claims.get("exp", 0)) > now - 30 and float(claims.get("nbf", claims.get("iat", 0)) or 0) <= now + 60):
         raise InputError("expired")
-    wf = f"{GH_REPO}/.github/workflows/{workflow}@refs/heads/main"
-    if (claims.get("repository") != GH_REPO or claims.get("ref") != "refs/heads/main" or
-            claims.get("workflow_ref") != wf or
+    ref = f"refs/heads/{GH_BRANCH}"
+    wf = f"{GH_REPO}/.github/workflows/{workflow}@{ref}"
+    if (str(claims.get("repository") or "").lower() != GH_REPO.lower() or claims.get("ref") != ref or
+            str(claims.get("workflow_ref") or "").lower() != wf.lower() or
             claims.get("event_name") not in ("workflow_dispatch", "repository_dispatch", "schedule")):
         raise InputError("wrong repo/workflow")
     return claims
@@ -9950,7 +10327,7 @@ def ub_dispatch(why: str = "") -> str:
         _DIAG["sent"].append({"ms": 0, "m": "ub_dispatch"})
         return "dispatched"
     url = f"https://api.github.com/repos/{GH_REPO}/actions/workflows/{UB_WORKFLOW}/dispatches"
-    body = json.dumps({"ref": "main", "inputs": {"why": str(why or "button")[:40]}}).encode()
+    body = json.dumps({"ref": GH_BRANCH, "inputs": {"why": str(why or "button")[:40], "bot_url": PUBLIC_HOME.rstrip("/")}}).encode()
     req = urllib.request.Request(url, data=body, method="POST", headers={
         "Authorization": f"Bearer {GH_DISPATCH_TOKEN}", "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "filesbull-bot", "Content-Type": "application/json"})
@@ -11068,17 +11445,17 @@ def ub_report_setup(body: Dict[str, Any], st: Dict[str, Any]) -> Dict[str, Any]:
                 st.setdefault("setup", {})[kind] = {"title": str(v.get("title") or "")[:60], "t": int(time.time())}
                 out[kind] = int(v["id"])
                 if kind == "alert":
-                    inbox_alert("🔔 filesbull Inbox alerts yahan aayenge: har run ka hisaab, settle, review, naye channel.")
+                    inbox_alert(brandify("🔔 filesbull Inbox alerts yahan aayenge: har run ka hisaab, settle, review, naye channel."))
                 else:
                     try:
                         telegram("sendMessage", {"chat_id": int(v["id"]), "disable_notification": True,
-                                                 "text": "📥 filesbull Userbot Inbox — channels ki raw files yahan aati hain. Bot inhe naam + category deke Backup me settle karta hai. Kuch delete mat karna."})
+                                                 "text": brandify("📥 filesbull Userbot Inbox — channels ki raw files yahan aati hain. Bot inhe naam + category deke Backup me settle karta hai. Kuch delete mat karna.")})
                     except Exception:
                         pass
                 continue
         out[kind] = 0
         st.setdefault("setup_err", {})[kind] = ub_scrub(why)[:120]
-        ub_tell_once(st, f"setup:{kind}", UB_HOWTO[kind].format(why=ub_scrub(why)[:100] or "pata nahi"))
+        ub_tell_once(st, f"setup:{kind}", brandify(UB_HOWTO[kind].format(why=ub_scrub(why)[:100] or "pata nahi")))
     return out
 
 
@@ -11839,7 +12216,7 @@ def ub_apply_chat(kind: str, cid: int, title: str) -> str:
         note = ub_inbox_access(st, int(cid), title)
     ub_save_state(st)
     if kind == "alert":
-        _inbox_send_one(int(cid), "🔔 filesbull userbot alerts ab yahan aayenge: har run ki poori details.", hold=False)
+        _inbox_send_one(int(cid), brandify("🔔 filesbull userbot alerts ab yahan aayenge: har run ki poori details."), hold=False)
     elif get_setting(UB_SESS_KEY) and not ub_paused():
         ub_dispatch("inbox storage added")
     audit_log(f"{'📥 Userbot Inbox storage' if kind == 'inbox' else '🔔 Userbot Alert storage'} add: {title[:60]} · {ist_now()}")
@@ -11976,7 +12353,7 @@ def ub_diag() -> Any:
     """Diag token only: &ping=1 = MTProto connect from Vercel (no login); state + sources (titles only); &files=1 = the
     userbot's files (names, category, status)."""
     tok = request.args.get("t", "")
-    if not tok or not hmac.compare_digest(hashlib.sha256(tok.encode()).hexdigest(), DIAG_TOKEN_SHA256):
+    if not diag_ok(tok):
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     _REQ.clear()
     out: Dict[str, Any] = {"ok": True, "build": os.environ.get("VERCEL_GIT_COMMIT_SHA", "")[:7], "health": ub_health_info()}
@@ -12095,7 +12472,7 @@ WEB_MAX = 1900 * 1024 * 1024
 UPLOAD_MAX = 50 * 1024 * 1024
 WEB_Q_KEY = "webq"
 WEB_BIG_KEY = "webbigq"
-WEB_BUCKET = "filesbull-uploads"
+WEB_BUCKET = os.environ.get("UPLOAD_BUCKET", "").strip() or "filesbull-uploads"
 WEB_DL_DEADLINE = 150.0
 WEB_WORKER_BUDGET = 200.0
 WEB_MAX_LINKS = 10
@@ -13470,6 +13847,45 @@ def upl_redirect_home(tok: Optional[str] = None) -> Any:
     return _upl_cookie(resp, tok) if tok else resp
 
 
+_SETUP_PAGE: Dict[str, Any] = {"t": 0.0, "html": ""}
+
+
+@app.get("/setup")
+def setup_page() -> Any:
+    """First-run checklist for a new deployment (names and yes/no only, never a secret). Cached 30 s."""
+    if time.time() - _SETUP_PAGE["t"] > 30 or not _SETUP_PAGE["html"]:
+        _REQ.clear()
+        _REQ_T0[0] = time.monotonic()
+        try:
+            items = setup_checklist()
+        except Exception as exc:
+            log_error("setup page")
+            items = [{"ok": False, "hi": "Setup check fail", "en": "Setup check failed", "fix": type(exc).__name__}]
+        rows = []
+        for it in items:
+            mark = "✅" if it["ok"] is True else ("❌" if it["ok"] is False else "➖")
+            fx = f'<div class="fix">↳ {html.escape(it["fix"])}</div>' if it["ok"] is not True and it.get("fix") else ""
+            rows.append(f'<li><b>{mark} {html.escape(it["hi"])}</b><br><span class="en">{html.escape(it["en"])}</span>{fx}</li>')
+        done = all(it["ok"] is not False for it in items)
+        _SETUP_PAGE["html"] = (
+            '<!doctype html><html lang="hi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+            '<meta name="robots" content="noindex"><title>Setup · ' + html.escape(brand()) + '</title><style>'
+            'body{font-family:system-ui,sans-serif;max-width:640px;margin:0 auto;padding:16px;line-height:1.45;background:#0f172a;color:#e2e8f0}'
+            'li{background:#1e293b;border-radius:10px;padding:10px 12px;margin:8px 0;list-style:none}ul{padding:0}'
+            '.en{color:#94a3b8;font-size:.9em}.fix{color:#fbbf24;font-size:.9em;margin-top:4px;word-break:break-word}a{color:#93c5fd}'
+            '</style></head><body><h2>🛠️ ' + html.escape(brand()) + ' — Setup</h2>'
+            '<p>' + ("🎉 Sab zaroori cheezein ready hain. Bot ko Telegram me /start bhejo. (Everything required is ready.)" if done else
+                     "❌ wali cheezein theek karo, phir ye page refresh karo. (Fix the ❌ items, then refresh.)") + '</p>'
+            '<ul>' + "".join(rows) + '</ul><p class="en">Full guide: README.md in the GitHub repo (Hindi + English). '
+            'Health JSON: <a href="/">/</a></p></body></html>')
+        _SETUP_PAGE["t"] = time.time()
+        try:
+            flush_request()
+        except Exception:
+            pass
+    return _SETUP_PAGE["html"], 200, {"Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store"}
+
+
 @app.get("/upload")
 def upload_page() -> Any:
     _REQ.clear()
@@ -13699,7 +14115,7 @@ def nondoc_scan(min_id: int = 0, apply: bool = False) -> Dict[str, Any]:
 def webdiag() -> Any:
     body = request.get_json(silent=True) or {} if request.method == "POST" else {}
     tok = request.args.get("t", "") or str(body.get("t") or "")
-    if not tok or not hmac.compare_digest(hashlib.sha256(tok.encode()).hexdigest(), DIAG_TOKEN_SHA256):
+    if not diag_ok(tok):
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     _REQ.clear()
     _LOG_QUEUE.clear()
@@ -13713,6 +14129,14 @@ def webdiag() -> Any:
         out["books"] = [{"id": b.get("id"), "title": b.get("title"), "size": human_size(b.get("file_size")), "status": b.get("status"),
                          "in_backup": bool(b.get("backup_chat_id")), "src": b.get("source_chat_title")} for b in rows]
         flush_request()
+        return jsonify(out)
+    if op == "diag_persist" and request.method == "POST":   # universal repo: keep THIS deployment's diag token hash in the DB
+        set_setting("diag_sha", hashlib.sha256(tok.encode()).hexdigest())
+        out["saved"] = True
+        out["source_after"] = diag_source()
+        return jsonify(out)
+    if op == "config":     # names + sources only, never values
+        out["config"] = config_status()
         return jsonify(out)
     if op == "nondoc":     # DOCUMENT-ONLY cleanup: userbot videos/photos/audio already catalogued → status 'skipped'
         out.update(nondoc_scan(int(request.args.get("min_id") or body.get("min_id") or 0),

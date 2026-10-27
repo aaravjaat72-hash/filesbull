@@ -1,7 +1,7 @@
 name: keepalive
 # Keeps the Telegram bot connected: after every push (once Vercel has deployed) and every
-# 10 minutes it opens https://filesbull.vercel.app/ , which checks the webhook and fixes it
-# only if something is wrong (no change when all is fine).
+# 5 minutes it opens the bot's address (repo variable BOT_URL; the original repo falls back to
+# https://filesbull.vercel.app), which checks the webhook and fixes it only if something is wrong.
 on:
   push:
     branches: [main]
@@ -18,9 +18,17 @@ jobs:
         if: github.event_name == 'push'
         run: sleep 90
       - name: Check / fix the bot webhook
+        env:
+          BOT_URL: ${{ vars.BOT_URL }}
+          REPO: ${{ github.repository }}
         run: |
+          URL="${BOT_URL%/}"
+          if [ -z "$URL" ]; then
+            if [ "$(echo "$REPO" | tr 'A-Z' 'a-z')" = "aaravjaat72-hash/filesbull" ]; then URL="https://filesbull.vercel.app"; else
+              echo "::warning::Set the repo variable BOT_URL (Settings → Secrets and variables → Actions → Variables) to https://<your-app>.vercel.app"; exit 0; fi
+          fi
           for i in 1 2 3; do
-            if curl -fsS --max-time 60 https://filesbull.vercel.app/ -o health.json; then
+            if curl -fsS --max-time 60 "$URL/" -o health.json; then
               python3 -c "import json; s=json.load(open('health.json'))['status']; print('webhook ok:', s.get('webhook_registered'), '| self-heal:', (s.get('self_heal') or {}).get('action'))"
               exit 0
             fi

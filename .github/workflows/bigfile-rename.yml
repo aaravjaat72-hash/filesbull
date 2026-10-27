@@ -12,6 +12,10 @@ on:
         description: "queue job id (optional)"
         required: false
         default: ""
+      bot_url:
+        description: "bot address (the bot fills it; else the repo variable BOT_URL is used)"
+        required: false
+        default: ""
   repository_dispatch:
     types: [bigfile-rename]
   schedule:
@@ -39,6 +43,8 @@ jobs:
       - name: Rename big files
         env:
           JOB: ${{ github.event.inputs.job }}
+          BOT_URL_INPUT: ${{ github.event.inputs.bot_url }}
+          BOT_URL: ${{ vars.BOT_URL }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}

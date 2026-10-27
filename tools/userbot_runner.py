@@ -18,7 +18,23 @@ Nothing secret is printed (session/api hash are masked; no phone numbers or ids 
 """
 import asyncio, base64, hashlib, hmac, json, os, random, shutil, struct, subprocess, sys, tempfile, time, urllib.request, urllib.error
 
-BOT_URL = os.environ.get("BOT_URL", "https://filesbull.vercel.app").rstrip("/")
+LEGACY_REPO, LEGACY_URL = "aaravjaat72-hash/filesbull", "https://filesbull.vercel.app"   # the original bot (non-secret)
+
+
+def resolve_bot_url():
+    """Which bot this run talks to: workflow input bot_url (the bot sends it) → repo variable BOT_URL → the original bot
+    when this IS the original repo. A fork with neither gets "" (the run stops with a clear note, no error)."""
+    for n in ("BOT_URL_INPUT", "BOT_URL"):
+        v = (os.environ.get(n) or "").strip().rstrip("/")
+        if v:
+            v = v if v.startswith("http") else "https://" + v
+            if v.startswith("https://"):
+                return v
+    repo = (os.environ.get("GITHUB_REPOSITORY") or LEGACY_REPO).strip().lower()
+    return LEGACY_URL if repo == LEGACY_REPO else ""
+
+
+BOT_URL = resolve_bot_url()
 AUD = "filesbull-userbot"
 
 
@@ -653,7 +669,7 @@ def chain_next(t0, why="chain"):
     print(f"next run in {int(wait)} s")
     time.sleep(wait)
     st, _ = http(f"https://api.github.com/repos/{repo}/actions/workflows/userbot-forward.yml/dispatches",
-                 {"ref": "main", "inputs": {"why": why}},
+                 {"ref": os.environ.get("GITHUB_REF_NAME") or "main", "inputs": {"why": why, "bot_url": BOT_URL}},
                  headers={"Authorization": "Bearer " + tok, "Accept": "application/vnd.github+json"})
     print("next run started" if st in (200, 204) else f"next run not started (HTTP {st})")
     return st
@@ -661,6 +677,11 @@ def chain_next(t0, why="chain"):
 
 def main():
     t0 = time.time()
+    if not BOT_URL:
+        print("::warning::BOT_URL is not set. GitHub repo → Settings → Secrets and variables → Actions → Variables → "
+              "New variable BOT_URL = https://<your-app>.vercel.app (or open https://<your-app>.vercel.app/setup once with "
+              "GH_TOKEN set in Vercel — the bot adds it itself). Nothing to do until then.")
+        return
     status, job = http(BOT_URL + "/api/userbot-job", {"oidc": oidc_token(), "why": started_by()})
     if status != 200 or not job.get("ok"):
         sys.exit(f"bot said HTTP {status}: {job.get('error')} {job.get('why', '')}")

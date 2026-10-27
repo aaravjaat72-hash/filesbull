@@ -3,12 +3,17 @@ name: userbot-forward
 # "filesbull Userbot Inbox" channel (never straight into Backup); the bot then names/categorises them and settles them
 # into Backup (Aarav, Oct 26 2026). Gentle: every 10 min, max 25 files per run (15 after a long FloodWait), live first,
 # 2–4 s apart, stops on FloodWait. The session comes from the bot only after GitHub's OIDC token proves this is this workflow on main; it is
-# never printed. See tools/userbot_runner.py. "🔄 Abhi check karo" in the bot starts it at once (workflow_dispatch).
+# never printed. See tools/userbot_runner.py. Which bot: input bot_url → repo variable BOT_URL (a fork sets it, or
+# the bot sets it itself when its GH_TOKEN may) → the original bot when this is the original repo. "🔄 Abhi check karo" in the bot starts it at once (workflow_dispatch).
 on:
   workflow_dispatch:
     inputs:
       why:
         description: "who started it (optional)"
+        required: false
+        default: ""
+      bot_url:
+        description: "bot address (the bot fills it; else the repo variable BOT_URL is used)"
         required: false
         default: ""
   schedule:
@@ -37,4 +42,6 @@ jobs:
       - name: Forward new files
         env:
           GH_CHAIN_TOKEN: ${{ github.token }}
+          BOT_URL_INPUT: ${{ github.event.inputs.bot_url }}
+          BOT_URL: ${{ vars.BOT_URL }}
         run: python tools/userbot_runner.py

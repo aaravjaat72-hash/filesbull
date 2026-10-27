@@ -13,7 +13,23 @@ Secrets are never printed (and are masked in the log).
 """
 import asyncio, hashlib, hmac, json, os, shutil, subprocess, sys, tempfile, time, urllib.request, urllib.error
 
-BOT_URL = os.environ.get("BOT_URL", "https://filesbull.vercel.app").rstrip("/")
+LEGACY_REPO, LEGACY_URL = "aaravjaat72-hash/filesbull", "https://filesbull.vercel.app"   # the original bot (non-secret)
+
+
+def resolve_bot_url():
+    """Which bot this run talks to: workflow input bot_url (the bot sends it) → repo variable BOT_URL → the original bot
+    when this IS the original repo. A fork with neither gets "" (the run stops with a clear note, no error)."""
+    for n in ("BOT_URL_INPUT", "BOT_URL"):
+        v = (os.environ.get(n) or "").strip().rstrip("/")
+        if v:
+            v = v if v.startswith("http") else "https://" + v
+            if v.startswith("https://"):
+                return v
+    repo = (os.environ.get("GITHUB_REPOSITORY") or LEGACY_REPO).strip().lower()
+    return LEGACY_URL if repo == LEGACY_REPO else ""
+
+
+BOT_URL = resolve_bot_url()
 AUD = "filesbull-bigfile"
 
 
@@ -230,6 +246,11 @@ async def main_async(jobs, creds):
 
 
 def main():
+    if not BOT_URL:
+        print("::warning::BOT_URL is not set. GitHub repo → Settings → Secrets and variables → Actions → Variables → "
+              "New variable BOT_URL = https://<your-app>.vercel.app (or open https://<your-app>.vercel.app/setup once with "
+              "GH_TOKEN set in Vercel — the bot adds it itself). Nothing to do until then.")
+        return
     env = {"bot_token": os.environ.get("BOT_TOKEN", "").strip(), "api_id": os.environ.get("TG_API_ID", "").strip(),
            "api_hash": os.environ.get("TG_API_HASH", "").strip()}
     for v in env.values():
