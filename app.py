@@ -236,7 +236,20 @@ def supabase(path: str, method: str = "GET", payload: Any = None,
     }
     if method == "POST" and "on_conflict=" in query:
         headers["Prefer"] = "return=representation,resolution=merge-duplicates"
+    if payload is not None and method != "GET":
+        payload = _no_nul(payload)       # Postgres text/jsonb refuses \u0000 ("unsupported Unicode escape sequence")
     return http_json(url, method, payload, headers)
+
+
+def _no_nul(v: Any) -> Any:
+    """A NUL byte in a caption / file name / page text made Supabase answer HTTP 400 and the file was lost (Oct 27)."""
+    if isinstance(v, str):
+        return v.replace("\x00", "") if "\x00" in v else v
+    if isinstance(v, dict):
+        return {k: _no_nul(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_no_nul(x) for x in v]
+    return v
 
 
 def is_admin(user_id: Optional[int]) -> bool:
@@ -606,8 +619,11 @@ def add_required_channel(target: str, message: Optional[Dict[str, Any]] = None) 
     return save_required_channel(resolve_chat(message, target))["title"]
 
 
-AUTO_SAVE_OFF = "⚠️ auto-save off (bot admin nahi)"
+AUTO_SAVE_OFF = "⚠️ userbot join nahi — join karo"      # Aarav 9:31 AM Oct 27: the old "auto-save off" label was wrong
 AUTO_SAVE_OFF_NOTE = "ℹ️ Bot admin nahi hai — purani/forward ki gayi files chalengi, nayi post apne-aap save nahi hongi"
+UB_SAVE_LABEL = "✅ userbot se save (old + new)"
+UB_JOIN_FIX = ("➕ Userbot account se ye channel join karo (private ho to channel add karte waqt invite link do). "
+               "Join ke baad agla check (~10 min) purani + nayi files apne-aap Inbox me laayega.")
 
 
 def bot_admin_in(chat_id: Any) -> bool:
@@ -999,9 +1015,37 @@ def chat_check(chat_id: Any) -> str:
         return "❌ " + friendly_tg_error(exc)[:60]
 
 
-def source_check(chat_id: Any) -> str:
-    """Source channels work without bot admin (forwarded/indexed files); only auto-save needs it."""
-    return "✅ auto-save on" if bot_admin_in(chat_id) else AUTO_SAVE_OFF
+def source_check(chat_id: Any, st: Optional[Dict[str, Any]] = None) -> str:
+    """How a source channel's files get in (Aarav 9:31 AM Oct 27): the bot as admin (new posts at once), or the userbot
+    account as a member (old + new, every ~10 min). Only when neither: "⚠️ userbot join nahi — join karo"."""
+    admin = bot_admin_in(chat_id)
+    try:
+        st = st if st is not None else ub_state()
+        logged_in = ub_health() != "not_logged_in"
+    except Exception:
+        st, logged_in = {}, False
+    c = (st.get("ch") or {}).get(str(chat_id)) or {}
+    member = logged_in and (bool(c.get("mem")) or ("mem" not in c and bool(c.get("t") or c.get("joined")) and not c.get("need_join")))
+    bf = c.get("bf") or {}
+    old = ""
+    if member:
+        if bf.get("done"):
+            old = f" · purani ✅ poori ({int(bf.get('n') or 0)} nayi)"
+        elif bf.get("skip"):
+            old = " · purani skip ki hui"
+        elif bf.get("cur") or bf.get("n"):
+            old = f" · purani chal rahi ({int(bf.get('n') or 0)} ab tak)"
+        else:
+            old = " · purani queue me"
+    if admin is True:
+        return "✅ auto-save on (bot admin)" + old
+    if member:
+        return UB_SAVE_LABEL + old
+    if not logged_in:
+        return "⚠️ userbot login nahi — /admin → 👤 Userbot → 🔑 Login"
+    if c.get("err") and "join" in str(c.get("err")):
+        return AUTO_SAVE_OFF + f" ({str(c['err'])[:50]})"
+    return AUTO_SAVE_OFF
 
 
 def source_channels() -> List[Dict[str, Any]]:
@@ -1024,13 +1068,21 @@ def required_list_view() -> Any:
 
 def source_list_view() -> Any:
     rows = source_channels()
-    lines = ["📋 Source Channels (inki nayi files index hoti hain):"]
+    lines = ["📋 Source Channels (inki purani + nayi files Inbox → Backup me aati hain):"]
     kb = []
-    for i, r in enumerate(rows, 1):
-        lines.append(f"{i}. {r.get('title')} ({'@' + r['username'] if r.get('username') else r.get('chat_id')}) — {source_check(r['chat_id'])}")
+    try:
+        _st = ub_state()
+    except Exception:
+        _st = {}
+    labels = par(*[(lambda cid=r["chat_id"]: source_check(cid, _st)) for r in rows]) if rows else []
+    for i, (r, lab) in enumerate(zip(rows, labels), 1):
+        lab = lab if isinstance(lab, str) else "❓"
+        lines.append(f"{i}. {r.get('title')} ({'@' + r['username'] if r.get('username') else r.get('chat_id')}) — {lab}")
         kb.append([{"text": f"❌ Hatao: {str(r.get('title'))[:28]}", "callback_data": f"ad:rmsrc:{r['chat_id']}"}])
     if not rows:
         lines.append("Koi source channel nahi hai.")
+    if any(isinstance(x, str) and x.startswith(AUTO_SAVE_OFF) for x in labels):
+        lines.append("\n" + UB_JOIN_FIX)
     kb.append([{"text": "➕ Source Channel Jodo", "callback_data": "ad:addsrc"}])
     kb.append(BACK_ROW)
     return "\n".join(lines), {"inline_keyboard": kb}
@@ -1120,8 +1172,8 @@ def status_text(user_id: Optional[int]) -> str:
         lines.append(f"\nSource channels: {len(srcs)}")
         for r, ch in zip(srcs, schecks):
             lines.append(f"• {r.get('title')}: {ch}")
-        if any(ch == AUTO_SAVE_OFF for ch in schecks):
-            lines.append("ℹ️ Auto-save off wale channels ki files forward karke save karo, ya bot ko admin banao. Purani files chalti rahengi.")
+        if any(str(ch).startswith(AUTO_SAVE_OFF) for ch in schecks):
+            lines.append(UB_JOIN_FIX)
     lines.append(f"Backup: {'ON' if get_setting('backup_chat_id') else 'OFF'} | {log_chat_line()}")
     try:
         nb = named_by_counts()
@@ -1225,7 +1277,8 @@ def handle_admin_input(message: Dict[str, Any], action: str, extra: Any) -> None
             if chat.get("_bot_admin"):
                 note = "Ab is channel me aane wali nayi files apne-aap save hongi.\nPurani files ke liye unhe bot ko forward karo."
             else:
-                note = AUTO_SAVE_OFF_NOTE + ".\nNayi files bhi bot ko forward kar doge to save ho jayengi." + (("\n" + chat["_ub"]) if chat.get("_ub") else "")
+                note = (chat["_ub"] if chat.get("_ub") and ub_health() != "not_logged_in" else
+                        AUTO_SAVE_OFF_NOTE + ".\nNayi files bhi bot ko forward kar doge to save ho jayengi." + (("\n" + chat["_ub"]) if chat.get("_ub") else ""))
             info = file_info(message)
             src = forwarded_source(message)
             if info and src:
@@ -6088,7 +6141,8 @@ def run_op(query: Dict[str, Any], chat_id: int, user_id: int, op: Dict[str, Any]
             if chat.get("_pending"):
                 show(chat_id, chat.get("_ub") or "", {"inline_keyboard": [[{"text": "👤 Userbot", "callback_data": "ad:ub"}], BACK_ROW]}, query)
                 return
-            note = "" if chat.get("_bot_admin") else "\n" + AUTO_SAVE_OFF_NOTE + (("\n" + chat["_ub"]) if chat.get("_ub") else "")
+            note = "" if chat.get("_bot_admin") else ("\n" + chat["_ub"] if chat.get("_ub") and ub_health() != "not_logged_in" else
+                                                      "\n" + AUTO_SAVE_OFF_NOTE + (("\n" + chat["_ub"]) if chat.get("_ub") else ""))
             show(chat_id, f"✅ Source channel jud gaya: {chat.get('title')}" + note,
                  {"inline_keyboard": [[{"text": "📋 Source Channels", "callback_data": "ad:srclist"}], BACK_ROW]}, query)
     else:
@@ -6682,7 +6736,7 @@ def diagnostics() -> Dict[str, Any]:
         # posts needs the bot to be admin (Telegram sends channel posts only to admins).
         d["source_channels_bot_not_admin"] = not_admin
         d["source_channels_status"] = [{"title": r.get("title"),
-                                        "auto_save": "on" if r.get("title") not in not_admin else AUTO_SAVE_OFF}
+                                        "auto_save": source_check(r["chat_id"])}
                                        for r in srcs]
     except Exception as exc:
         d["source_channels"] = "error: " + str(exc)[:60]
@@ -10886,6 +10940,19 @@ def ub_job_api() -> Any:
                 ub_tell_once(st, f"ibacc:{cid}", f"📥 Inbox storage \"{titles.get(str(cid), cid)}\": {note}")
     ub_save_state(st)
     bf_paused = ub_bf_paused()
+    # Aarav 9:33 AM Oct 27: OLD files of every source too. A channel where the bot is admin gets its new posts from the
+    # bot itself; the userbot only walks its history (bf_only), and only until that history is done.
+    try:
+        _ids = {str(r["chat_id"]) for r in srcs}
+        _skip = {str(get_setting("backup_chat_id") or ""), str(get_setting("log_chat_id") or "")}
+        _skip |= {str(v) for v in ub_chat_ids("inbox") + ub_chat_ids("alert")}
+        for r in source_channels():
+            k = str(r.get("chat_id"))
+            bfx = (ch.get(k) or {}).get("bf") or {}
+            if k not in _ids and k not in _skip and not bfx.get("done") and not bfx.get("skip") and not bf_paused:
+                srcs.append(dict(r, _bf_only=True))
+    except Exception:
+        log_error("ub bf-only sources")
     sources = []
     for r in srcs:
         c = ch.get(str(r["chat_id"])) or {}
@@ -10893,7 +10960,8 @@ def ub_job_api() -> Any:
         sources.append({"id": int(r["chat_id"]), "title": str(r.get("title") or ""), "username": r.get("username") or "",
                         "link": c.get("link") or "", "last": int(c.get("last") or 0),
                         "bf": {"cur": int(bf.get("cur") or 0), "done": bool(bf.get("done")),
-                               "skip": bool(bf.get("skip")), "on": not bf_paused and not bf.get("skip") and not bf.get("done")}})
+                               "skip": bool(bf.get("skip")), "on": not bf_paused and not bf.get("skip") and not bf.get("done")},
+                        **({"bf_only": True} if r.get("_bf_only") else {})})
     out = {"ok": True, "state": "ready", "session": sess, "api_id": TG_API_ID, "api_hash": TG_API_HASH,
            "backup": int(backup), "inbox": ub_inbox() or 0, "inboxes": ub_inboxes(), "alert": ub_alert_chat() or 0,
            "alerts": ub_chat_ids("alert"), "inbox_links": st.get("inbox_links") or {}, "create": create,
@@ -11007,7 +11075,8 @@ def _ub_done(body: Dict[str, Any], st: Dict[str, Any]) -> Any:
         for j in body.get("joined") or []:
             c = ch.setdefault(str(j.get("id")), {})
             c["title"] = str(j.get("title") or c.get("title") or "")[:60]
-            c["joined"] = now
+            c["joined"] = c["mem"] = now
+            c.pop("need_join", None)
             if j.get("new_source"):
                 try:
                     register_channel({"id": int(j["id"]), "title": c["title"], "username": j.get("username") or None})
@@ -11097,9 +11166,13 @@ def _ub_done(body: Dict[str, Any], st: Dict[str, Any]) -> Any:
                 bf["done"] = now
                 inbox_alert(f"📚 {c.get('title') or cid}: purani files poori ho gayi ({int(bf.get('n') or 0)} nayi Inbox me)")
         for cid in (body.get("ok_ids") or []):
-            ch.setdefault(str(cid), {})["err"] = ""
+            c = ch.setdefault(str(cid), {})
+            c["err"], c["mem"] = "", now            # the userbot account read this channel → it is a member
+            c.pop("need_join", None)
         for cid, err in (body.get("errors") or {}).items():
             ch.setdefault(str(cid), {})["err"] = ub_scrub(err)[:120]
+            if "joined nahi" in str(err) or "private/ban" in str(err):
+                ch[str(cid)]["mem"] = 0
         for cid, title in (body.get("titles") or {}).items():
             ch.setdefault(str(cid), {})["title"] = str(title)[:60]
         if body.get("me"):
@@ -13007,6 +13080,7 @@ def webbig_done(job: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
             inbox_alert(f"🔗 Link se (badi file): {str(r.get('title'))[:80]} · {human_size(info.get('file_size'))} · {web_host_of(job.get('u', ''))}")
         except Exception:
             pass
+    job["res"] = {k: r.get(k) for k in ("state", "title")}
     web_reply(job.get("chat"), web_result_text(r))
     return {"ok": True, "state": "done", "file_name": info.get("file_name")}
 
@@ -13515,9 +13589,17 @@ def webdiag() -> Any:
     _REQ_T0[0] = time.monotonic()
     op = request.args.get("op", "") or str(body.get("op") or "")
     out: Dict[str, Any] = {"ok": True, "op": op}
+    if op == "book":       # a file by name: where it is now (no ids of people)
+        q = re.sub(r"[^\w .-]", "", request.args.get("q", ""))[:60].strip()
+        rows = supabase("books", "GET", query=f"?select=id,title,file_name,file_size,status,backup_chat_id,source_chat_title"
+                        f"&or=(title.ilike.*{urllib.parse.quote(q)}*,file_name.ilike.*{urllib.parse.quote(q)}*)&order=id.desc&limit=5") if q else []
+        out["books"] = [{"id": b.get("id"), "title": b.get("title"), "size": human_size(b.get("file_size")), "status": b.get("status"),
+                         "in_backup": bool(b.get("backup_chat_id")), "src": b.get("source_chat_title")} for b in rows]
+        flush_request()
+        return jsonify(out)
     if op == "status":
         out["web"] = web_status()
-        out["big_jobs"] = [{k: j.get(k) for k in ("fn", "sz", "st", "tries", "err", "t", "dt")} for j in webq_load(WEB_BIG_KEY)][-5:]
+        out["big_jobs"] = [{k: j.get(k) for k in ("fn", "sz", "st", "tries", "err", "t", "dt", "res")} for j in webq_load(WEB_BIG_KEY)][-5:]
         out["link_jobs"] = [{k: j.get(k) for k in ("st", "tries", "t", "dt")} for j in webq_load()][-5:]
     elif op == "route":
         uid = 1 if request.args.get("as") == "user" else (min(ADMIN_USER_IDS) if ADMIN_USER_IDS else 1)

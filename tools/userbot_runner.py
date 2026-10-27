@@ -323,6 +323,9 @@ class Run:
         """Walk older posts newest → oldest from the cursor. Returns (sent, scanned)."""
         bf = src.get("bf") or {}
         cur = int(bf.get("cur") or 0) or self.live_first.get(cid) or (int(self.s["last"].get(str(cid)) or src.get("last") or 0) + 1)
+        if cur <= 1 and src.get("bf_only") and not bf.get("cur"):
+            top = await self.client.get_messages(ent, limit=1)     # bot-admin channel: history from its newest post
+            cur = (top[0].id + 1) if top else 1
         rec = self.s["bf"].setdefault(str(cid), {"cur": cur, "scanned": 0, "files": 0, "dup": 0})
         protected = bool(getattr(ent, "noforwards", False))
         sent = 0
@@ -491,6 +494,9 @@ async def main_async(job):
                 order.append((cid, src, ent))
             if not run.stop:
                 for cid, src, ent in order:
+                    if src.get("bf_only"):          # the bot is admin there: new posts reach it directly; userbot does history only
+                        summary["ok_ids"].append(cid)
+                        continue
                     try:
                         n = await run.live(ent, cid, src)
                         summary["ok_ids"].append(cid)
