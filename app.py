@@ -978,8 +978,8 @@ VERIFY_BUTTON = "✅ Joined / Verify"
 
 
 def join_markup(channels: Optional[List[Dict[str, Any]]] = None, total: int = 0) -> Dict[str, Any]:
-    """Join buttons for the channels still missing. With more than one join channel in total,
-    each button carries the channel's name so the user knows which one is left."""
+    """Join buttons for the channels still missing (each with the channel's name when there is more than one),
+    then ❓ Help (works without joining) and ✅ Joined / Verify last."""
     chans = required_channels() if channels is None else channels
     named = max(total, len(chans)) > 1
     rows = []
@@ -988,24 +988,39 @@ def join_markup(channels: Optional[List[Dict[str, Any]]] = None, total: int = 0)
         if url:
             label = f"📢 Join: {str(channel.get('title') or 'Channel')[:28]}" if named else "📢 Join Channel"
             rows.append([{"text": label, "url": url}])
+    rows.append([{"text": "❓ Help / Request", "callback_data": "user_help"}])
     rows.append([{"text": VERIFY_BUTTON, "callback_data": "verify_join"}])
     return {"inline_keyboard": rows}
 
 
-def gate_text(missing: List[Dict[str, Any]], left: bool = False, total: int = 0) -> str:
-    many = max(total, len(missing)) > 1
-    names = "\n".join(f"• {esc(c.get('title') or 'Channel')}" for c in missing) if many else ""
+def gate_text(missing: List[Dict[str, Any]], left: bool = False, total: int = 0,
+              allch: Optional[List[Dict[str, Any]]] = None, user: Optional[Dict[str, Any]] = None) -> str:
+    """✨ Premium join prompt (Aarav 11:01 AM): every join channel with ✅ / 🔸, a progress bar "1/2 joined",
+    and the promise that access comes by itself the moment they join."""
+    chans = list(allch) if allch else list(missing)
+    total = max(total, len(chans), len(missing))
+    miss_ids = {str(c.get("chat_id")) for c in missing}
+    done = max(0, total - len(missing))
+    many = total > 1
+    lines = []
+    for c in chans:
+        ok = str(c.get("chat_id")) not in miss_ids and bool(allch)
+        lines.append(("✅ " if ok else "🔸 ") + ("" if ok else "<b>") + esc(str(c.get("title") or "Channel")[:40]) +
+                     ("" if ok else "</b> — <i>join baaki</i>"))
+    bar = "🟩" * done + "⬜" * max(0, total - done)
+    progress = f"📊 Progress: {bar} <b>{done}/{total} joined</b>" + (" ✅" if done and done == total else "")
+    nm = first_name(user) if user and (user.get("first_name") or "").strip() else ""
+    hello = f"👋 Namaste <b>{nm}</b>!\n" if nm else ""
     if left:
-        head = "⁉️ <b>Aapne hamara channel chhod diya!</b>"
-        body = ("Bot ka access rok diya gaya hai 🔒\n"
-                + ("Ye channels dobara join karo:\n" + names + "\n\nPhir ✅ Joined dabao." if many
-                   else "Dobara channel join karo aur ✅ Joined dabao."))
-        return f"{head}\n\n{body}"
-    if many:
-        return ("⁉️ <b>Bot use karne ke liye pehle hamare channels join karo!</b>\n\n" + names +
-                "\n\nNiche har 📢 Join button dabao, join karo, phir ✅ Joined / Verify dabao.")
-    return ("⁉️ <b>Bot use karne ke liye pehle hamara channel join karo!</b>\n\n"
-            "Niche 📢 Join Channel dabao, join karo, phir ✅ Joined / Verify dabao.")
+        head = "⁉️ <b>Aapne hamara channel chhod diya!</b>\n🔒 Bot ka access abhi band hai."
+        tail = "👇 Dobara join karo — join karte hi access apne-aap wapas mil jayega ⚡\nPhir bhi na mile to ✅ Joined dabao."
+    elif many:
+        head = "🔐 <b>Bot use karne ke liye pehle hamare channels join karo!</b>"
+        tail = "⚡ Join karte hi access apne-aap mil jayega — ya niche ✅ Joined / Verify dabao."
+    else:
+        head = "🔐 <b>Bot use karne ke liye pehle hamara channel join karo!</b>"
+        tail = "⚡ Join karte hi access apne-aap mil jayega — ya niche ✅ Joined / Verify dabao."
+    return f"{head}\n\n{hello}" + "\n".join(lines) + f"\n\n{progress}\n\n{tail}"
 
 
 # ---- verified memory: who has passed the gate before (to tell "left" apart from "new").
@@ -1077,7 +1092,7 @@ def gate_clear(user_id: Optional[int], chat_id: Any, keep_mid: Any = None) -> Di
 
 def send_join_gate(chat_id: int, missing: List[Dict[str, Any]], left: bool = False, total: int = 0,
                    user_id: Optional[int] = None, ask: Optional[Dict[str, Any]] = None, trig: Any = None,
-                   user: Optional[Dict[str, Any]] = None) -> None:
+                   user: Optional[Dict[str, Any]] = None, allch: Optional[List[Dict[str, Any]]] = None) -> None:
     """ONE join prompt per user, always FRESH at the bottom of the chat (Aarav 11:07 AM: "har baar start krne pr msg
     aana chahiye or pichhla delete ho jaye"): every new message/tap sends a new prompt and deletes the old one.
     The same Telegram update delivered twice (same message id) changes nothing. The user's request is remembered
@@ -1089,7 +1104,7 @@ def send_join_gate(chat_id: int, missing: List[Dict[str, Any]], left: bool = Fal
         return                              # Telegram re-sent the same update: the prompt for it is already there
     if ask:
         st["q"] = ask
-    text, markup = gate_text(missing, left, total), join_markup(missing, total)
+    text, markup = gate_text(missing, left, total, allch, user), join_markup(missing, total)
     res = telegram("sendMessage", {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "reply_markup": safe_markup(markup),
                                    "disable_web_page_preview": True}) or {}
     mid = ((res.get("result") or {}) if isinstance(res, dict) else {}).get("message_id")
@@ -1155,9 +1170,95 @@ def send_welcome(chat_id: int, user: Optional[Dict[str, Any]], text: str, markup
             log_error("lastw")
 
 
+# ---- 👀 JOIN ATTEMPTS (Aarav 11:01 AM: admin sees who is trying) + 🔓 bypass from the alert with one tap
+GATE_ATT_KEY = "gate_attempts"
+GATE_ALERT_EVERY = 1800        # one live alert per user per 30 min (more tries just raise the count in the list)
+GATE_ALERT_HOURLY = 20         # and at most 20 alerts an hour in total — the rest only in 👀 Join attempts
+
+
+def gate_attempts() -> Dict[str, Any]:
+    try:
+        d = json.loads(get_setting(GATE_ATT_KEY) or "{}")
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def gate_attempts_save(d: Dict[str, Any]) -> None:
+    users = sorted(((k, v) for k, v in d.items() if not k.startswith("_") and isinstance(v, dict)),
+                   key=lambda kv: -float(kv[1].get("t") or 0))[:60]
+    out = {k: v for k, v in users}
+    if isinstance(d.get("_h"), list):
+        out["_h"] = d["_h"]
+    set_setting(GATE_ATT_KEY, json.dumps(out, ensure_ascii=False, separators=(",", ":")))
+
+
+def gate_alert_target() -> Optional[Any]:
+    tgt = get_setting("log_chat_id")
+    if tgt:
+        return tgt
+    return min(ADMIN_USER_IDS) if ADMIN_USER_IDS else None
+
+
+def gate_user_name(user_id: int, user: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    u = user or {}
+    if not (u.get("first_name") or u.get("username")):
+        try:
+            u = get_user_rec(int(user_id)) or {}
+        except Exception:
+            u = {}
+    name = " ".join(x for x in [str(u.get("first_name") or "").strip(), str(u.get("last_name") or "").strip()] if x) or "User"
+    return {"n": name[:40], "u": str(u.get("username") or "")[:40]}
+
+
+def gate_who(user_id: Any, rec: Dict[str, Any]) -> str:
+    return (f"👤 <b>{esc(rec.get('n') or 'User')}</b>" + (f" @{esc(rec['u'])}" if rec.get("u") else "") +
+            f" · <code>{int(user_id)}</code>")
+
+
 def gate_attempt_note(user_id: int, user: Optional[Dict[str, Any]], missing: List[Dict[str, Any]], st: Dict[str, Any]) -> None:
-    """Hook for the 👀 join-attempt list/alerts (filled in by the premium gate)."""
-    return None
+    """Every join prompt = one attempt: remembered for 👀 Join attempts; a live alert (throttled) to the Log Chat
+    with ✅ Bina join access do."""
+    if not user_id:
+        return
+    now = time.time()
+    d = gate_attempts()
+    rec = dict(d.get(str(user_id)) or {})
+    rec.update(gate_user_name(user_id, user))
+    rec["c"] = int(rec.get("c") or 0) + 1
+    rec["t"] = int(now)
+    rec.setdefault("t0", int(now))
+    rec["m"] = [str(c.get("title") or "Channel")[:30] for c in missing][:4]
+    rec.pop("j", None)
+    hour = int(now // 3600)
+    h = d.get("_h") if isinstance(d.get("_h"), list) and len(d.get("_h")) == 2 else [hour, 0]
+    if h[0] != hour:
+        h = [hour, 0]
+    alert = now - float(rec.get("at") or 0) > GATE_ALERT_EVERY and h[1] < GATE_ALERT_HOURLY and not is_gate_bypass(user_id)
+    if alert:
+        rec["at"] = int(now)
+        h[1] += 1
+    d["_h"] = h
+    d[str(user_id)] = rec
+    gate_attempts_save(d)
+    if alert:
+        tgt = gate_alert_target()
+        if not tgt:
+            return
+        text = ("👀 <b>Join attempt</b>" + (f" · {rec['c']}x" if rec["c"] > 1 else "") + "\n" + gate_who(user_id, rec) +
+                "\n🔒 Baaki: " + esc(", ".join(rec["m"]) or "—") + f"\n🕐 {ist_now()}")
+        markup = {"inline_keyboard": [[{"text": "✅ Bina join access do", "callback_data": f"ad:gb:{int(user_id)}"}],
+                                      [{"text": "👀 Sab attempts", "callback_data": "ad:gatt"}]]}
+        try:
+            res = telegram("sendMessage", {"chat_id": tgt, "text": text, "parse_mode": "HTML", "reply_markup": markup,
+                                           "disable_web_page_preview": True, "disable_notification": rec["c"] > 1}) or {}
+            mid = ((res.get("result") or {}) if isinstance(res, dict) else {}).get("message_id")
+            if mid:
+                rec["am"] = [tgt, mid]
+                d[str(user_id)] = rec
+                gate_attempts_save(d)
+        except Exception:
+            log_error("gate alert")
 
 
 _REQ_IDS: Dict[str, Any] = {"t": 0.0, "v": set()}
@@ -1234,7 +1335,7 @@ def gate_recheck(uid: int, user: Dict[str, Any], chat_id: Any = None) -> None:
     reqs = required_channels()
     missing = missing_required(uid, reqs)
     if missing:
-        send_join_gate(chat_id, missing, left=was_verified(uid), total=len(reqs), user_id=uid, user=user)
+        send_join_gate(chat_id, missing, left=was_verified(uid), total=len(reqs), user_id=uid, user=user, allch=reqs)
         return
     mark_verified(uid)
     note_user(user, verified=True)
@@ -1250,8 +1351,104 @@ def gate_recheck(uid: int, user: Dict[str, Any], chat_id: Any = None) -> None:
 
 
 def gate_passed(uid: int, user: Optional[Dict[str, Any]], st: Dict[str, Any]) -> None:
-    """Hook: a user with an open prompt got in (premium gate: attempt list + admin alert update)."""
+    """A user with an open prompt got in: 👀 attempt marked ✅ joined and their live alert updated (no stale button)."""
     gate_event("pass", uid, None, f"n={st.get('n') or 0}")
+    try:
+        d = gate_attempts()
+        rec = d.get(str(uid))
+        if not isinstance(rec, dict) or rec.get("j"):
+            return
+        rec["j"] = int(time.time())
+        am = rec.pop("am", None)
+        d[str(uid)] = rec
+        gate_attempts_save(d)
+        if am:
+            try:
+                telegram("editMessageText", {"chat_id": am[0], "message_id": int(am[1]), "parse_mode": "HTML",
+                                             "text": "✅ <b>Join ho gaya</b> — access mil gaya\n" + gate_who(uid, rec) + f"\n🕐 {ist_now()}"})
+            except Exception:
+                pass
+    except Exception:
+        log_error("gate passed")
+
+
+def gate_grant(admin_id: int, uid: int, query: Optional[Dict[str, Any]], chat_id: Any) -> None:
+    """✅ Bina join access do: the user is let in without joining; their join prompt goes and they get the welcome."""
+    rec = (gate_attempts().get(str(uid)) or {}) if True else {}
+    if not rec.get("n"):
+        rec = dict(rec, **gate_user_name(uid, None))
+    gate_bypass_set(uid, True, admin_id, rec.get("n") or "")
+    audit_log(f"🔓 Bina join access: {rec.get('n') or uid} ({uid}) · {actor_label(admin_id)}")
+    st = gate_clear(uid, uid)
+    try:
+        u = {"id": uid, "first_name": rec.get("n") or ""}
+        send_welcome(uid, u, "✅ <b>Admin ne aapko access de diya!</b> 🎉\n\n" + welcome_text(u), user_menu())
+    except Exception:
+        log_error("gate grant notify")
+    show(chat_id, "🔓 <b>Bina join access diya</b>\n" + gate_who(uid, rec) + f"\n✅ by {esc(actor_label(admin_id))} · {ist_now()}",
+         {"inline_keyboard": [[{"text": "↩️ Access wapas lo", "callback_data": f"ad:gr:{uid}"}]]}, query, "HTML")
+
+
+def gate_attempts_screen(chat_id: Any, query: Optional[Dict[str, Any]]) -> None:
+    d = gate_attempts()
+    rows = sorted(((k, v) for k, v in d.items() if not k.startswith("_") and isinstance(v, dict)), key=lambda kv: -float(kv[1].get("t") or 0))
+    byp = gate_bypass_map()
+    lines, kb = [], []
+    for k, v in rows[:15]:
+        mark = "✅ joined" if v.get("j") else ("🔓 bypass" if k in byp else "🔒 " + ", ".join(v.get("m") or [])[:40])
+        t = time.strftime("%d %b %I:%M %p", time.gmtime(float(v.get("t") or 0) + 19800))
+        lines.append(f"• <b>{esc(v.get('n') or 'User')}</b>" + (f" @{esc(v['u'])}" if v.get("u") else "") +
+                     f" · <code>{k}</code>\n   {int(v.get('c') or 0)}x · {t} · {esc(mark)}")
+        if not v.get("j") and k not in byp and len(kb) < 8:
+            kb.append([{"text": f"✅ Access: {str(v.get('n') or k)[:18]}", "callback_data": f"ad:gb:{k}"}])
+    text = ("👀 <b>Join attempts</b> (latest 15)\nJo bot use karna chahte hain par channel join nahi kiya:\n\n" +
+            ("\n".join(lines) if lines else "Abhi koi attempt nahi 🙂") +
+            "\n\n✅ = bina join access do (🔓 Bypass list se wapas le sakte ho)")
+    kb.append([{"text": f"🔓 Bypass list ({len(byp)})", "callback_data": "ad:gbl"}, {"text": "🔄 Refresh", "callback_data": "ad:gatt"}])
+    kb.append(list(BACK_ROW))
+    show(chat_id, text, {"inline_keyboard": kb}, query, "HTML")
+
+
+def gate_bypass_screen(chat_id: Any, query: Optional[Dict[str, Any]]) -> None:
+    byp = gate_bypass_map()
+    lines, kb = [], []
+    for k, v in sorted(byp.items(), key=lambda kv: -float((kv[1] or {}).get("t") or 0))[:30]:
+        v = v or {}
+        t = time.strftime("%d %b %I:%M %p", time.gmtime(float(v.get("t") or 0) + 19800))
+        lines.append(f"• <b>{esc(v.get('n') or 'User')}</b> · <code>{k}</code> · {t}")
+        if len(kb) < 15:
+            kb.append([{"text": f"❌ Hatao: {str(v.get('n') or k)[:20]}", "callback_data": f"ad:gr:{k}:l"}])
+    text = ("🔓 <b>Bypass list</b> — ye users bina channel join kiye bot use kar sakte hain\n\n" +
+            ("\n".join(lines) if lines else "Koi nahi. 👀 Join attempts se ✅ dabakar kisi ko bhi access de sakte ho."))
+    kb.append([{"text": "👀 Join attempts", "callback_data": "ad:gatt"}])
+    kb.append(list(BACK_ROW))
+    show(chat_id, text, {"inline_keyboard": kb}, query, "HTML")
+
+
+def gate_admin_cb(query: Dict[str, Any], data: str, chat_id: Any, user_id: int) -> None:
+    if data == "ad:gatt":
+        gate_attempts_screen(chat_id, query)
+    elif data == "ad:gbl":
+        gate_bypass_screen(chat_id, query)
+    elif data.startswith("ad:gb:"):
+        uid = int(data.split(":")[2])
+        if is_subadmin(uid):
+            show(chat_id, "ℹ️ Ye admin hai — admin ko join ki zarurat nahi.", None, query)
+            return
+        gate_grant(user_id, uid, query, chat_id)
+    elif data.startswith("ad:gr:"):
+        parts = data.split(":")
+        uid = int(parts[2])
+        rec = gate_bypass_map().get(str(uid)) or gate_attempts().get(str(uid)) or {}
+        gate_bypass_set(uid, False)
+        audit_log(f"↩️ Bina join access wapas: {rec.get('n') or uid} ({uid}) · {actor_label(user_id)}")
+        if len(parts) > 3:
+            gate_bypass_screen(chat_id, query)
+        else:
+            show(chat_id, "↩️ <b>Access wapas liya</b> — ab channel join karna padega\n" +
+                 gate_who(uid, {"n": rec.get("n"), "u": rec.get("u")}) + f"\nby {esc(actor_label(user_id))} · {ist_now()}",
+                 {"inline_keyboard": [[{"text": "✅ Bina join access do", "callback_data": f"ad:gb:{uid}"}]]}, query, "HTML")
+
 
 
 def handle_join_request(jr: Dict[str, Any]) -> None:
@@ -1289,7 +1486,7 @@ def gate_blocks(user_id: Optional[int], chat_id: int, ask: Optional[Dict[str, An
     if missing:
         note_user(None, verified=False)
         send_join_gate(chat_id, missing, left=was_verified(user_id), total=len(reqs), user_id=user_id, ask=ask,
-                       trig=trig, user=user)
+                       trig=trig, user=user, allch=reqs)
         return True
     if reqs:
         mark_verified(user_id)
@@ -1348,10 +1545,12 @@ def admin_menu(user_id: Optional[int] = None) -> Dict[str, Any]:
         [{"text": "💾 Backup Channel", "callback_data": "ad:backup"}, {"text": "📝 Log Chat", "callback_data": "ad:log"}],
         [{"text": "💾 Backup: purani files bhi", "callback_data": "ad:bkold"}],
         [{"text": "👥 Users", "callback_data": "ad:users"}, {"text": "👮 Admins", "callback_data": "ad:admins"}],
+        [{"text": "👀 Join attempts", "callback_data": "ad:gatt"}, {"text": "🔓 Bypass users", "callback_data": "ad:gbl"}],
         [{"text": "📂 All Files", "callback_data": "ad:files:1"}, {"text": "🤖 AI Naming", "callback_data": "ad:ainame"}],
         [{"text": "✏️ File Rename", "callback_data": "ad:rename"}, {"text": "📊 Report", "callback_data": "ad:report"}],
         keys_row + [{"text": "🔄 Bot Restart", "callback_data": "ad:restart"}],
-    ] + ([[{"text": "👤 Userbot", "callback_data": "ad:ub"}]] if (user_id is None or is_owner(user_id)) else []) + [
+    ] + ([[{"text": "👤 Userbot", "callback_data": "ad:ub"}, {"text": "📢 Sabko message", "callback_data": "ad:bc"}]]
+         if (user_id is None or is_owner(user_id)) else []) + [
         [{"text": "🩺 Status", "callback_data": "ad:status"}, {"text": "❓ Admin Help", "callback_data": "ad:help"}],
         [{"text": search_mode_label(user_id), "callback_data": "ad:smode"}],
     ] + ([[{"text": agent_label(), "callback_data": "ad:agent"}]] if (user_id is None or is_owner(user_id)) else []) + [
@@ -4561,6 +4760,7 @@ USER_MENU = [
     {"command": "start", "description": "Bot start karein"},
     {"command": "search", "description": "Book/file search karein"},
     {"command": "help", "description": "Help aur instructions"},
+    {"command": "request", "description": "Admin ko request / problem bhejo"},
     {"command": "myid", "description": "Apna Telegram ID dekhein"},
 ]
 ADMIN_MENU = USER_MENU + [
@@ -4827,6 +5027,24 @@ def handle_private_message(message: Dict[str, Any]) -> None:
         role = {"owner": "Owner ✅", "admin": "Sub-admin ✅", "user": "Normal user"}[role_of(user_id)]
         send_text(chat_id, f"Aapka Telegram ID: {user_id}\nRole: {role}")
         return
+    if message.get("chat", {}).get("type") == "private" and user_id:
+        try:
+            prefetch_settings([f"hd:{user_id}", f"verified:{user_id}", f"gate:{user_id}", f"jrq:{user_id}", f"lastw:{user_id}",
+                               f"pending:{user_id}"])
+        except Exception:
+            pass
+        # 📝 HELP DESK (Aarav 11:05 / 11:26 AM): /request <msg> (and /admin <msg> for normal users) → straight to admin;
+        # after 📝 Request button the next message goes to admin. Works before and after joining.
+        if command == "/request" or (command == "/admin" and not is_subadmin(user_id)):
+            body = text.split(None, 1)[1].strip() if len(text.split(None, 1)) > 1 else ""
+            if body:
+                hd_submit(message, user, body_text=body)
+            else:
+                hd_open(chat_id, user_id)
+            return
+        if not command and hd_pending(user_id):
+            hd_submit(message, user)
+            return
     if command and command not in USER_COMMANDS and not is_subadmin(user_id):
         send_text(chat_id, f"⛔ Ye command sirf admin ke liye hai.\nAapka Telegram ID: {user_id}")
         return
@@ -4852,6 +5070,12 @@ def handle_private_message(message: Dict[str, Any]) -> None:
         action = prompt_action(message)
         extra = None
         pending = get_pending(user_id)
+        if pending and action is None and pending.get("a") in ("hdreply", "bcast"):
+            if pending.get("a") == "hdreply":
+                hd_admin_reply(message, user_id, pending.get("x"))
+            else:
+                bc_draft(message, user_id)
+            return
         if pending and (action is None or action == pending.get("a")):
             action, extra = pending.get("a"), pending.get("x")
         if action in PROMPTS:
@@ -4982,7 +5206,7 @@ def handle_private_message(message: Dict[str, Any]) -> None:
     send_text(chat_id, f"🔎 <b>{len(results)} file mili</b> — jo chahiye us par tap karo 👇", {"inline_keyboard": buttons}, "HTML")
 
 
-USER_COMMANDS = {"/start", "/help", "/search", "/myid"}
+USER_COMMANDS = {"/start", "/help", "/search", "/myid", "/request"}
 
 SEARCH_PROMPT = ("🔍 <b>Kya dhoondhna hai?</b>\n\n"
                  "Book / PDF ka naam, subject ya exam likhkar bhejo.\n"
@@ -4995,14 +5219,26 @@ USER_HELP = ("❓ <b>Bot kaise use kare</b>\n\n"
              "/myid — aapka Telegram ID")
 
 
+HD_HELP_LINE = "\n\n📝 <b>Admin ko message</b>: niche button dabao, ya likho <code>/request apna message</code>"
+
+
 def send_help(chat_id: int, user_id: Optional[int]) -> None:
-    """❓ /help + the help button: works WITHOUT joining the channels."""
-    extra = "\n\n⚙️ Admin: /admin se Admin Panel khulega." if is_subadmin(user_id) else ""
-    send_text(chat_id, USER_HELP + extra, help_markup(user_id), "HTML")
+    """❓ /help + the help button work WITHOUT joining (Aarav 11:01 / 11:26 AM): before joining ONLY the
+    "message admin" option is offered; after joining the normal help + the same option."""
+    if is_subadmin(user_id):
+        send_text(chat_id, USER_HELP + HD_HELP_LINE + "\n\n⚙️ Admin: /admin se Admin Panel khulega.", help_markup(user_id), "HTML")
+        return
+    reqs = required_channels()
+    if reqs and user_id and missing_required(user_id, reqs):
+        send_text(chat_id, "❓ <b>Help</b>\n\nBot ki files/search ke liye pehle hamare channels join karo (/start dabao).\n\n"
+                           "Tab tak aap admin ko apni request ya problem bhej sakte ho 👇\n"
+                           "Ya likho: <code>/request apna message</code>", help_markup(user_id), "HTML")
+        return
+    send_text(chat_id, USER_HELP + HD_HELP_LINE, help_markup(user_id), "HTML")
 
 
 def help_markup(user_id: Optional[int]) -> Optional[Dict[str, Any]]:
-    return None
+    return {"inline_keyboard": [[{"text": "📝 Request / Problem bhejo", "callback_data": "hd_new"}]]}
 
 
 def command_name(text: str) -> str:
@@ -5258,13 +5494,15 @@ CALLBACK_PATTERNS = [
     r"ad:ubst:[a-z]+", r"ad:ubdl:[a-z]+",
     r"ad:y:(rtl:[a-z]|rtos:[a-z]*|rtms:[a-z]:(a|\d+))", r"ad:agent",
     r"ad:wl:[0-9a-f]{8}:(a|\d{1,2})", r"ad:uplpw:(go|no)",
+    r"hd_new", r"hd_cancel", r"ad:(gatt|gbl|bc|bcy|bcn|bcgo)", r"ad:gb:\d+", r"ad:gr:\d+(:l)?",
+    r"ad:(hr|hdn|hb|hub):\d+",
 ]
 _CB_RE = re.compile("(?:" + ")|(?:".join(CALLBACK_PATTERNS) + ")")
 STALE_ADMIN = "🔄 Ye button purana hai, /admin dobara kholo"
 STALE_USER = "🔄 Ye button purana hai, /start dobara karo"
 CONFIRM_TTL = 3600      # an ✅ Accept older than this (message date) asks to start again
 OWNER_ONLY_CMDS = ("keys", "key", "rt", "bigfix", "addadm", "rmadm:", "y:keyrm:", "y:rmadm:", "y:rt", "ub", "y:ublogout", "y:ubdel", "y:ubdx",
-                   "wl:", "uplpw")
+                   "wl:", "uplpw", "bc")
 # toast shown at once for buttons whose screen needs a few lookups; quick screens just stop the spinner
 CB_TOASTS = [("ad:status", "⏳ Status check ho raha hai..."), ("ad:keychk", "🔄 Keys check ho rahi hain..."),
              ("ad:aitest", "⏳ AI test ho raha hai..."), ("ad:report", "⏳"), ("ad:users", "⏳"), ("ad:bkold", "💾 Backup chal raha hai..."),
@@ -5272,7 +5510,8 @@ CB_TOASTS = [("ad:status", "⏳ Status check ho raha hai..."), ("ad:keychk", "�
              ("ad:bigfix", "🔁 Badi files dekh raha hu..."), ("ad:logfill", "📜 Log Chat me bhej raha hu..."),
              ("ad:fs:", "📤 File bhej raha hu..."), ("book:", "📤 File bhej raha hu..."), ("ad:y:", "⏳"), ("ad:op:y:", "⏳"),
              ("ad:keys", "⏳"), ("ad:rtm:", "⏳"), ("ad:ub", "⏳"), ("ad:ubrun", "🔄 Check shuru kar raha hu..."),
-             ("ad:ublogin", "🔑 Login link bana raha hu...")]
+             ("ad:ublogin", "🔑 Login link bana raha hu..."),
+             ("ad:gb:", "🔓 Access de raha hu..."), ("ad:bcy", "📢 Shuru kar raha hu..."), ("ad:hr:", "✍️ Jawab bot ki private chat me likho")]
 
 
 def callback_known(data: str) -> bool:
@@ -5394,7 +5633,7 @@ def _handle_callback_body(query: Dict[str, Any], data: str, chat_id: Any, user_i
             alert += f"\n\nBaaki: {names}"
             # Already answered immediately; Telegram allows only one callback answer.
             # Put the failure in the message itself (the same prompt, edited — never a second prompt).
-            show(chat_id, esc(alert[:160]) + "\n\n" + gate_text(missing, was_verified(user_id), len(reqs)),
+            show(chat_id, esc(alert[:160]) + "\n\n" + gate_text(missing, was_verified(user_id), len(reqs), reqs, query.get("from")),
                  join_markup(missing, len(reqs)), query, "HTML")
             if user_id and tapped:
                 st = gate_state(user_id)
@@ -5405,6 +5644,20 @@ def _handle_callback_body(query: Dict[str, Any], data: str, chat_id: Any, user_i
                         pass
                 st.update({"mid": tapped, "t": time.time()})
                 gate_save(user_id, st)
+        return
+    if data.startswith(("ad:gb:", "ad:gr:", "ad:gatt", "ad:gbl", "ad:hr:", "ad:hdn:", "ad:hb:", "ad:hub:", "ad:bc")) and chat_id:
+        if not is_subadmin(user_id):
+            send_text(chat_id, f"⛔ Ye button sirf admin ke liye hai.\nAapka Telegram ID: {user_id}")
+            return
+        try:
+            if data.startswith(("ad:g",)):
+                gate_admin_cb(query, data, chat_id, user_id)
+            elif data.startswith("ad:bc"):
+                bc_admin_cb(query, data, chat_id, user_id)
+            else:
+                hd_admin_cb(query, data, chat_id, user_id)
+        except InputError as exc:
+            send_text(chat_id, f"❌ Nahi hua: {exc}", {"inline_keyboard": [BACK_ROW]})
         return
     if (data.startswith("ad:") or data.startswith("admin_")) and chat_id:
         if not is_subadmin(user_id):
@@ -5417,6 +5670,13 @@ def _handle_callback_body(query: Dict[str, Any], data: str, chat_id: Any, user_i
         return
     if data == "user_help" and chat_id:
         send_help(chat_id, user_id)               # ❓ help works without joining
+        return
+    if data in ("hd_new", "hd_cancel") and chat_id:
+        if data == "hd_new":
+            hd_open(chat_id, user_id, query)
+        else:
+            hd_close(user_id)
+            show(chat_id, "❌ Theek hai, request cancel.", None, query)
         return
     if chat_id and gate_blocks(user_id, chat_id, ask={"k": "cb", "data": data}, trig=f"cb{query.get('id') or ''}:{data}"[:80],
                                user=query.get("from")):
@@ -7248,6 +7508,10 @@ def health() -> Any:
         log_error("logfill keepalive")
     try:
         web_keepalive()        # 🌐 link jobs left behind / old upload temp files
+        try:
+            bc_keepalive()     # 📢 a broadcast that stopped half way continues
+        except Exception:
+            log_error("bc keepalive")
     except Exception:
         log_error("web keepalive")
     try:
@@ -14545,6 +14809,439 @@ def nondoc_scan(min_id: int = 0, apply: bool = False) -> Dict[str, Any]:
     return res
 
 
+# ================================================================ 📝 HELP DESK + 📢 BROADCAST (Aarav 11:05 / 11:26 AM Oct 27 2026)
+# HELP DESK: /help → "📝 Request / Problem bhejo" (works before AND after joining; before joining it is the ONLY help
+# option), or /request <msg> (and /admin <msg> for normal users). The user's text/photo/file goes to the 📝 Log Chat
+# (no Log Chat → the owner's private chat) with name/@/id + [↩️ Reply] [✅ Done] [🚫 Block]. ↩️ Reply: the admin's next
+# message (text/photo/file) reaches the user through the bot. Rate limit: 1 per 20 s, 6 per hour; blocked users can't.
+HD_KEY_BLOCK = "hd_blocked"
+HD_MIN_GAP = 20
+HD_PER_HOUR = 6
+
+
+def hd_pending(user_id: Optional[int]) -> bool:
+    try:
+        return bool(user_id) and time.time() - float(get_setting(f"hd:{user_id}") or 0) < 900
+    except Exception:
+        return False
+
+
+def hd_close(user_id: Optional[int]) -> None:
+    if not user_id:
+        return
+    try:
+        supabase("bot_settings", "DELETE", query=f"?key=eq.{urllib.parse.quote(f'hd:{user_id}')}")
+    except Exception:
+        log_error("hd_close")
+
+
+def hd_blocked_set() -> set:
+    try:
+        return {str(x) for x in (json.loads(get_setting(HD_KEY_BLOCK) or "[]") or [])}
+    except Exception:
+        return set()
+
+
+def hd_block(uid: int, on: bool) -> None:
+    s = hd_blocked_set()
+    (s.add if on else s.discard)(str(uid))
+    set_setting(HD_KEY_BLOCK, json.dumps(sorted(s)))
+
+
+def hd_open(chat_id: Any, user_id: Optional[int], query: Optional[Dict[str, Any]] = None) -> None:
+    if user_id and str(user_id) in hd_blocked_set():
+        show(chat_id, "🚫 Aap admin ko request nahi bhej sakte.", None, query)
+        return
+    try:
+        set_setting(f"hd:{user_id}", str(int(time.time())))
+    except Exception:
+        log_error("hd_open")
+    text = ("📝 <b>Admin ko message</b>\n\nApni request ya problem likh kar bhejo — text, photo ya file, jo bhi bhejoge "
+            "seedha admin tak jayega.\nJaise: <i>\"SSC GD 2025 ka paper chahiye\"</i> ya <i>\"file nahi khul rahi\"</i>\n\n"
+            "Jawab yahin bot me aayega 🙏")
+    markup = {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "hd_cancel"}]]}
+    if query:
+        send_text(chat_id, text, markup, "HTML")
+    else:
+        send_text(chat_id, text, markup, "HTML")
+
+
+def hd_target() -> Optional[Any]:
+    tgt = get_setting("log_chat_id")
+    if tgt:
+        return tgt
+    return min(ADMIN_USER_IDS) if ADMIN_USER_IDS else None
+
+
+def hd_rate_ok(uid: int) -> bool:
+    key = f"hdrl:{uid}"
+    now = time.time()
+    try:
+        ts = [float(x) for x in (json.loads(get_setting(key) or "[]") or []) if now - float(x) < 3600]
+    except Exception:
+        ts = []
+    if (ts and now - ts[-1] < HD_MIN_GAP) or len(ts) >= HD_PER_HOUR:
+        return False
+    ts.append(now)
+    try:
+        set_setting(key, json.dumps([int(x) for x in ts]))
+    except Exception:
+        log_error("hd rate")
+    return True
+
+
+def hd_submit(message: Dict[str, Any], user: Dict[str, Any], body_text: str = "") -> None:
+    chat_id = (message.get("chat") or {}).get("id")
+    uid = user.get("id")
+    hd_close(uid)
+    if uid and str(uid) in hd_blocked_set():
+        send_text(chat_id, "🚫 Aap admin ko request nahi bhej sakte.")
+        return
+    if is_subadmin(uid) and False:
+        return
+    if not hd_rate_ok(int(uid)):
+        send_text(chat_id, "⏳ Thoda ruk kar bhejo — bahut jaldi-jaldi request aa rahi hain (1 ghante me max 6).")
+        return
+    tgt = hd_target()
+    if not tgt:
+        send_text(chat_id, "❌ Abhi admin tak message nahi ja sakta (setup baaki hai).")
+        return
+    rec = {"n": " ".join(x for x in [str(user.get("first_name") or ""), str(user.get("last_name") or "")] if x).strip() or "User",
+           "u": user.get("username") or ""}
+    words = body_text or message.get("text") or message.get("caption") or ""
+    has_media = not body_text and any(message.get(k) for k in ("photo", "document", "video", "audio", "voice", "animation", "sticker", "video_note"))
+    kind = "" if not has_media else " · 📎 " + next(k for k in ("photo", "document", "video", "audio", "voice", "animation", "sticker", "video_note") if message.get(k))
+    head = ("📝 <b>Nayi request / problem</b>" + kind + "\n" + gate_who(uid, rec) + f"\n🕐 {ist_now()}" +
+            (f"\n\n💬 {esc(words[:1500])}" if words else ""))
+    markup = {"inline_keyboard": [[{"text": "↩️ Reply", "callback_data": f"ad:hr:{int(uid)}"},
+                                   {"text": "✅ Done", "callback_data": f"ad:hdn:{int(uid)}"}],
+                                  [{"text": "🚫 Block", "callback_data": f"ad:hb:{int(uid)}"}]]}
+    try:
+        res = telegram("sendMessage", {"chat_id": tgt, "text": head, "parse_mode": "HTML", "reply_markup": markup,
+                                       "disable_web_page_preview": True}) or {}
+        hmid = ((res.get("result") or {}) if isinstance(res, dict) else {}).get("message_id")
+        if has_media:
+            p = {"chat_id": tgt, "from_chat_id": chat_id, "message_id": message.get("message_id")}
+            if hmid:
+                p["reply_to_message_id"] = hmid
+            telegram("copyMessage", p)
+    except Exception:
+        log_error("hd submit")
+        send_text(chat_id, "❌ Abhi admin tak nahi pahunch paya, thodi der baad dobara bhejo.")
+        return
+    send_text(chat_id, "✅ <b>Admin tak pahunch gaya!</b> 🙏\nJawab yahin bot me aayega.",
+              {"inline_keyboard": [[{"text": "📝 Aur bhejo", "callback_data": "hd_new"}]]}, "HTML")
+
+
+def hd_admin_reply(message: Dict[str, Any], admin_id: int, uid: Any) -> None:
+    """The admin's next message after ↩️ Reply goes to the user through the bot (text, photo, file — anything)."""
+    clear_pending(admin_id)
+    chat_id = (message.get("chat") or {}).get("id")
+    try:
+        uid = int(uid)
+    except Exception:
+        send_text(chat_id, "❌ User nahi mila.")
+        return
+    text = message.get("text") or ""
+    try:
+        if text and not any(message.get(k) for k in ("photo", "document", "video", "audio", "voice", "animation", "sticker")):
+            telegram("sendMessage", {"chat_id": uid, "text": "💬 <b>Admin ka jawab:</b>\n\n" + esc(text[:3800]), "parse_mode": "HTML",
+                                     "reply_markup": {"inline_keyboard": [[{"text": "📝 Admin ko reply karo", "callback_data": "hd_new"}]]}})
+        else:
+            telegram("sendMessage", {"chat_id": uid, "text": "💬 <b>Admin ka jawab:</b>", "parse_mode": "HTML"})
+            telegram("copyMessage", {"chat_id": uid, "from_chat_id": chat_id, "message_id": message.get("message_id"),
+                                     "reply_markup": {"inline_keyboard": [[{"text": "📝 Admin ko reply karo", "callback_data": "hd_new"}]]}})
+    except Exception as exc:
+        low = str(exc).lower()
+        why = "user ne bot block kar diya" if ("blocked" in low or "deactivated" in low or "forbidden" in low) else friendly_tg_error(exc)
+        send_text(chat_id, f"❌ Jawab nahi gaya: {why}", {"inline_keyboard": [BACK_ROW]})
+        return
+    audit_log(f"↩️ Help desk jawab → {uid} · {actor_label(admin_id)}")
+    send_text(chat_id, f"✅ Jawab bhej diya (user {uid}).", {"inline_keyboard": [BACK_ROW]})
+
+
+def hd_admin_cb(query: Dict[str, Any], data: str, chat_id: Any, user_id: int) -> None:
+    cmd, uid = data[3:].split(":")[0], int(data.split(":")[2])
+    msg_text = str((query.get("message") or {}).get("text") or "")[:3500]
+    who = actor_label(user_id)
+    if cmd == "hr":
+        set_pending(user_id, "hdreply", uid)
+        send_text(user_id, f"↩️ User <code>{uid}</code> ko jawab likho — text, photo ya file. Jo agla message bhejoge wahi jayega.\n/cancel = band",
+                  {"force_reply": True, "input_field_placeholder": "Jawab likho…"}, "HTML")
+        if str(chat_id) != str(user_id):
+            try:
+                telegram("editMessageReplyMarkup", {"chat_id": chat_id, "message_id": (query.get("message") or {}).get("message_id"),
+                                                    "reply_markup": {"inline_keyboard": [[{"text": f"✍️ {who[:30]} jawab likh rahe hain", "callback_data": f"ad:hr:{uid}"},
+                                                                                          {"text": "✅ Done", "callback_data": f"ad:hdn:{uid}"}]]}})
+            except Exception:
+                pass
+    elif cmd == "hdn":
+        show(chat_id, msg_text + f"\n\n✅ Done · {who} · {ist_now()}", None, query)
+    elif cmd == "hb":
+        hd_block(uid, True)
+        audit_log(f"🚫 Help desk block: {uid} · {who}")
+        show(chat_id, msg_text + f"\n\n🚫 Blocked · {who}", {"inline_keyboard": [[{"text": "↩️ Unblock", "callback_data": f"ad:hub:{uid}"}]]}, query)
+    elif cmd == "hub":
+        hd_block(uid, False)
+        show(chat_id, msg_text.split("\n\n🚫 Blocked")[0] + f"\n\n↩️ Unblocked · {who}",
+             {"inline_keyboard": [[{"text": "↩️ Reply", "callback_data": f"ad:hr:{uid}"}, {"text": "✅ Done", "callback_data": f"ad:hdn:{uid}"}]]}, query)
+
+
+# BROADCAST (owner): 📢 Sabko message → send anything → preview + ONE ✅ Accept / ❌ Deny → sent to every bot user,
+# ~20/s (under Telegram's limits), users who blocked the bot are skipped (remembered), live progress + final report.
+# Runs in its own function call (kick, 200 s budget) and continues by itself; the keepalive restarts a stalled run.
+BC_JOB_KEY = "bc_job"
+BC_BLOCKED_KEY = "bc_blocked"
+BC_BUDGET = 200.0
+BC_GAP = 0.05
+
+
+def bc_kick_key() -> str:
+    return hmac.new((WEBHOOK_SECRET or "x").encode(), b"bcast", hashlib.sha256).hexdigest()[:24]
+
+
+def _bc_kick_real() -> None:
+    try:
+        urllib.request.urlopen(urllib.request.Request(PUBLIC_HOME + "api/bcast?k=" + bc_kick_key(),
+                                                      headers={"User-Agent": "filesbull-bot/1.0"}), timeout=1.5).read()
+    except Exception:
+        pass
+
+
+BC_KICK = [_bc_kick_real]
+
+
+def bc_kick() -> None:
+    if _DIAG["dry"]:
+        return
+    BC_KICK[0]()
+
+
+def bc_job() -> Dict[str, Any]:
+    try:
+        d = json.loads(get_setting(BC_JOB_KEY) or "{}")
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def bc_job_save(j: Dict[str, Any]) -> None:
+    set_setting(BC_JOB_KEY, json.dumps(j, ensure_ascii=False, separators=(",", ":")))
+
+
+def bc_user_count() -> int:
+    try:
+        _, hh, _ = http_raw(f"{SUPABASE_URL}/rest/v1/bot_users?select=user_id", "GET", None,
+                            {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Prefer": "count=exact",
+                             "Range": "0-0"}, 15)
+        cr = {k.lower(): v for k, v in hh.items()}.get("content-range", "")
+        return int(cr.split("/")[-1]) if "/" in cr and cr.split("/")[-1].isdigit() else 0
+    except Exception:
+        try:
+            return len(supabase("bot_users", "GET", query="?select=user_id&limit=100000"))
+        except Exception:
+            return 0
+
+
+def bc_admin_cb(query: Dict[str, Any], data: str, chat_id: Any, user_id: int) -> None:
+    cmd = data[3:]
+    if cmd == "bc":
+        j = bc_job()
+        if j.get("st") == "running":
+            show(chat_id, bc_progress_text(j), bc_progress_markup(j), query, "HTML")
+            return
+        n = bc_user_count()
+        set_pending(user_id, "bcast")
+        show(chat_id, "📢 <b>Sabko message</b>\n\nAb jo message bhejoge — text, photo, file, video ya kisi channel se forward — "
+                      f"uska preview dikhega, phir <b>✅ Accept</b> dabane par sab <b>{n}</b> users ko jayega.\n"
+                      "Jinhone bot block kiya hai wo apne-aap skip honge.\n\n/cancel = band",
+             {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "ad:bcn"}]]}, query, "HTML")
+    elif cmd == "bcn":
+        clear_pending(user_id)
+        try:
+            supabase("bot_settings", "DELETE", query=f"?key=eq.{urllib.parse.quote(f'bcd:{user_id}')}")
+        except Exception:
+            pass
+        show(chat_id, "❌ Broadcast cancel — kisi ko kuch nahi gaya.", {"inline_keyboard": [BACK_ROW]}, query)
+    elif cmd == "bcy":
+        j = bc_job()
+        if j.get("st") == "running":
+            show(chat_id, "⏳ Ek broadcast pehle se chal raha hai.\n\n" + bc_progress_text(j), bc_progress_markup(j), query, "HTML")
+            return
+        try:
+            draft = json.loads(get_setting(f"bcd:{user_id}") or "{}")
+        except Exception:
+            draft = {}
+        if not draft.get("mid"):
+            show(chat_id, "⌛ Preview purana ho gaya — 📢 Sabko message dobara dabao.", {"inline_keyboard": [BACK_ROW]}, query)
+            return
+        try:
+            supabase("bot_settings", "DELETE", query=f"?key=eq.{urllib.parse.quote(f'bcd:{user_id}')}")
+        except Exception:
+            pass
+        j = {"id": hashlib.sha1(os.urandom(8)).hexdigest()[:8], "st": "running", "from": draft["chat"], "mid": draft["mid"],
+             "by": user_id, "cur": 0, "sent": 0, "fail": 0, "blocked": 0, "skip": 0, "total": bc_user_count(), "t0": int(time.time()),
+             "pt": int(time.time()), "pm": [chat_id, (query.get("message") or {}).get("message_id")], "lk": 0}
+        bc_job_save(j)
+        audit_log(f"📢 Broadcast shuru · {j['total']} users · {actor_label(user_id)}")
+        show(chat_id, bc_progress_text(j), bc_progress_markup(j), query, "HTML")
+        bc_kick()
+    elif cmd == "bcgo":              # ▶️ continue a stalled run by hand
+        j = bc_job()
+        if j.get("st") == "running":
+            j["lk"] = 0
+            bc_job_save(j)
+            bc_kick()
+        show(chat_id, bc_progress_text(j) if j else "Koi broadcast nahi chal raha.", bc_progress_markup(j) if j else {"inline_keyboard": [BACK_ROW]}, query, "HTML")
+
+
+def bc_draft(message: Dict[str, Any], admin_id: int) -> None:
+    """The owner's message after 📢 Sabko message: stored as the draft, shown back as a preview + ✅ Accept / ❌ Deny."""
+    clear_pending(admin_id)
+    chat_id = (message.get("chat") or {}).get("id")
+    set_setting(f"bcd:{admin_id}", json.dumps({"chat": chat_id, "mid": message.get("message_id"), "t": int(time.time())}))
+    n = bc_user_count()
+    try:
+        telegram("copyMessage", {"chat_id": chat_id, "from_chat_id": chat_id, "message_id": message.get("message_id")})
+    except Exception as exc:
+        send_text(chat_id, f"❌ Ye message copy nahi ho sakta: {friendly_tg_error(exc)}", {"inline_keyboard": [BACK_ROW]})
+        return
+    send_text(chat_id, f"👆 <b>Preview</b> — users ko bilkul aisa hi dikhega.\n\nYe <b>{n}</b> users ko jayega (block kiye hue skip).\n"
+                       "Bhejna hai?",
+              {"inline_keyboard": [[{"text": "✅ Accept — sabko bhejo", "callback_data": "ad:bcy"}],
+                                   [{"text": "❌ Deny", "callback_data": "ad:bcn"}]]}, "HTML")
+
+
+def bc_progress_text(j: Dict[str, Any]) -> str:
+    done = int(j.get("sent", 0)) + int(j.get("fail", 0)) + int(j.get("blocked", 0)) + int(j.get("skip", 0))
+    tot = max(int(j.get("total") or 0), done)
+    mins = max(0, int((float(j.get("et") or time.time()) - float(j.get("t0") or time.time())) // 60))
+    head = "📢 <b>Broadcast poora ✅</b>" if j.get("st") == "done" else "📢 <b>Broadcast chal raha hai…</b>"
+    return (f"{head}\n\n✅ Pahunch gaya: <b>{j.get('sent', 0)}</b>\n🚫 Block / account band: {j.get('blocked', 0)}"
+            f"\n⏭️ Pehle se block (skip): {j.get('skip', 0)}\n❌ Fail: {j.get('fail', 0)}\n📊 {done}/{tot}" +
+            (f" · ⏱ {mins} min" if j.get("st") == "done" else ""))
+
+
+def bc_progress_markup(j: Dict[str, Any]) -> Dict[str, Any]:
+    if j.get("st") == "running":
+        return {"inline_keyboard": [[{"text": "🔄 Refresh", "callback_data": "ad:bc"}, {"text": "▶️ Continue", "callback_data": "ad:bcgo"}]]}
+    return {"inline_keyboard": [BACK_ROW]}
+
+
+def bc_progress_show(j: Dict[str, Any]) -> None:
+    pm = j.get("pm") or []
+    if len(pm) == 2 and pm[1]:
+        try:
+            telegram("editMessageText", {"chat_id": pm[0], "message_id": int(pm[1]), "text": bc_progress_text(j), "parse_mode": "HTML",
+                                         "reply_markup": bc_progress_markup(j)})
+        except Exception:
+            pass
+
+
+def bc_worker(budget: float = BC_BUDGET) -> Dict[str, Any]:
+    t0 = time.monotonic()
+    j = bc_job()
+    if j.get("st") != "running":
+        return {"idle": True}
+    if time.time() - float(j.get("lk") or 0) < 60:
+        return {"busy": True}                 # another run holds it
+    j["lk"] = int(time.time())
+    bc_job_save(j)
+    blocked = set()
+    try:
+        blocked = {int(x) for x in (json.loads(get_setting(BC_BLOCKED_KEY) or "[]") or [])}
+    except Exception:
+        blocked = set()
+    new_blocked: List[int] = []
+    last_show = time.monotonic()
+    finished = False
+    while time.monotonic() - t0 < budget:
+        rows = supabase("bot_users", "GET", query=f"?select=user_id&user_id=gt.{int(j.get('cur') or 0)}&order=user_id.asc&limit=100") or []
+        if not rows:
+            finished = True
+            break
+        for r in rows:
+            if time.monotonic() - t0 >= budget:
+                break
+            uid = int(r["user_id"])
+            j["cur"] = uid
+            if uid == int(j.get("by") or 0):
+                continue
+            if uid in blocked:
+                j["skip"] = int(j.get("skip", 0)) + 1
+                continue
+            for attempt in range(2):
+                try:
+                    telegram("copyMessage", {"chat_id": uid, "from_chat_id": j["from"], "message_id": int(j["mid"])})
+                    j["sent"] = int(j.get("sent", 0)) + 1
+                    break
+                except Exception as exc:
+                    low = str(exc).lower()
+                    m = re.search(r"retry after (\d+)", low)
+                    if m and attempt == 0:
+                        time.sleep(min(30, int(m.group(1)) + 1))
+                        continue
+                    if any(x in low for x in ("blocked", "deactivated", "forbidden", "chat not found", "user is deactivated")):
+                        j["blocked"] = int(j.get("blocked", 0)) + 1
+                        new_blocked.append(uid)
+                    else:
+                        j["fail"] = int(j.get("fail", 0)) + 1
+                    break
+            time.sleep(BC_GAP)
+            if time.monotonic() - last_show > 5:
+                last_show = time.monotonic()
+                j["pt"] = int(time.time())
+                j["lk"] = int(time.time())
+                bc_job_save(j)
+                bc_progress_show(j)
+        else:
+            continue
+        break
+    if new_blocked:
+        try:
+            set_setting(BC_BLOCKED_KEY, json.dumps(sorted(blocked | set(new_blocked))))
+        except Exception:
+            log_error("bc blocked")
+    j["pt"] = int(time.time())
+    j["lk"] = 0
+    if finished:
+        j["st"] = "done"
+        j["et"] = int(time.time())
+        audit_log(f"📢 Broadcast poora · ✅ {j.get('sent', 0)} · 🚫 {j.get('blocked', 0)} · ❌ {j.get('fail', 0)}")
+    bc_job_save(j)
+    bc_progress_show(j)
+    if not finished:
+        bc_kick()                              # next function run continues from j["cur"]
+    return {"sent": j.get("sent"), "done": finished}
+
+
+@app.get("/api/bcast")
+def bc_worker_api() -> Any:
+    tok = request.args.get("k", "")
+    if not tok or not hmac.compare_digest(tok, bc_kick_key()):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    _REQ.clear()
+    _LOG_QUEUE.clear()
+    _REQ_T0[0] = time.monotonic()
+    try:
+        out = bc_worker()
+    except Exception:
+        log_error("bc worker")
+        out = {"error": True}
+    flush_request()
+    return jsonify(dict(out, ok=True))
+
+
+def bc_keepalive() -> None:
+    """GET / (keepalive): a broadcast whose run stopped (function time over / lost kick) continues."""
+    j = bc_job()
+    if j.get("st") == "running" and time.time() - float(j.get("pt") or 0) > 240:
+        j["lk"] = 0
+        bc_job_save(j)
+        bc_kick()
+
+
+
 @app.route("/api/webdiag", methods=["GET", "POST"])
 def webdiag() -> Any:
     body = request.get_json(silent=True) or {} if request.method == "POST" else {}
@@ -14597,6 +15294,13 @@ def webdiag() -> Any:
             chans.append(row)
         out["channels"] = chans
         uids = [int(x) for x in re.findall(r"\d+", str(request.args.get("uid") or body.get("uid") or ""))][:5]
+        _nm = re.sub(r"[^\w ]", "", str(request.args.get("name") or ""))[:30].strip()
+        if _nm and not uids:
+            try:
+                uids = [int(r["user_id"]) for r in supabase("bot_users", "GET",
+                        query=f"?first_name=ilike.*{urllib.parse.quote(_nm)}*&select=user_id&order=last_seen.desc&limit=5")]
+            except Exception:
+                uids = []
         if not uids:
             try:
                 rows = supabase("bot_settings", "GET", query="?key=like.gate:*&select=key&limit=10")
