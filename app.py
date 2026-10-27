@@ -11868,6 +11868,48 @@ def webhook() -> Any:
     return jsonify({"ok": True})
 
 
+# ================================================================ 🌐 web-file platform probe (temporary, diag token only)
+@app.get("/api/webdiag")
+def webdiag_probe() -> Any:
+    tok = request.args.get("t", "")
+    if not tok or not hmac.compare_digest(hashlib.sha256(tok.encode()).hexdigest(), DIAG_TOKEN_SHA256):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    op = request.args.get("op", "")
+    out: Dict[str, Any] = {"ok": True, "op": op}
+    if op == "sleep":
+        n = min(int(request.args.get("n", "5") or 5), 280)
+        tag = re.sub(r"[^a-z0-9]", "", request.args.get("tag", "x"))[:12] or "x"
+        set_setting("webdiag:" + tag, json.dumps({"start": int(time.time()), "n": n}))
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < n:
+            time.sleep(1)
+            if int(time.monotonic() - t0) % 10 == 0:
+                set_setting("webdiag:" + tag, json.dumps({"start": int(time.time() - (time.monotonic() - t0)), "n": n,
+                                                          "alive": int(time.monotonic() - t0)}))
+        set_setting("webdiag:" + tag, json.dumps({"start": int(time.time() - n), "n": n, "end": int(time.time())}))
+        out["slept"] = n
+    elif op == "read":
+        tag = re.sub(r"[^a-z0-9]", "", request.args.get("tag", "x"))[:12] or "x"
+        out["v"] = get_setting("webdiag:" + tag)
+    elif op == "storage":
+        hdr = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+        try:
+            b = http_json(f"{SUPABASE_URL}/storage/v1/bucket", "GET", None, hdr)
+            out["buckets"] = [{"id": x.get("id"), "public": x.get("public"), "limit": x.get("file_size_limit")} for x in (b or [])]
+        except Exception as exc:
+            out["buckets_err"] = str(exc)[:200]
+        out["mem_mb"] = None
+        try:
+            import resource
+            out["mem_mb"] = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024)
+        except Exception:
+            pass
+        import shutil as _sh
+        out["tmp_free_mb"] = int(_sh.disk_usage("/tmp").free / 1048576)
+        out["region"] = os.environ.get("VERCEL_REGION")
+    return jsonify(out)
+
+
 _BOOT_MS = [int((time.time() - _BOOT_T0) * 1000)]
 
 
