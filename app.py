@@ -374,7 +374,8 @@ def required_channels() -> List[Dict[str, Any]]:
 # config keys that change rarely are also kept per warm instance for SETTINGS_TTL seconds. Every write/delete through
 # set_setting()/supabase("bot_settings", ...) updates/drops the cached copy, so this instance never serves its own stale value.
 SETTINGS_TTL = 30.0
-_SET_TTL_KEYS = ("log_chat_id", "backup_chat_id", "ai_naming", "cat_registry", "catmap")
+_SET_TTL_KEYS = ("log_chat_id", "backup_chat_id", "ai_naming", "cat_registry", "catmap", "search_mode_owner", "search_mode_users",
+                 "gate_autoapprove")
 _SET_CACHE: Dict[str, Any] = {}
 
 
@@ -1553,6 +1554,8 @@ def admin_menu(user_id: Optional[int] = None) -> Dict[str, Any]:
          if (user_id is None or is_owner(user_id)) else []) + [
         [{"text": "🩺 Status", "callback_data": "ad:status"}, {"text": "❓ Admin Help", "callback_data": "ad:help"}],
         [{"text": search_mode_label(user_id), "callback_data": "ad:smode"}],
+        [{"text": "🔍 Admin: " + ("search cmd" if search_cmd_only(True) else "auto"), "callback_data": "ad:som"},
+         {"text": "👥 Users: " + ("search cmd" if search_cmd_only(False) else "auto"), "callback_data": "ad:sum"}],
     ] + ([[{"text": agent_label(), "callback_data": "ad:agent"}]] if (user_id is None or is_owner(user_id)) else []) + [
         [{"text": "🔍 Search Menu", "callback_data": "ad:usermenu"}],
     ]}
@@ -1561,7 +1564,7 @@ def admin_menu(user_id: Optional[int] = None) -> Dict[str, Any]:
 ADMIN_PANEL_TEXT = ("⚙️ <b>Admin Panel</b>\n\n"
                     "Niche se kaam chuno 👇\n"
                     "🤖 <i>AI agent mode: bas likho kya karna hai, jaise: \"polity ka naam politics kr do\", "
-                    "\"userbot pause karo\", \"status batao\". Search ke liye: \"search karo lucent\" / \"lucent ki files do\" (ya shuru me ? lagao).</i>")
+                    "\"userbot pause karo\", \"status batao\". File search sirf: <b>search lucent</b> (plain msg pe bot search nahi karta, poochta hai).</i>")
 
 # Prompts for buttons that need input. The admin answers with a reply (ForceReply) or just
 # sends the next message within 15 minutes (pending state in bot_settings).
@@ -5013,6 +5016,54 @@ def deliver_result(chat_id: int, row: Dict[str, Any], user: Optional[Dict[str, A
         send_text(chat_id, "File direct send nahi ho payi aur is message ka public link available nahi hai.")
 
 
+# ---- 🔍 SEARCH ONLY ON "search" (Aarav 11:34 AM): owner/sub-admin private chat = chat / AI agent / admin commands;
+# files are searched only for "search <naam>" ("/search", "search:", "Search", "सर्च"). A plain message that looks like
+# a file request gets "🔍 Kya file search karni hai: '…'?" [✅ Haan, search karo] [❌ Nahi]. Settings (admin menu):
+# search_mode_owner = command_only (default) | auto; search_mode_users = auto (default) | command_only.
+SEARCH_CMD_RE = re.compile(r"^\s*(?:/search(?:@\w+)?|search|सर्च)(?=$|[\s:：\-])\s*[:：\-]?\s*(.*)$", re.I | re.S)
+_SQ_ASK = [False]
+
+
+def search_cmd_only(admin: bool) -> bool:
+    if admin:
+        return str(get_setting("search_mode_owner") or "command_only") != "auto"
+    return str(get_setting("search_mode_users") or "auto") == "command_only"
+
+
+def search_cmd_words(text: str) -> Optional[str]:
+    """'search lucent gk' → 'lucent gk'; '' when only the word search; None when it doesn't start with search."""
+    m = SEARCH_CMD_RE.match(text or "")
+    if not m:
+        return None
+    rest = re.sub(r"^(?:karo|kro|kar|kr|do|for|ki|ka|ke)\b\s*", "", m.group(1).strip(), flags=re.I).strip()
+    return rest[:200]
+
+
+def search_confirm(chat_id: Any, user_id: Any, words: str) -> None:
+    words = str(words or "").strip()[:120]
+    if not words:
+        return
+    try:
+        set_setting(f"sq:{user_id}", words)
+    except Exception:
+        log_error("sq save")
+    send_text(chat_id, f"🔍 Kya file search karni hai: <b>\"{esc(words)}\"</b>?\n\n<i>Seedha search ke liye likho: search {esc(words[:40])}</i>",
+              {"inline_keyboard": [[{"text": "✅ Haan, search karo", "callback_data": "sq:y"}, {"text": "❌ Nahi", "callback_data": "sq:n"}]]}, "HTML")
+
+
+def search_confirm_tap(query: Dict[str, Any], data: str, chat_id: Any, user_id: Any) -> None:
+    words = get_setting(f"sq:{user_id}") or ""
+    try:
+        supabase("bot_settings", "DELETE", query=f"?key=eq.{urllib.parse.quote(f'sq:{user_id}')}")
+    except Exception:
+        pass
+    if data == "sq:n" or not words:
+        show(chat_id, "👍 Theek hai, search nahi kiya." if data == "sq:n" else "⌛ Ye purana hai — likho: search <naam>", None, query)
+        return
+    show(chat_id, f"🔍 Search: <b>{esc(words)}</b>", None, query, "HTML")
+    smart_reply(chat_id, query.get("from") or {"id": user_id}, words)
+
+
 def handle_private_message(message: Dict[str, Any]) -> None:
     user = message.get("from", {})
     chat_id = message.get("chat", {}).get("id")
@@ -5160,6 +5211,40 @@ def handle_private_message(message: Dict[str, Any]) -> None:
     if not query:
         send_text(chat_id, SEARCH_PROMPT, None, "HTML")
         return
+    if is_private and not command and is_subadmin(user_id) and search_cmd_only(True):
+        # 🔍 OWNER/ADMIN CHAT MODE (Aarav 11:34 AM): plain messages never auto-search; "search <naam>" does.
+        sq = search_cmd_words(query)
+        if sq is not None:
+            if not sq:
+                send_text(chat_id, SEARCH_PROMPT, None, "HTML")
+                return
+            try:
+                smart_reply(chat_id, user, sq)
+            except Exception:
+                log_error("smart_reply")
+                send_text(chat_id, "Database abhi available nahi hai. Admin se setup check karne ko kahen.")
+            return
+        if get_setting(f"admsearch:{user_id}") != "1":     # 🔍 Search Mode ON (his own toggle) still = everything search
+            try:
+                if not agent_on() and is_owner(user_id) and AGENT_ON_RE.search(query.lower()):
+                    set_setting(AGENT_KEY, "on")
+                    audit_log(f"🤖 AI agent mode ON · {actor_label(user_id)} · {ist_now()}")
+                    send_text(chat_id, "🤖 AI agent mode ON — ab plain msg = AI se baat. Search: \"search lucent\".", admin_menu(user_id))
+                    return
+                _SQ_ASK[0] = True
+                try:
+                    routed = agent_text(chat_id, user, query) if agent_on() else admin_text(chat_id, user, query)
+                finally:
+                    _SQ_ASK[0] = False
+            except InputError as exc:
+                send_text(chat_id, f"❌ Nahi hua: {exc}", {"inline_keyboard": [BACK_ROW]})
+                return
+            except Exception:
+                log_error("admin_text")
+                routed = None
+            if routed:
+                search_confirm(chat_id, user_id, routed)    # it looks like a file request → ASK first
+            return
     if is_private and not command and is_subadmin(user_id):
         # Admin free text: a whitelisted admin action (preview + ✅ Accept) or a search.
         try:
@@ -5178,6 +5263,13 @@ def handle_private_message(message: Dict[str, Any]) -> None:
         if routed is None:
             return
         query = routed
+    if is_private and not command and not is_subadmin(user_id) and search_cmd_only(False):
+        sq = search_cmd_words(query)                 # users in "search <naam>" mode (setting search_mode_users)
+        if sq:
+            query = sq
+        else:
+            search_confirm(chat_id, user_id, query)
+            return
     if is_private and not command:
         # Understand first (free), search second, AI only if needed.
         try:
@@ -5495,14 +5587,14 @@ CALLBACK_PATTERNS = [
     r"ad:y:(rtl:[a-z]|rtos:[a-z]*|rtms:[a-z]:(a|\d+))", r"ad:agent",
     r"ad:wl:[0-9a-f]{8}:(a|\d{1,2})", r"ad:uplpw:(go|no)",
     r"hd_new", r"hd_cancel", r"ad:(gatt|gbl|bc|bcy|bcn|bcgo)", r"ad:gb:\d+", r"ad:gr:\d+(:l)?",
-    r"ad:(hr|hdn|hb|hub):\d+",
+    r"ad:(hr|hdn|hb|hub):\d+", r"sq:[yn]", r"ad:(som|sum)",
 ]
 _CB_RE = re.compile("(?:" + ")|(?:".join(CALLBACK_PATTERNS) + ")")
 STALE_ADMIN = "🔄 Ye button purana hai, /admin dobara kholo"
 STALE_USER = "🔄 Ye button purana hai, /start dobara karo"
 CONFIRM_TTL = 3600      # an ✅ Accept older than this (message date) asks to start again
 OWNER_ONLY_CMDS = ("keys", "key", "rt", "bigfix", "addadm", "rmadm:", "y:keyrm:", "y:rmadm:", "y:rt", "ub", "y:ublogout", "y:ubdel", "y:ubdx",
-                   "wl:", "uplpw", "bc")
+                   "wl:", "uplpw", "bc", "som", "sum")
 # toast shown at once for buttons whose screen needs a few lookups; quick screens just stop the spinner
 CB_TOASTS = [("ad:status", "⏳ Status check ho raha hai..."), ("ad:keychk", "🔄 Keys check ho rahi hain..."),
              ("ad:aitest", "⏳ AI test ho raha hai..."), ("ad:report", "⏳"), ("ad:users", "⏳"), ("ad:bkold", "💾 Backup chal raha hai..."),
@@ -5645,6 +5737,13 @@ def _handle_callback_body(query: Dict[str, Any], data: str, chat_id: Any, user_i
                 st.update({"mid": tapped, "t": time.time()})
                 gate_save(user_id, st)
         return
+    if data in ("ad:som", "ad:sum") and chat_id and is_subadmin(user_id):
+        key = "search_mode_owner" if data == "ad:som" else "search_mode_users"
+        now_cmd = search_cmd_only(data == "ad:som")
+        set_setting(key, "auto" if now_cmd else "command_only")
+        audit_log(f"🔍 {'Admin' if data == 'ad:som' else 'Users'} search: {'AUTO' if now_cmd else 'sirf search <naam>'} · {actor_label(user_id)}")
+        show(chat_id, ADMIN_PANEL_TEXT, admin_menu(user_id), query, "HTML")
+        return
     if data.startswith(("ad:gb:", "ad:gr:", "ad:gatt", "ad:gbl", "ad:hr:", "ad:hdn:", "ad:hb:", "ad:hub:", "ad:bc")) and chat_id:
         if not is_subadmin(user_id):
             send_text(chat_id, f"⛔ Ye button sirf admin ke liye hai.\nAapka Telegram ID: {user_id}")
@@ -5680,6 +5779,9 @@ def _handle_callback_body(query: Dict[str, Any], data: str, chat_id: Any, user_i
         return
     if chat_id and gate_blocks(user_id, chat_id, ask={"k": "cb", "data": data}, trig=f"cb{query.get('id') or ''}:{data}"[:80],
                                user=query.get("from")):
+        return
+    if data in ("sq:y", "sq:n") and chat_id:
+        search_confirm_tap(query, data, chat_id, user_id)
         return
     if data == "noop":
         return
@@ -15735,6 +15837,13 @@ def agent_text(chat_id: int, user: Dict[str, Any], text: str) -> Optional[str]:
             reply = (reply + "\n" if reply else "") + "🙏 Ye kaam abhi bot me nahi hai."
         send_text(chat_id, esc(reply or "🙂"), None, "HTML")
         agent_remember(user_id, raw, reply)
+        return None
+    if tool == "search" and _SQ_ASK[0]:
+        q = str((args or {}).get("q") or (args or {}).get("query") or (args or {}).get("text") or raw)[:120]
+        if reply:
+            send_text(chat_id, "🤖 " + esc(reply), None, "HTML")
+        search_confirm(chat_id, user_id, q)
+        agent_remember(user_id, raw, f"{reply} [asked: search {q}?]")
         return None
     if tool == "search" and not asks_search(raw):
         send_text(chat_id, esc(reply or "🙂") + "\n\n<i>Search chahiye to likho: search karo &lt;naam&gt;</i>", None, "HTML")

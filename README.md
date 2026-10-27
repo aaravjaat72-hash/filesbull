@@ -43,7 +43,11 @@ Bot अपने database में ढूंढकर file सीधे chat �
 |---|---|---|
 | 🔍 **Search + spelling/Hinglish** | Understands Hinglish, Hindi (Devanagari) and typos (`alg→alag`, `itihas = history`). With an AI key the AI reads the message first (cached 24 h); without AI a local parser does it. Results: 8 per page + "➡️ Aur dikhao". | Hinglish, हिंदी और गलत spelling समझता है। AI key हो तो AI पहले message समझता है, नहीं तो local parser। एक बार में 8 results + "➡️ Aur dikhao"। |
 | 🗂️ **Categories** | Every file gets a subject category (GK, Polity, Maths, Notification…). New categories are made automatically. Users browse with the 🗂️ button. | हर file को subject category मिलती है। नई category अपने आप बनती है। User 🗂️ button से देखते हैं। |
-| 🔒 **Join gate** | Optional: users must join your channels before they get files. `/admin → Join channels`. The bot must be admin there (for private channels it makes the invite link). | Optional: file पाने से पहले user को आपके channel join करने होंगे। Bot वहां admin होना चाहिए। |
+| 🔒 **Join gate (premium)** | Optional: users must join your channels before they get files (`/admin → Join channels`, bot must be admin there). The prompt lists every channel ✅/🔸 with a progress bar ("1/2 joined"). **Auto-access**: the moment they join (or send a join request to an approval channel) the bot lets them in, deletes the prompt and runs their search — no tap needed; ✅ Joined / Verify is instant. Membership is checked live on every message; someone who **leaves** is asked to join again at once. One fresh prompt per message (old one deleted), every `/start` = fresh message. Owner / sub-admins bypass. If the bot can't check a channel, users are not blocked and the owner is told. | Optional: file से पहले channels join करने होंगे (bot वहां admin)। Prompt में हर channel ✅/🔸 और progress "1/2 joined"। **Join करते ही** (या approval channel में join request भेजते ही) access अपने-आप, prompt delete, search चल जाता है। Verify दबाओ = turant। हर message पर live check; channel **छोड़ा** तो तुरंत दोबारा join को कहेगा। हर `/start` पर नया msg, पुराना delete। |
+| 👀 **Join attempts + 🔓 bypass** | Every blocked try is listed (name, @username, id, time, missing channels, count): `/admin → 👀 Join attempts`, plus a live Log Chat alert (max 1 per user per 30 min, 20/hour). One tap **✅ Bina join access do** lets that user in without joining; **↩️ Access wapas lo** or `/admin → 🔓 Bypass users → ❌` takes it back. | कौन try कर रहा है (नाम, @, id, समय, कौनसा channel बाकी, कितनी बार) — `/admin → 👀 Join attempts` + Log Chat में live alert। एक tap में **✅ बिना join access दो**, वापस लेना भी। |
+| 📝 **Help desk** | `/help` works without joining. Before joining it offers only **📝 Request / Problem bhejo**; after joining normal help + the same button. Or type `/request <message>` (normal users can also use `/admin <message>`). Text / photo / file goes to the Log Chat (or the owner) with name/@/id + **↩️ Reply · ✅ Done · 🚫 Block**; the admin's reply (any message) reaches the user through the bot. Limit: 1 per 20 s, 6 per hour. | `/help` बिना join के चलता है। Join से पहले सिर्फ **📝 Request / Problem bhejo**। या लिखो `/request अपना message`। Admin को नाम/@/id के साथ पहुंचता है — **↩️ Reply · ✅ Done · 🚫 Block**; admin का जवाब bot से user तक। |
+| 📢 **Broadcast** (owner) | `/admin → 📢 Sabko message` → send any message (text, photo, file, video, forward) → preview → one **✅ Accept** → sent to all bot users (~20/s, Telegram limits respected), users who blocked the bot are skipped and remembered; live progress + final report (sent / blocked / failed). | `/admin → 📢 Sabko message` → कोई भी msg → preview → **✅ Accept** → सभी users को। Block वाले skip। Live progress + report। |
+| 🔍 **Search only on "search"** (admin chat) | In the owner's / sub-admins' private chat a plain message is chat / AI agent / admin command — files are searched only for `search <naam>` (`/search`, `search:`, `सर्च` too). If a message looks like a file request the bot asks **🔍 Kya file search karni hai?** first. `/admin → 🔍 Admin: search cmd / auto` and `👥 Users: auto / search cmd` switch it (users stay auto by default). | Owner/admin chat में plain msg पर search नहीं — सिर्फ `search <नाम>` पर। File जैसा लगे तो पहले पूछता है। `/admin` में Admin / Users mode बदल सकते हो। |
 | 💾 **Backup channel** | A private channel where the bot keeps one copy of every file. Search sends files from here. `/admin → 💾 Backup`. | Private channel जहां हर file की एक copy रहती है। Search यहीं से file भेजता है। |
 | 👤 **Userbot Inbox → settle → Backup** | A second Telegram *account* (not the bot) reads source channels where the bot is NOT admin, including **old files** (backfill). It forwards files into a private **Inbox** channel every ~10 min (GitHub Action). The bot names + categorises each file and "settles" it into Backup. Files it can't understand wait in ❓ review. | एक दूसरा Telegram *account* (bot नहीं) उन channels को पढ़ता है जहां bot admin नहीं है — **पुरानी files** भी। हर ~10 min files private **Inbox** में आती हैं, bot नाम + category देकर Backup में डालता है। समझ न आए तो ❓ review में। |
 | 📄 **Document-only filter** | The userbot keeps only study documents (PDF, DOC/DOCX, PPT, XLS, EPUB, TXT, ZIP/RAR/7Z…). Videos, photos, audio, stickers, polls, text/link posts are skipped (not errors). Your own forwards / links / uploads are never filtered. | Userbot सिर्फ documents लेता है (PDF, DOC, PPT, XLS, EPUB, ZIP…)। Video, photo, audio, text/link posts skip। आपकी खुद की forward / link / upload की files filter नहीं होतीं। |
@@ -238,6 +242,7 @@ Fork में `BOT_URL` नहीं है तो run आराम से र�
 | Command | Who | What |
 |---|---|---|
 | `/start`, `/help`, `/search <naam>`, `/myid` | everyone | use the bot / see your id |
+| `/request <message>` (users: also `/admin <message>`) | everyone, even before joining | message the admin (help desk) |
 | `/admin` | owner + sub-admins | all admin buttons |
 | `/setup` | owner | setup checklist |
 | `/status` | admins | roles, channels, how each channel's files get in |
@@ -247,9 +252,12 @@ Fork में `BOT_URL` नहीं है तो run आराम से र�
 | `/upload`, `/uploadpass` | owner | upload page link + password / new password |
 | `/logs [n]` | owner | recent logs |
 | `/addchannel`, `/requirechannel`, `/requiredchannels`, `/removerequired` | admins | channels / join gate |
+| `/admin → 👀 Join attempts`, `🔓 Bypass users` | admins | who is trying, let in without joining / take back |
+| `/admin → 📢 Sabko message` | owner | broadcast to all users (preview + Accept) |
+| `/admin → 🔍 Admin / 👥 Users search mode` | owner | search only on `search <naam>` or auto |
 
-Owner's private chat also understands plain Hinglish ("sari files dikhao", "X ka naam Y kar do", "backup channel set karo").
-Owner chat में सीधी Hinglish भी चलती है।
+Owner's private chat also understands plain Hinglish ("X ka naam Y kar do", "backup channel set karo"). Files are searched only with `search <naam>`.
+Owner chat में सीधी Hinglish भी चलती है; file search सिर्फ `search <नाम>` से।
 
 ---
 
