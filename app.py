@@ -11991,6 +11991,7 @@ WEB_PAID_TEXT = ("🙏 Ye Scribd jaisi paid / premium document site ka link hai.
 _WEB_URL_RE = re.compile(r"https?://[^\s<>\"'`]+", re.I)
 _WEB_TG_POST_RE = re.compile(r"^https?://(?:t\.me|telegram\.me|telegram\.dog)/(?:s/)?([A-Za-z][A-Za-z0-9_]{3,})/(\d+)(?:[/?#].*)?$", re.I)
 _WEB_OUT: List[str] = []           # diag: replies collected instead of sent (chat None)
+_WEB_CAP_TEST = [0]                 # diag only: a smaller inline cap so the GitHub-Action route can be tested live
 
 
 class WebErr(Exception):
@@ -12747,11 +12748,12 @@ def web_fetch_one(url: str, chat: Any, uid: Any, name_hint: str = "", depth: int
         _WEB_FOLDER_SEEN[0] = 0
         got = web_drive_folder(rw["id"])
         return {"state": "folder", "files": got["files"], "folders": got["folders"]}
-    r = web_probe(rw["url"], WEB_INLINE_MAX)
+    cap = _WEB_CAP_TEST[0] or WEB_INLINE_MAX
+    r = web_probe(rw["url"], cap)
     if r["kind"] == "html" and rw.get("drive"):
         conf = web_drive_confirm(r["html"])
         if conf:
-            r = web_probe(conf, WEB_INLINE_MAX)
+            r = web_probe(conf, cap)
         if r["kind"] == "html":
             if web_login_url(r.get("final", "")) or "accounts.google.com" in r["html"][:30000]:
                 raise WebErr("🔒 File public nahi hai — Drive me sharing \"Anyone with the link\" karo, phir link bhejo.")
@@ -12759,7 +12761,7 @@ def web_fetch_one(url: str, chat: Any, uid: Any, name_hint: str = "", depth: int
     if r["kind"] == "html" and "mediafire.com" in web_host_of(r.get("final", "")):
         direct = web_mediafire_direct(r["html"])
         if direct:
-            r = web_probe(direct, WEB_INLINE_MAX)
+            r = web_probe(direct, cap)
     if r["kind"] == "html":
         if web_login_url(r.get("final", "")):
             raise WebErr("🔒 Ye page login maangta hai — sirf public link chalega.")
@@ -13515,6 +13517,8 @@ def webdiag() -> Any:
     out: Dict[str, Any] = {"ok": True, "op": op}
     if op == "status":
         out["web"] = web_status()
+        out["big_jobs"] = [{k: j.get(k) for k in ("fn", "sz", "st", "tries", "err", "t", "dt")} for j in webq_load(WEB_BIG_KEY)][-5:]
+        out["link_jobs"] = [{k: j.get(k) for k in ("st", "tries", "t", "dt")} for j in webq_load()][-5:]
     elif op == "route":
         uid = 1 if request.args.get("as") == "user" else (min(ADMIN_USER_IDS) if ADMIN_USER_IDS else 1)
         text = request.args.get("text", "")
@@ -13557,7 +13561,11 @@ def webdiag() -> Any:
         if web_is_paid(url):
             _WEB_OUT.append(WEB_PAID_TEXT)
         else:
-            web_run_job(job)
+            _WEB_CAP_TEST[0] = 1024 * 1024 if body.get("force_big") else 0
+            try:
+                web_run_job(job)
+            finally:
+                _WEB_CAP_TEST[0] = 0
         out["replies"] = list(_WEB_OUT)
         out["ms"] = int((time.monotonic() - _REQ_T0[0]) * 1000)
         flush_request()
