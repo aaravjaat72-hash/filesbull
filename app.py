@@ -1030,7 +1030,7 @@ def source_check(chat_id: Any, st: Optional[Dict[str, Any]] = None) -> str:
     old = ""
     if member:
         if bf.get("done"):
-            old = f" · purani ✅ poori ({int(bf.get('n') or 0)} nayi)"
+            old = " · purani ✅ poori" + (f" ({int(bf.get('n') or 0)} nayi)" if int(bf.get("n") or 0) else "")
         elif bf.get("skip"):
             old = " · purani skip ki hui"
         elif bf.get("cur") or bf.get("n"):
