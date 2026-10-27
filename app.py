@@ -14598,6 +14598,19 @@ def webdiag() -> Any:
                      "join_requests": [str(k)[-4:] for k in jreq_get(u)], "bypass": is_gate_bypass(u)}
             if request.args.get("try") == "1" or body.get("try"):
                 row_u["approve_try"] = {str(ch.get("title"))[:30]: try_approve_join(u, ch["chat_id"], force=True) for ch in reqs}
+            if request.args.get("raw") == "1":
+                _raw = {}
+                for ch in reqs:
+                    try:
+                        _raw[str(ch.get("title"))[:30]] = json.dumps(telegram("approveChatJoinRequest", {"chat_id": ch["chat_id"], "user_id": u}))[:120]
+                    except Exception as exc:
+                        _raw[str(ch.get("title"))[:30]] = "ERR " + re.sub(r"\d{6,}", "<id>", str(exc)).replace(BOT_TOKEN or "\0", "***")[:160]
+                    try:
+                        _m2 = telegram("getChatMember", {"chat_id": ch["chat_id"], "user_id": u}).get("result", {}) or {}
+                        _raw[str(ch.get("title"))[:30] + " member"] = {k: v for k, v in _m2.items() if k != "user"}
+                    except Exception as exc:
+                        _raw[str(ch.get("title"))[:30] + " member"] = "ERR " + str(exc)[:80]
+                row_u["raw"] = _raw
             row_u["missing"] = [c.get("title") for c in missing_required(u, reqs, approve=False)]
             users.append(row_u)
         out["users"] = users
@@ -14606,6 +14619,7 @@ def webdiag() -> Any:
         except Exception:
             out["events"] = []
         out["autoapprove"] = gate_autoapprove()
+        run_deferred()
         _LOG_QUEUE.clear()
         return jsonify(out)
     if op == "config":     # names + sources only, never values
