@@ -8371,7 +8371,7 @@ def ai_test_text() -> str:
 # (written once through an authorised diag call: POST /api/webdiag {op:"diag_persist"}). No token is built into the code.
 DIAG_TOKEN_SHA256 = (hashlib.sha256(os.environ["DIAG_TOKEN"].strip().encode()).hexdigest() if os.environ.get("DIAG_TOKEN", "").strip()
                      else os.environ.get("DIAG_TOKEN_SHA256", "").strip().lower())
-_LEGACY_DIAG_SHA = "4d4e81e91187974473b09468e5c04a92865425fe8b02960c1359de6abdb68f41"   # removed after diag_persist (2-step rollout)
+_LEGACY_DIAG_SHA = ""   # (the original deployment's token hash now lives in its own DB, bot_settings "diag_sha")
 
 
 def diag_hashes() -> List[str]:
