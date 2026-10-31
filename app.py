@@ -6,6 +6,7 @@ import hmac
 import html
 import http.client
 import threading
+import difflib
 import json
 import io
 import os
@@ -4221,14 +4222,14 @@ def search_rows(keywords: List[str], lang: Optional[str] = None, types: Optional
     primary = [normalize(k) for k in keywords if normalize(k)]
     words = list(dict.fromkeys(primary + sorted(t for g in groups for t in g if len(t) > 1 or t.isdigit())))[:20]
     filters = ",".join(f"{col}.ilike.*{word}*" for word in words
-                       for col in ("title", "caption", "keywords", "content_text", "source_chat_title", "file_name"))
+                       for col in ("title", "caption", "keywords", "content_text", "file_name"))   # v25: not the channel's name
     rows = supabase("books", "GET", query=(
         "?select=id,title,caption,keywords,content_text,source_chat_title,language,file_name,status,telegram_file_unique_id"
         "&status=in.(indexed,inbox,review)&limit=300&or=" + urllib.parse.quote(f"({filters})", safe="(),.*")
     ))
     scored = []
     for row in rows:
-        head = normalize(" ".join(str(row.get(k) or "") for k in ("title", "caption", "keywords", "source_chat_title", "file_name")))
+        head = normalize(" ".join(str(row.get(k) or "") for k in ("title", "caption", "keywords", "file_name")))
         body = normalize(str(row.get("content_text") or ""))
         score = 0.0
         hits = 0
@@ -4283,7 +4284,7 @@ def search_books(query: str) -> List[Dict[str, Any]]:
 
 
 def results_markup(rows: List[Dict[str, Any]], more_left: int) -> Dict[str, Any]:
-    kb = [[{"text": f"📄 {str(r.get('title') or 'Untitled')[:45]}", "callback_data": f"book:{r['id']}"}] for r in rows]
+    kb = [[{"text": "📄 " + button_title(r), "callback_data": f"book:{r['id']}"}] for r in rows]
     if more_left > 0:
         kb.append([{"text": f"➡️ Aur dikhao ({more_left})", "callback_data": "more"}])
     return {"inline_keyboard": kb}
@@ -4315,6 +4316,8 @@ def send_no_results(chat_id: int, label: str) -> None:
 
 
 def show_more(chat_id: int, user_id: Optional[int], ctx: Dict[str, Any]) -> None:
+    if ctx.get("s2") and s2_more(chat_id, user_id, ctx):
+        return                     # v25: next page of the same list — never other words ("Milti-julti" is gone)
     if not ctx.get("q"):
         send_text(chat_id, NO_CONTEXT_MORE_MSG, None, "HTML")
         return
@@ -4408,30 +4411,35 @@ def smart_reply_local(chat_id: int, user: Dict[str, Any], text: str, searched: b
             merged = keywords
         if send_results(chat_id, user_id, ctx, merged, lang or ctx.get("lang"), types, text):
             return
-    # "iski english wali" -> same search, new language/type
+    # "iski english wali" -> same search, new language/type (v25: the asking search keeps its spec)
+    if not keywords and u["ref"] and ctx.get("s2") and (lang or types):
+        sp = ctx["s2"]
+        sp["lang"] = lang or sp.get("lang")
+        sp["kind"] = s2_query_kind(text) or sp.get("kind")
+        rows2 = s2_search(sp)
+        if rows2:
+            txt2, kb2 = s2_screen(sp, rows2, 1)
+            ctx["s2"], ctx["s2p"] = sp, 1
+            save_ctx(user_id, ctx)
+            send_text(chat_id, txt2, kb2, "HTML")
+            return
     if not keywords and u["ref"] and ctx.get("q") and (lang or types):
         if send_results(chat_id, user_id, ctx, ctx["q"], lang or ctx.get("lang"), types or ctx.get("types"), text):
             return
     if not keywords:
         if lang:
-            # "Mujhe ek hindi ki book chahiye": search the language as a subject; if many, ask the exam.
-            kw = ["hindi" if lang == "hi" else "english"]
-            rows = search_rows(kw, lang, types)
-            if len(rows) > 6:
-                ask_question(chat_id, user_id, ctx, "exam", kw, lang)
-                return
-            if send_results(chat_id, user_id, ctx, kw, lang, types, text):
-                return
-            send_no_results(chat_id, kw[0])
+            # v25 "Mujhe ek hindi ki book chahiye": only a language (+ type) → ask the subject, counts in that language
+            kq = s2_query_kind(text)
+            k_ = kq if kq in KIND_LABEL else "-"
+            txt_b, kb_b = browse_view("s", k_, lang, "-")
+            send_text(chat_id, f"🌐 <b>{LANG_LABEL.get(lang, '')}</b> me files 👇\n\n" + txt_b, kb_b, "HTML")
             return
         generic_reply(chat_id, user_id)          # "ek badhiya si book do" → subjects + most-taken files, no search
         return
-    if send_results(chat_id, user_id, ctx, keywords, lang, types, text, require_all=True):
-        return
-    fuzzy = fuzzy_rows(keywords)
-    if fuzzy and send_results(chat_id, user_id, ctx, keywords, lang, types, text, rows=fuzzy):
-        return
+    # v25: the asking search (typed words must match the file's own name; language / type asked, never guessed)
     key_terms = [k for k in keywords if is_key_term(k)]
+    if s2_answer(chat_id, user, text, ctx, u=u, not_found=bool(key_terms) or not (allow_ai and ai_budget_ok(user_id, ctx))):
+        return
     if key_terms:
         # Local parsing understood it (lucent, gd, gk…) and it is truly not there → no AI tokens.
         not_found_reply(chat_id, user, keywords)
@@ -4449,17 +4457,20 @@ def smart_reply_local(chat_id: int, user: Dict[str, Any], text: str, searched: b
             if ans["intent"] == "more" and ctx.get("q"):
                 show_more(chat_id, user_id, ctx)
                 return
-            if ans["keywords"] and ans["keywords"] != keywords and \
-                    send_results(chat_id, user_id, ctx, ans["keywords"], ans["lang"] or lang, types, text, require_all=True):
-                return
+            if ans["keywords"] and ans["keywords"] != keywords:
+                sp_ai = s2_spec(" ".join(ans["keywords"]))
+                sp_ai["lang"] = ans["lang"] or lang or sp_ai["lang"]
+                if sp_ai["req"] and s2_run(chat_id, user, sp_ai, ctx, not_found=False, raw=text):
+                    return
             if ans["ask"]:
                 ask_question(chat_id, user_id, ctx, "exam" if keywords else "subject", keywords, lang,
                              "🤔 " + esc(ans["ask"]))
                 return
-    not_found_reply(chat_id, user, keywords or [text])
+    s2_not_found(chat_id, user, s2_spec(" ".join(keywords) or text))
 
 
 def handle_guided_callback(query: Dict[str, Any], data: str, chat_id: int) -> None:
+    """Old 'kis exam / kis subject' buttons (g:e:* / g:s:*) and 'more' — answered with the v25 asking search."""
     user = query.get("from") or {}
     user_id = user.get("id")
     ctx = load_ctx(user_id)
@@ -4469,21 +4480,27 @@ def handle_guided_callback(query: Dict[str, Any], data: str, chat_id: int) -> No
     _, kind, val = (data.split(":", 2) + ["", ""])[:3]
     pending = list(ctx.get("pending") or [])
     lang = ctx.get("lang")
-    if kind == "s":
-        if not send_results(chat_id, user_id, ctx, [val], lang, None, val):
-            send_no_results(chat_id, val)
+    words = [val] if kind == "s" else (pending + ([val] if val and val != "all" else []))
+    if not words:
+        send_text(chat_id, "⌛ Ye button purana ho gaya. Book ka naam likho 🔍")
         return
-    if val == "all" or not val:
-        if not pending or not send_results(chat_id, user_id, ctx, pending, lang, None, " ".join(pending)):
-            offtopic_reply(chat_id, user, "", True)
+    spec = s2_spec(" ".join(words))
+    if not spec["req"]:
+        spec = dict(spec, req=s2_groups_from(words) or [[w] for w in words])
+    spec["lang"] = lang or spec["lang"]
+    if s2_search(spec):
+        s2_run(chat_id, user, spec, ctx)
         return
-    label = dict((v, l) for l, v in EXAM_BUTTONS).get(val, val)
-    if has_full_match(pending + [val], lang) and send_results(chat_id, user_id, ctx, pending + [val], lang, None, " ".join(pending + [val])):
-        return
-    if pending and send_results(chat_id, user_id, ctx, pending, lang, None, " ".join(pending),
-                                note=f"ℹ️ {esc(label)} ke liye alag file nahi mili, ye saari {esc(' '.join(pending))} files hain:\n\n"):
-        return
-    send_no_results(chat_id, " ".join(pending + [val]))
+    if kind == "e" and pending and val and val != "all":
+        label = dict((v, l) for l, v in EXAM_BUTTONS).get(val, val)
+        sp2 = s2_spec(" ".join(pending))
+        if not sp2["req"]:
+            sp2 = dict(sp2, req=s2_groups_from(pending) or [[w] for w in pending])
+        sp2["lang"] = lang or sp2["lang"]
+        if s2_search(sp2):
+            s2_run(chat_id, user, sp2, ctx, note=f"ℹ️ {label} ke liye alag file nahi mili, ye saari {' '.join(pending)} files hain:\n")
+            return
+    s2_not_found(chat_id, user, spec)
 
 
 # ================================================================ user tracking
@@ -4798,6 +4815,7 @@ def index_file(record: Dict[str, Any], from_chat: Any, message_id: Any, where: s
         record["status"] = "review"
     record["keywords"] = with_cat_tag(clean_text(" ".join(str(x or "") for x in (
         record.get("title"), record.get("keywords"))))[:3990], slug)
+    tag_record(record)          # v25: language + type + subject; name ends with [हिंदी] / [English] …
     if has_category_col():
         record["category"] = slug
     if review:
@@ -5068,7 +5086,7 @@ def build_metadata(message: Dict[str, Any], channel: Dict[str, Any]) -> Dict[str
         "caption": caption[:4000],
         "keywords": keywords[:4000],
         "content_text": content_text,
-        "language": detect_language(searchable),
+        "language": lang_from_meta(title, raw_name, caption) or "unk",
         "status": "indexed",
     }
 
@@ -5967,6 +5985,7 @@ CALLBACK_PATTERNS = [
     r"ad:ubst:[a-z]+", r"ad:ubdl:[a-z]+",
     r"ad:y:(rtl:[a-z]|rtos:[a-z]*|rtms:[a-z]:(a|\d+))", r"ad:agent",
     r"ad:wl:[0-9a-f]{8}:(a|\d{1,2})", r"ad:uplpw:(go|no)",
+    r"s2:[lkpf](:[a-z0-9_]{1,12})?", r"bw:[ks]:[a-z_\-\*]{1,20}:[a-z\-\*]{1,5}:[a-z_\-\*]{1,20}:\d{1,4}",
     r"hd_new", r"hd_cancel", r"ad:(gatt|gbl|bc|bcy|bcn|bcgo)", r"ad:gb:\d+", r"ad:gr:\d+(:l)?",
     r"ad:(hr|hdn|hb|hub):\d+", r"sq:[yn]", r"ad:(som|sum)",
     r"ad:fx(t|p|s|sd|sy|sn|dp|dy|dn)?",
@@ -6170,8 +6189,14 @@ def _handle_callback_body(query: Dict[str, Any], data: str, chat_id: Any, user_i
         return
     if data == "noop":
         return
+    if data.startswith("s2:") and chat_id:
+        s2_callback(query, data, chat_id, user_id)       # v25 asking search: 🌐 language / 📂 type / page
+        return
+    if data.startswith("bw:") and chat_id:
+        browse_callback(query, data, chat_id)            # v25 browse: type → language → subject → list
+        return
     if data == "user_categories":
-        text, kb = categories_view()
+        text, kb = browse_view("s", "-", "-", "-")       # v25: subject → type → language (counts on every button)
         show(chat_id, text, kb, query, "HTML")
         return
     if data.startswith("cat:"):
@@ -6181,9 +6206,8 @@ def _handle_callback_body(query: Dict[str, Any], data: str, chat_id: Any, user_i
         show(chat_id, text, kb, query)
         return
     if data == "user_list":
-        rows = supabase("books", "GET", query="?select=id,title,source_chat_title&status=eq.indexed&order=title&limit=30")
-        send_text(chat_id, "📚 <b>PDF List</b>\n\n" + ("\n".join(f"📄 {esc(r.get('title'))}" for r in rows) if rows else "Abhi koi file nahi hai.") +
-                  "\n\n<i>Jo chahiye uska naam likhkar bhejo 🔍</i>", None, "HTML")
+        text, kb = browse_view("k", "-", "-", "-")       # v25: 📚 PDF List = type → language → subject → list
+        send_text(chat_id, text, kb, "HTML")
         return
     if data == "user_search":
         send_text(chat_id, SEARCH_PROMPT, None, "HTML")
@@ -8778,6 +8802,19 @@ def save_categories(cats: Dict[int, str]) -> None:
 
 def with_cat_tag(keywords: str, slug: str) -> str:
     k = re.sub(r"\s*" + CAT_TAG + r"[a-z_]+", "", str(keywords or ""))
+    try:      # v25: the language / type / subject tags survive every rename / category move (browse reads them)
+        tags = re.findall(r"\b(?:lang_(?:hi|en|both|unk)|kind_[a-z]+|subj_[a-z_]+)\b", k)
+        if tags or k.strip():
+            k = _FACET_RE.sub("", k).strip()
+            if not any(t.startswith("kind_") for t in tags):
+                tags.append("kind_" + kind_of(k[:300]))
+            if not any(t.startswith("subj_") for t in tags):
+                tags.append("subj_" + subj_of(k[:300]))
+            if not any(t.startswith("lang_") for t in tags):
+                tags.append("lang_" + (lang_from_meta(k[:300]) or "unk"))
+            k = (k[:3900] + " " + " ".join(dict.fromkeys(tags))).strip()
+    except Exception:
+        pass
     return (k + (" " + CAT_TAG + slug if slug else ""))[:4000]
 
 
@@ -10128,6 +10165,7 @@ def generic_reply(chat_id: int, user_id: Optional[int]) -> None:
         kb += [[{"text": f"🔥 {str(r.get('title') or 'Untitled')[:42]}", "callback_data": f"book:{r['id']}"}] for r in top]
     if not kb:
         kb = [[{"text": label, "callback_data": f"g:s:{val}"}] for label, val in SUBJECT_BUTTONS[:6]]
+    kb = [[{"text": "📚 Type / Bhasha / Subject se dekho", "callback_data": bw_cb("k")}]] + kb      # v25 browse
     send_text(chat_id, text, {"inline_keyboard": kb})
 
 
@@ -10422,19 +10460,9 @@ def act_on_understanding(chat_id: int, user: Dict[str, Any], text: str, d: Dict[
         return True
     if not sets:
         return False                              # nothing searchable understood ("hindi ki book") → local rules
-    lang, types = u.get("lang") or ai_lang, u.get("types") or []
-    for kws in sets:
-        rows = search_rows(kws, lang, types, require_all=True)
-        if rows:
-            return send_results(chat_id, user_id, ctx, kws, lang, types, text, rows=rows)
-    for kws in sets[:3]:
-        fz = fuzzy_rows(kws)
-        if fz:
-            return send_results(chat_id, user_id, ctx, kws, lang, types, text, rows=fz)
-    label = d.get("book") or " ".join(dict.fromkeys(x for x in (d.get("exam"), d.get("subject"), d.get("topic")) if x)) \
-        or " ".join(sets[0])
-    not_found_reply(chat_id, user, [label], understood=f"AI samjha ({understanding_label(d)}) · msg: “{text.strip()[:80]}”")
-    return True
+    # v25: only the typed key words must match the file's own name; the language / type are asked, never guessed
+    return s2_answer(chat_id, user, text, ctx, d=d, u=u,
+                     understood=f"AI samjha ({understanding_label(d)}) · msg: “{text.strip()[:80]}”")
 
 
 
@@ -12211,6 +12239,7 @@ def ub_catalog(record: Dict[str, Any], where: str) -> str:
     record.pop("_retry", None)
     record.pop("_pages", None)
     record["keywords"] = with_cat_tag(clean_text(" ".join(str(x or "") for x in (record.get("title"), record.get("keywords"))))[:3990], slug)
+    tag_record(record)          # v25: language + type + subject tags
     if has_category_col():
         record["category"] = slug
     record["status"] = "review" if reason else "inbox"
@@ -15752,6 +15781,38 @@ def webdiag() -> Any:
     _REQ_T0[0] = time.monotonic()
     op = request.args.get("op", "") or str(body.get("op") or "")
     out: Dict[str, Any] = {"ok": True, "op": op}
+    if op == "s2":         # v25 asking search, dry: what the user would see for a text (+ the old search for comparison)
+        txt_s = request.args.get("q", "")[:200]
+        u_s = understand(txt_s)
+        d_s = None
+        if request.args.get("ai") == "1":
+            try:
+                d_s, _ = ai_understand(txt_s, None)
+            except Exception:
+                d_s = None
+        spec = s2_spec(txt_s, d_s, u_s)
+        rows = s2_search(spec) if spec["req"] else []
+        sp2 = dict(spec)
+        if request.args.get("lang"):
+            sp2["lang"] = request.args.get("lang")
+        if request.args.get("kind"):
+            sp2["kind"] = request.args.get("kind")
+        screen = s2_screen(sp2, rows, int(request.args.get("page", "1") or 1)) if rows else None
+        out.update({"spec": spec, "ai": d_s, "total": len(rows), "langs": _count_lang(rows) if rows else {},
+                    "kinds": _count_kind(rows) if rows else {},
+                    "top": [{"t": display_title(r), "lang": r["_lang"], "kind": r["_kind"], "status": r.get("status")} for r in rows[:15]],
+                    "screen": {"text": screen[0], "buttons": [[b["text"] for b in row] for row in screen[1]["inline_keyboard"]]} if screen else None})
+        if not rows and spec["req"]:
+            out["close"] = [display_title(r) for r in s2_close_options(spec)]
+        return jsonify(out)
+    if op == "browse":     # v25 browse screen, dry
+        try:
+            tx, kb = browse_view(request.args.get("o", "k"), request.args.get("k", "-"), request.args.get("l", "-"),
+                                 request.args.get("s", "-"), int(request.args.get("p", "1") or 1))
+            out.update({"text": tx, "buttons": [[b["text"] for b in row] for row in kb["inline_keyboard"]]})
+        except Exception as exc:
+            out.update({"error": _err_class(exc)})
+        return jsonify(out)
     if op == "catalog":    # 🗂️ catalog read for the tagging pass (Oct 31): rows by id range, text cut short; no people
         try:
             after = int(request.args.get("after", "0") or 0)
@@ -16567,6 +16628,900 @@ def agent_toggle(query: Dict[str, Any], chat_id: int, user_id: int) -> None:
     note = ("🤖 AI agent mode ON — ab plain msg = AI se baat. Search: \"search karo X\" / \"X ki files do\"." if on else
             "🤖 AI agent mode OFF — purana tareeka: plain msg = search.")
     show(chat_id, note + "\n\n" + ADMIN_PANEL_TEXT, admin_menu(user_id), query, "HTML")
+
+
+# ================================================================ v25 🗂️ LANGUAGE + TYPE + SUBJECT TAGS, SEARCH THAT ASKS
+# Aarav 5:10 PM Oct 31 2026: "kuchh bhi files bhej deta h … hindi eng vali usme read nhi kiya … user se puchh ke uske
+# according options dikhane chahiye … sare files ko rename krke unke aage mention kro language … notes books vgera
+# sbb kuchh shi se arrange kro". Causes of the random files (old search_rows): it matched the SOURCE CHANNEL's name
+# ("SSC Adda247" → every file of that channel is "ssc"), the keywords column (which carries that channel name too),
+# words anywhere inside 20 pages of a file's text, and dropped the language the user typed; "aur dikhao" then
+# broadened to ANY single word ("Milti-julti"). Now:
+#   • every file carries language (books.language = hi | en | both | unk) + type + subject (keywords tags
+#     kind_<x> subj_<x>); its display name ends with the language: "Lucent GK [हिंदी]";
+#   • a search matches only the file's own name (title / original file name / first caption line), every typed key
+#     word must match (whole words for short ones); words the AI added on its own only rank;
+#   • more than a few matches → the bot ASKS (🌐 language, then 📂 type) with live counts, then lists;
+#   • nothing matches → it says so, with clearly-labelled close options (never a random list);
+#   • 📚 PDF List / 🗂️ Categories = browse by type → language → subject (counts on every button).
+LANG_LABEL = {"hi": "हिंदी", "en": "English", "both": "हिंदी + English", "unk": "भाषा अज्ञात"}
+LANG_TAGS = {k: f"[{v}]" for k, v in LANG_LABEL.items()}
+LANG_BTN = {"hi": "🇮🇳 हिंदी", "en": "🇬🇧 English", "both": "🔀 हिंदी + English", "unk": "❔ भाषा अज्ञात"}
+LANG_SHORT = {"hi": "हिंदी", "en": "Eng", "both": "हिं+Eng", "unk": "❔"}
+_LANG_TAG_RE = re.compile(r"\s*\[(?:हिंदी|English|हिंदी \+ English|भाषा अज्ञात)\]\s*$")
+KINDS = [("book", "📚", "Book / किताब"), ("notes", "📒", "Notes / नोट्स"), ("test", "📝", "Test / Mock / MCQ"),
+         ("pyq", "📜", "PYQ / पुराने पेपर"), ("job", "📢", "Job / Notice / Result"), ("short", "📄", "छोटी PDF"),
+         ("other", "🗃️", "बाकी files")]
+KIND_LABEL = {k: f"{e} {l}" for k, e, l in KINDS}
+SUBJ = [("history", "🏛️", "इतिहास"), ("polity", "⚖️", "राजव्यवस्था"), ("geography", "🌍", "भूगोल"),
+        ("economics", "💰", "अर्थव्यवस्था"), ("science", "🔬", "विज्ञान"), ("static_gk", "🧠", "GK / GS"),
+        ("current_affairs", "📰", "करंट अफेयर्स"), ("maths", "➗", "गणित"), ("reasoning", "🧩", "रीजनिंग"),
+        ("hindi", "📖", "हिंदी (विषय)"), ("english", "🔤", "English (विषय)"), ("computer", "💻", "कंप्यूटर"),
+        ("mixed", "🗃️", "मिश्रित / अन्य")]
+SUBJ_LABEL = {k: f"{e} {l}" for k, e, l in SUBJ}
+S2_PAGE = 8
+S2_ASK_MIN = 6          # more matches than this (and a real split) → ask instead of dumping a list
+S2_STATUSES = "status=in.(indexed,inbox,review)"
+
+_M_BOTH = re.compile(r"bilingual|bi-lingual|द्विभाषी|hindi\s*(?:&|and|\+|/|\||-|,)\s*english|english\s*(?:&|and|\+|/|\||-|,)\s*hindi|"
+                     r"(?<![a-z])hin\s*(?:&|\+|/|-)\s*eng(?![a-z])|(?<![a-z])eng\s*(?:&|\+|/|-)\s*hin(?![a-z])|\(\s*h\s*[+&/]\s*e\s*\)|"
+                     r"\(\s*e\s*[+&/]\s*h\s*\)|हिंदी\s*(?:व|और|एवं|&|\+|/)\s*(?:अंग्रेजी|अंग्रेज़ी|english)", re.I)
+_M_HI = re.compile(r"(?<![a-z])(?:hindi|hindhi|hindee)(?![a-z])|हिंदी|हिन्दी|\(\s*h\s*\)|[_\- ]h\.(?:pdf|docx?)$|(?<![a-z])hin(?![a-z])|"
+                   r"(?<![a-z])hn(?![a-z])", re.I)
+_M_EN = re.compile(r"(?<![a-z])(?:english|englsh|inglish)(?![a-z])|अंग्रेजी|अंग्रेज़ी|इंग्लिश|\(\s*e\s*\)|[_\- ]e\.(?:pdf|docx?)$|"
+                   r"(?<![a-z])eng(?![a-z])", re.I)
+_KRUTI = re.compile(r"(?<![A-Za-z])(?:dk|ds|dh|gS|esa|vkSj|ls|fd|rFkk|;g|Hkkjr|gksrk|fy,|tks|dks|ij|vFkok)(?![A-Za-z])")
+_ENGW = re.compile(r"(?<![A-Za-z])(?:the|and|of|is|which|following|in|to|was|are|for|with)(?![A-Za-z])", re.I)
+_HIW = re.compile(r"(?:^|\s)(?:का|की|के|है|में|और|से|को|एक|किस|कौन|द्वारा|निम्न|भारत)(?=\s|$|[,।?])")
+# a subject word is not a language marker: "Hindi Grammar", "English Vocabulary" keep their words
+_SUBJ_LANG = re.compile(r"(?:hindi|हिंदी|हिन्दी)\s*(?:grammar|vyakaran|व्याकरण|sahitya|साहित्य|subject|विषय)|"
+                        r"(?:english)\s*(?:grammar|vocab|vocabulary|comprehension|subject|literature|language\s*test)", re.I)
+
+
+def _stem_text(file_name: Any) -> str:
+    return re.sub(r"[_]+", " ", os.path.splitext(str(file_name or ""))[0])
+
+
+def lang_from_meta(title: Any = "", file_name: Any = "", caption: Any = "") -> Optional[str]:
+    """Language from the file's own words: explicit markers first (file name > caption > title), then the script."""
+    fn = str(file_name or "")
+    cap = "\n".join(str(caption or "").splitlines()[:3])[:300]
+    ttl = _LANG_TAG_RE.sub("", str(title or ""))
+    for txt in (fn, cap, ttl):
+        if not txt.strip():
+            continue
+        t = _SUBJ_LANG.sub(" ", txt)
+        if _M_BOTH.search(t):
+            return "both"
+        hi, en = bool(_M_HI.search(t)), bool(_M_EN.search(t))
+        if hi and en:
+            return "both"
+        if hi:
+            return "hi"
+        if en:
+            return "en"
+    meta = _stem_text(fn) + " " + cap
+    nd = len(re.findall(r"[\u0900-\u097F]", meta))
+    nl = len(re.findall(r"[A-Za-z]", re.sub(r"\bpdf\b", "", meta, flags=re.I)))
+    if nd >= 4 and nd >= nl * 0.5:
+        return "hi"
+    if len(re.findall(r"[\u0900-\u097F]", ttl)) >= 4:
+        return "hi"
+    return None
+
+
+def lang_from_text(txt: Any, ocr: bool = False) -> Optional[str]:
+    """Language from the first pages' text (text layer, or OCR of a scanned page). Legacy Krutidev Hindi fonts read
+    as Latin junk ("dk", "gS", "esa") and still count as Hindi. None = can't tell."""
+    s = str(txt or "")
+    if ocr:
+        dev_words = len(re.findall(r"[\u0900-\u097F]{3,}", s))
+        hi_func = len(_HIW.findall(s))
+        lat_words = len(re.findall(r"(?<![A-Za-z])[A-Za-z]{3,}(?![A-Za-z])", s))
+        en_func = len(_ENGW.findall(s))
+        if dev_words + lat_words < 8:
+            return None
+        hi_ok = hi_func >= 3 or dev_words >= 25
+        en_ok = en_func >= 3 or (lat_words >= 25 and en_func >= 1)
+        if hi_ok and en_ok and min(dev_words, lat_words) >= 0.25 * max(dev_words, lat_words):
+            return "both"
+        if hi_ok and dev_words >= lat_words * 0.6:
+            return "hi"
+        if en_ok and lat_words > dev_words:
+            return "en"
+        return "hi" if hi_ok else ("en" if en_ok else None)
+    d = len(re.findall(r"[\u0900-\u097F]", s))
+    l_ = len(re.findall(r"[A-Za-z]", s))
+    if d + l_ < 80:
+        return None
+    k = len(_KRUTI.findall(s))
+    e = len(_ENGW.findall(s))
+    if k >= 6 and k > e:
+        return "hi"
+    ratio = d / (d + l_)
+    if ratio >= 0.6:
+        return "hi"
+    if ratio <= 0.12:
+        return "en" if e >= 3 else None
+    if d >= 150 and l_ >= 150 and e >= 5:
+        return "both"
+    return "hi" if ratio > 0.4 else None
+
+
+def row_lang(row: Dict[str, Any]) -> str:
+    v = str(row.get("language") or "").lower()
+    if v in ("hi", "en", "both", "unk"):
+        return v
+    m = re.search(r"\blang_(hi|en|both|unk)\b", str(row.get("keywords") or ""))
+    if m:
+        return m.group(1)
+    return lang_from_meta(row.get("title"), row.get("file_name"), row.get("caption")) or "unk"
+
+
+_K_JOB = re.compile(r"notification|notice|admit\s*card|hall\s*ticket|\bresult|cut\s*-?\s*off|answer\s*key|syllabus|vacanc|"
+                    r"recruitment|bharti|भर्ती|अधिसूचना|परिणाम|रिजल्ट|प्रवेश\s*पत्र|उत्तर\s*कुंजी|सिलेबस|पाठ्यक्रम|exam\s*date|"
+                    r"shortlist|merit\s*list|selection\s*list|qualified|physical\s*date|document\s*verification|postpone|"
+                    r"apply\s*online|form\s*(?:start|out|date)|last\s*date", re.I)
+_K_PYQ = re.compile(r"\bpyq|\bpyp\b|previous\s*year|prev\.?\s*year|old\s*paper|question\s*paper|solved\s*paper|exam\s*paper|"
+                    r"memory\s*based|पिछले\s*वर्ष|प्रश्न\s*पत्र|हल\s*प्रश्न|pre\s*year|asked\s*in|\bshift\b|पाली|"
+                    r"(?<!news\s)(?<!news)\bpaper\b|पेपर", re.I)
+_K_MODEL = re.compile(r"model\s*paper|mock\s*paper|practice\s*paper|मॉडल\s*पेपर|sample\s*paper", re.I)
+_K_TEST = re.compile(r"\bmock|\btest\b|\btests\b|quiz|\bmcqs?\b|practice|\bdpp\b|\bset\s*[-:]?\s*\d|\bset\b|model\s*paper|"
+                     r"प्रैक्टिस|अभ्यास|मॉक|टेस्ट|प्रश्नोत्तरी|प्रश्न\s*(?:एवं|और|व)\s*उत्तर|\bquestions?\b|exam\s*booster|"
+                     r"daily\s*dose|\bqs\b|objective|वस्तुनिष्ठ", re.I)
+_K_BOOK = re.compile(r"\bbook\b|\bbooks\b|पुस्तक|किताब|edition|magazine|वार्षिकी|year\s*book|\bguide\b|darpan|दर्पण|"
+                     r"ghatna\s*chakra|घटना\s*चक्र|complete\s*(?:book|gk|gs|theory)|sampoorna|सम्पूर्ण|संपूर्ण", re.I)
+_K_NOTES = re.compile(r"\bnotes?\b|नोट्स|नोट्स|one\s*liner|oneliner|वन\s*लाइनर|chapter|अध्याय|\bclass\s*\d|\bclass\b|lecture|"
+                      r"handwritten|summary|revision|concept|\bppt\b|current\s*affairs|करंट\s*अफेयर्स|समसामयिकी|\bca\b|"
+                      r"article|editorial|theory", re.I)
+_K_BRAND = re.compile(r"lucent|ल्यूसेंट|ncert|एनसीईआरटी|arihant|अरिहंत|kiran|किरण|laxmikanth|spectrum|rs\s*aggarwal|"
+                      r"rakesh\s*yadav\s*(?:sir\s*)?(?:book|class)|khan\s*sir\s*book", re.I)
+
+
+def kind_of(title: Any = "", file_name: Any = "", caption: Any = "", pages: Optional[int] = None,
+            size: Optional[int] = None) -> str:
+    """📂 type of a file from its own name words, then its length (pages when known, else size)."""
+    head = " ".join([_LANG_TAG_RE.sub("", str(title or "")), _stem_text(file_name),
+                     "\n".join(str(caption or "").splitlines()[:2])[:200]])
+    if _K_JOB.search(head):
+        return "job"
+    if _K_MODEL.search(head):
+        return "test"
+    if _K_PYQ.search(head):
+        return "pyq"
+    if _K_TEST.search(head):
+        return "test"
+    if _K_BOOK.search(head):
+        return "book"
+    if _K_NOTES.search(head):
+        return "notes"
+    if _K_BRAND.search(head):
+        return "book"
+    try:
+        p = int(pages) if pages else 0
+    except Exception:
+        p = 0
+    sz = int(size or 0)
+    if p:
+        if p <= 12:
+            return "short"
+        if p >= 80:
+            return "book"
+        return "notes"
+    if sz and sz < 1_200_000:
+        return "short"
+    if sz >= 15_000_000:
+        return "book"
+    return "other" if not sz else "notes"
+
+
+_SUBJ_SKIP = {"pyq", "mock", "other"}
+SUBJ_EXTRA = {   # v25: more name words per subject (on top of SUBJECTS)
+    "current_affairs": ["news", "news article", "article", "editorial", "समाचार", "daily ga", "current affiars", "monthly",
+                        "weekly", "ca quiz", "करेंट", "करंट", "सामयिकी"],
+    "maths": ["speed", "distance", "interest", "average", "mixture", "alligation", "allegation", "profit", "discount",
+              "mensuration", "number series", "simplification", "quant", "quantitative", "aptitude", "अंकगणित"],
+    "reasoning": ["coding", "decoding", "blood relation", "venn", "seating", "puzzle", "analogy", "classification",
+                  "mathematical operation", "mirror", "dice", "calendar", "clock"],
+    "static_gk": ["gs", "general studies", "सामान्य अध्ययन", "author", "authors", "temple", "मंदिर", "national symbol",
+                  "first in", "important days", "animals", "awards", "festival", "त्योहार", "लोक नृत्य"],
+    "geography": ["national park", "राष्ट्रीय उद्यान", "dam", "बाँध", "lake", "झील", "पठार", "plateau", "forest", "वन"],
+    "polity": ["bnss", "bns", "ipc", "crpc", "कानून", "अधिनियम", "law", "act", "अनुच्छेद", "article 3", "संसद"],
+    "science": ["bio", "physics", "chemistry", "biology", "भौतिक", "रसायन", "जीव", "periodic", "formula"],
+    "hindi": ["hindi class", "hindi grammar", "हिंदी कक्षा", "वर्तनी", "शब्द शुद्धि", "वाक्य शुद्धि", "हिंदी भाषा"],
+    "english": ["english grammar", "vocab", "vocabulary", "idioms", "synonym", "antonym", "one word substitution",
+                "spelling", "narration", "direct indirect", "active passive", "error detection", "cloze", "the hindu vocab"],
+    "computer": ["computer", "कंप्यूटर", "कम्प्यूटर", "ms office", "excel", "internet", "ccc", "o level"],
+}
+
+
+def subj_of(title: Any = "", file_name: Any = "", caption: Any = "", content: Any = "") -> str:
+    """📚 subject: name words count 3×, the first pages' words 1× (max 6). Nothing → mixed."""
+    name = " ".join([_LANG_TAG_RE.sub("", str(title or "")), _stem_text(file_name),
+                     "\n".join(str(caption or "").splitlines()[:2])[:200]]).lower()
+    body = str(content or "")[:6000].lower()
+    best, score = "mixed", 0
+    allowed = {k for k, _, _ in SUBJ}
+    for slug, _, _, words in SUBJECTS:
+        if slug in _SUBJ_SKIP or slug not in allowed:
+            continue
+        s = 3 * _hits(list(words) + SUBJ_EXTRA.get(slug, []), name) + min(6, _hits(words, body))
+        if s > score:
+            best, score = slug, s
+    if score < 2:
+        return "mixed"
+    return best
+
+
+def facet_tags(lang: str, kind: str, subj: str) -> str:
+    return f"lang_{lang} kind_{kind} subj_{subj}"
+
+
+_FACET_RE = re.compile(r"\s*\b(?:lang_(?:hi|en|both|unk)|kind_[a-z]+|subj_[a-z_]+)\b")
+
+
+def with_facets(keywords: Any, lang: str, kind: str, subj: str) -> str:
+    k = _FACET_RE.sub("", str(keywords or "")).strip()
+    return (k[:3940] + " " + facet_tags(lang, kind, subj)).strip()
+
+
+def row_kind(row: Dict[str, Any]) -> str:
+    m = re.search(r"\bkind_([a-z]+)\b", str(row.get("keywords") or ""))
+    if m and m.group(1) in KIND_LABEL:
+        return m.group(1)
+    return kind_of(row.get("title"), row.get("file_name"), row.get("caption"), None, row.get("file_size"))
+
+
+def row_subj(row: Dict[str, Any]) -> str:
+    m = re.search(r"\bsubj_([a-z_]+)\b", str(row.get("keywords") or ""))
+    if m and m.group(1) in SUBJ_LABEL:
+        return m.group(1)
+    return subj_of(row.get("title"), row.get("file_name"), row.get("caption"))
+
+
+_LANG_WORD_TRIM = re.compile(r"\s*(?:\(\s*(?:hindi|english|eng|hin|h|e|हिंदी|हिन्दी)\s*\)|\[\s*(?:hindi|english|eng|hin)\s*\]|"
+                             r"[-–—:|]\s*(?:hindi|english|eng|हिंदी|हिन्दी)\s*$|\b(?:in|हिंदी\s*में)\s+(?:hindi|english)\s*$|"
+                             r"\b(?:hindi|english)\s*(?:medium|version)\b|(?<![a-z])(?:hindi|english)\s*$)", re.I)
+
+
+def base_title(title: Any) -> str:
+    """The name without our language tag (and without a dangling '(Hindi)' / '- English' marker)."""
+    t = _LANG_TAG_RE.sub("", str(title or "")).strip()
+    if not _SUBJ_LANG.search(t):
+        t2 = _LANG_WORD_TRIM.sub(" ", t)
+        t2 = re.sub(r"\s+", " ", t2).strip(" -–—:|,")
+        if len(re.findall(r"[A-Za-z\u0900-\u097F0-9]", t2)) >= 3:
+            t = t2
+    return t
+
+
+def tagged_title(title: Any, lang: str) -> str:
+    """'Lucent GK [हिंदी]'. An unknown language adds nothing to the name (buttons show ❔ in front)."""
+    b = base_title(title)[:480]
+    return (b + " " + LANG_TAGS[lang]).strip() if lang in ("hi", "en", "both") else (b or str(title or ""))
+
+
+def display_title(row: Dict[str, Any]) -> str:
+    return tagged_title(row.get("title") or "Untitled", row_lang(row))
+
+
+def button_title(row: Dict[str, Any], n: int = 46) -> str:
+    """Result button: the language first (so it is never cut off), then the name."""
+    b = base_title(row.get("title") or "Untitled")
+    lg = LANG_SHORT.get(row_lang(row), "❔")
+    room = max(12, n - len(lg) - 3)
+    return f"{lg} • {b[:room - 1] + '…' if len(b) > room else b}"
+
+
+def tag_record(record: Dict[str, Any], text: str = "") -> None:
+    """New file (any source): language + type + subject tags and the language in its name. Reads page 1 only when
+    the name can't tell the language, the file is small and the request still has time (no OCR on the server)."""
+    try:
+        lang = lang_from_meta(record.get("title"), record.get("file_name"), record.get("caption"))
+        body = str(text or record.get("content_text") or "")
+        if not lang and body:
+            lang = lang_from_text(body)
+        if not lang and not body and record.get("telegram_file_id") and 0 < int(record.get("file_size") or 0) <= 8_000_000 \
+                and req_elapsed() < 3.0 and str(record.get("mime_type") or "").endswith("pdf"):
+            try:
+                data = download_file(record.get("telegram_file_id"), record.get("file_size"))
+                pages = list(iter_pages(data, str(record.get("file_name") or ""), str(record.get("mime_type") or ""), 2)) if data else []
+                body = "\n".join(str(p) for p in pages)
+                lang = lang_from_text(body)
+            except Exception:
+                lang = None
+        lang = lang or "unk"
+        kind = kind_of(record.get("title"), record.get("file_name"), record.get("caption"), None, record.get("file_size"))
+        subj = subj_of(record.get("title"), record.get("file_name"), record.get("caption"), body)
+        record["language"] = lang
+        record["keywords"] = with_facets(record.get("keywords"), lang, kind, subj)
+        if record.get("title"):
+            record["title"] = tagged_title(record["title"], lang)[:500]
+    except Exception:
+        log_error("tag_record")
+
+
+# ---- 🔎 the search: only the file's own name counts, every typed key word must match
+
+_S2_DROP = {"pdf", "pdfs", "file", "files", "book", "books", "kitab", "kitaab", "notes", "note", "नोट्स", "बुक", "किताब",
+            "पुस्तक", "chahiye", "do", "dedo", "bhejo", "plz", "please", "bhai", "sir", "ki", "ka", "ke", "wali", "wala",
+            "vali", "vala", "me", "mein", "में", "की", "का", "के", "do", "de", "chhoti", "choti", "chota", "chhota",
+            "short", "small", "mock", "test", "tests", "quiz", "mcq", "mcqs", "pyq", "previous", "year", "paper", "papers",
+            "practice", "set", "old", "medium", "subject", "all", "sab", "sabhi", "sare", "sari", "hindi", "english",
+            "हिंदी", "हिन्दी", "eng", "hin", "angreji", "angrezi", "अंग्रेजी"}
+_S2_KIND_WORDS = [("pyq", re.compile(r"\bpyq|previous\s*year|old\s*paper|question\s*paper|solved\s*paper|purane?\s*paper|प्रश्न\s*पत्र", re.I)),
+                  ("test", re.compile(r"\bmock|\btest|quiz|\bmcq|practice|\bdpp\b|मॉक|टेस्ट", re.I)),
+                  ("job", re.compile(r"notification|admit\s*card|result|cut\s*off|answer\s*key|syllabus|vacancy|bharti|भर्ती", re.I)),
+                  ("short", re.compile(r"chhot|\bchot|short\s*pdf|small\s*pdf|छोटी", re.I)),
+                  ("notes", re.compile(r"\bnotes?\b|नोट्स|one\s*liner", re.I))]   # "book"/"kitab" = any PDF to users: asked, not filtered
+_S2_PREFIX_OPTIONAL = {"ssc", "rrb", "upsc", "exam", "bharti", "recruitment", "constable", "sarkari", "govt"}
+
+
+def s2_query_lang(text: str) -> Optional[str]:
+    low = " " + (text or "").lower() + " "
+    hi = bool(re.search(r"(?<![a-z])(?:hindi|hindee|hin|hn)(?![a-z])|हिंदी|हिन्दी", low))
+    en = bool(re.search(r"(?<![a-z])(?:english|eng|inglish|angreji|angrezi)(?![a-z])|अंग्रेजी|इंग्लिश", low))
+    if re.search(r"dono|both|bilingual|दोनों", low) and (hi or en):
+        return "both"
+    if hi and en:
+        return "both"
+    return "hi" if hi else ("en" if en else None)
+
+
+def s2_query_kind(text: str) -> Optional[str]:
+    for k, rx in _S2_KIND_WORDS:
+        if rx.search(text or ""):
+            return k
+    return None
+
+
+def _norm_term(t: str) -> str:
+    return re.sub(r"\s+", " ", str(t or "").lower()).strip()
+
+
+def s2_groups_from(words: List[str]) -> List[List[str]]:
+    groups: List[List[str]] = []
+    for w in words:
+        w = _norm_term(w)
+        if not w or w in _S2_DROP or w in FILLER and not (w in EXAM_WORDS or w in SUBJECT_WORDS):
+            continue
+        if len(w) < 2 and not w.isdigit():
+            continue
+        g = sorted(set(ALIASES.get(w, {w})) | {w}, key=lambda x: (x != w, x))
+        g = [x for x in g if x and "," not in x and "(" not in x and ")" not in x][:8]
+        if g and not any(set(g) == set(h) for h in groups):
+            groups.append(g)
+    return groups
+
+
+def s2_spec(text: str, d: Optional[Dict[str, Any]] = None, u: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """What to search: req = groups the user actually typed (or an AI spelling fix of a typed word), opt = words the
+    AI added on its own (rank only), lang/kind = what the user asked for (None = ask)."""
+    u = u or understand(text)
+    typed = [t for t in (u.get("tokens") or tokenize(text))]
+    req_words: List[str] = []
+    for t in typed:
+        if t in u.get("keywords") or []:
+            req_words.append(t)
+    ai_words: List[str] = []
+    if d:
+        for f in ("book", "exam", "subject", "topic"):
+            if d.get(f):
+                ai_words += tokenize(str(d[f]))
+        for k in d.get("keywords") or []:
+            ai_words += tokenize(str(k))
+    import difflib
+    typed_set = set(typed)
+    req: List[List[str]] = s2_groups_from(req_words)
+    # a typed word that is unknown junk to us but the AI fixed it ("lusent" → lucent): the fix becomes required
+    fixed: List[str] = []
+    for w in ai_words:
+        if w in typed_set or w in _S2_DROP:
+            continue
+        close = difflib.get_close_matches(w, list(typed_set), n=1, cutoff=0.75)
+        if close and len(w) >= 4:
+            fixed.append(w)
+            req = [g for g in req if close[0] not in g]
+    req += [g for g in s2_groups_from(fixed) if g not in req]
+    opt = [g for g in s2_groups_from([w for w in ai_words if w not in typed_set])
+           if not any(set(g) & set(r) for r in req)]
+    # "ssc gd" → "ssc" only ranks when another exam word is there (files often say just "GD Constable")
+    if len(req) > 1:
+        keep = [g for g in req if not (set(g) & _S2_PREFIX_OPTIONAL)]
+        if keep and len(keep) < len(req):
+            opt = [g for g in req if g not in keep] + opt
+            req = keep
+    kq = s2_query_kind(text)
+    # what the AI understood (book / subject / topic, else exam) — tried only when the typed words find nothing
+    ai_req: List[List[str]] = []
+    if d:
+        for f in ("book", "subject", "topic"):
+            if d.get(f):
+                ai_req += [g for g in s2_groups_from(tokenize(str(d[f]))) if g not in ai_req]
+        if not ai_req and d.get("exam"):
+            ai_req = s2_groups_from(tokenize(str(d["exam"])))
+    # a specific book the AI named from a description ("peeli mota kitab jisme sab hota" → Lucent) — subject /
+    # exam / type words never count here, so a vague or junk message can't turn into a whole subject's files
+    ai_book: List[List[str]] = []
+    if d:
+        bw = tokenize(str(d.get("book") or "")) + [w for k in (d.get("keywords") or []) for w in tokenize(str(k))]
+        ai_book = [g for g in s2_groups_from([w for w in bw if len(w) >= 4 and not _s2_generic(w)]) if g not in req]
+    return {"req": req[:6], "opt": opt[:6], "lang": s2_query_lang(text), "kind": kq, "kind_q": kq,
+            "raw": (text or "")[:120], "ai_req": ai_req[:4], "ai_book": ai_book[:2]}
+
+
+_S2_GENERIC: set = set()
+S2_BRANDS = {"lucent", "lusent", "ल्यूसेंट", "arihant", "ghatna", "chakra", "kiran", "rakesh", "yadav", "agrawal", "aggarwal",
+             "paramount", "disha", "speedy", "youth", "drishti", "laxmikant", "spectrum", "ncert", "pinnacle", "mahesh",
+             "barnwal", "neetu", "parmar", "khan", "testbook", "adda247", "adda", "wallah", "unacademy", "mccraw", "tmh"}
+
+
+def _s2_generic(w: str) -> bool:
+    if not _S2_GENERIC:
+        for _, _, _, words in SUBJECTS:
+            _S2_GENERIC.update(x.lower() for x in words)
+        for ws in SUBJ_EXTRA.values():
+            _S2_GENERIC.update(ws)
+        for _, v in EXAM_BUTTONS:
+            _S2_GENERIC.add(str(v).lower())
+        _S2_GENERIC.update(["notes", "note", "book", "books", "pdf", "test", "mock", "pyq", "paper", "quiz", "mcq", "class",
+                            "hindi", "english", "exam", "exams", "series", "practice", "set", "gk", "gs", "ssc", "gd",
+                            "railway", "police", "army", "bank", "upsc", "bpsc", "ntpc", "constable", "general", "studies",
+                            "knowledge", "current", "affairs", "static", "complete", "important", "questions", "question"])
+        _S2_GENERIC.difference_update(S2_BRANDS)
+    if w in _S2_GENERIC or w in _S2_DROP:
+        return True
+    return any(x in _S2_GENERIC for x in (s2_groups_from([w]) or [[w]])[0])
+
+
+def _head_fields(row: Dict[str, Any]) -> List[str]:
+    cap = "\n".join(str(row.get("caption") or "").splitlines()[:2])[:200]
+    return [normalize(base_title(row.get("title"))), normalize(_stem_text(row.get("file_name"))), normalize(cap)]
+
+
+def _t_match(term: str, text: str) -> bool:
+    if not term or not text:
+        return False
+    if re.search(r"[\u0900-\u097F]", term):
+        return term in text
+    if " " in term:
+        return re.search(r"(?<![a-z0-9])" + re.escape(term) + r"(?![a-z0-9])", text) is not None
+    if len(term) >= 5:
+        return re.search(r"(?<![a-z0-9])" + re.escape(term), text) is not None     # history → history's / historyy
+    return re.search(r"(?<![a-z0-9])" + re.escape(term) + r"(?![a-z0-9])", text) is not None
+
+
+def _db_or(group: List[str]) -> str:
+    parts = []
+    for term in group:
+        t = re.sub(r"[,()*\"\\]", " ", term).strip()
+        if not t:
+            continue
+        for col in ("title", "file_name", "caption"):
+            parts.append(f"{col}.ilike.*{t}*")
+            if col == "file_name" and " " in t:
+                parts.append(f"file_name.ilike.*{t.replace(' ', '_')}*")
+    return "or(" + ",".join(parts) + ")"
+
+
+S2_COLS = "id,title,file_name,caption,keywords,language,status,file_size,telegram_file_unique_id"
+
+
+def s2_fetch(groups: List[List[str]]) -> List[Dict[str, Any]]:
+    """Candidates from the DB: every group must appear in title / file name / caption (and=(or(..),or(..))).
+    The Python check after it is the real rule (whole words, first caption lines only)."""
+    if not groups:
+        return []
+    cond = "and=(" + ",".join(_db_or(g) for g in groups) + ")"
+    q = f"?select={S2_COLS}&{S2_STATUSES}&order=id.desc&limit=1000&" + urllib.parse.quote(cond, safe="(),.*=&")
+    rows = supabase("books", "GET", query=q)
+    if isinstance(rows, list) and len(rows) >= 1000:
+        more = par(*[(lambda off: (lambda: supabase("books", "GET", query=q + f"&offset={off}")))(o)
+                     for o in (1000, 2000, 3000, 4000)])
+        for m in more:
+            if isinstance(m, list):
+                rows += m
+    return rows if isinstance(rows, list) else []
+
+
+def s2_score(row: Dict[str, Any], spec: Dict[str, Any]) -> Optional[float]:
+    fields = _head_fields(row)
+    score = 0.0
+    for g in spec["req"]:
+        best = 0.0
+        for i, f in enumerate(fields):
+            if any(_t_match(normalize(t), f) for t in g):
+                best = max(best, (3.0, 2.0, 1.0)[i])
+        if not best:
+            return None
+        score += best
+    for g in spec.get("opt") or []:
+        if any(_t_match(normalize(t), fields[0]) or _t_match(normalize(t), fields[1]) for t in g):
+            score += 0.7
+    raw = normalize(" ".join(w for w in tokenize(spec.get("raw") or "") if w not in _S2_DROP and w not in FILLER))
+    if raw and len(raw) >= 4 and raw in fields[0]:
+        score += 2.0
+    if str(row.get("status") or "indexed") == "indexed":
+        score += 0.3
+    return score
+
+
+def s2_search(spec: Dict[str, Any]) -> List[Dict[str, Any]]:
+    rows = s2_fetch(spec["req"])
+    scored = []
+    for r in rows:
+        if str(r.get("status") or "") == "removed":
+            continue
+        s = s2_score(r, spec)
+        if s is not None:
+            scored.append((s, r))
+    scored.sort(key=lambda x: (-x[0], len(str(x[1].get("title") or "")), str(x[1].get("title") or "")))
+    out, seen_u, seen_n = [], set(), set()
+    for _, r in scored:
+        u_ = str(r.get("telegram_file_unique_id") or "")
+        n_ = (normalize(base_title(r.get("title"))), row_lang(r), int(r.get("file_size") or 0) // 50000)
+        if (u_ and u_ in seen_u) or n_ in seen_n:
+            continue
+        seen_u.add(u_)
+        seen_n.add(n_)
+        r["_lang"], r["_kind"] = row_lang(r), row_kind(r)
+        out.append(r)
+    return out
+
+
+def s2_filter(rows: List[Dict[str, Any]], lang: Optional[str], kind: Optional[str]) -> List[Dict[str, Any]]:
+    out = rows
+    if lang and lang != "all":
+        ok = {"hi": ("hi", "both"), "en": ("en", "both"), "both": ("both",), "unk": ("unk",)}.get(lang, (lang,))
+        out = [r for r in out if r["_lang"] in ok]
+        out.sort(key=lambda r: r["_lang"] != lang)        # exact language first, bilingual after
+    if kind and kind != "all":
+        out = [r for r in out if r["_kind"] == kind]
+    return out
+
+
+def s2_label(spec: Dict[str, Any]) -> str:
+    words = [g[0] for g in spec.get("req") or []]
+    lab = " ".join(words) or (spec.get("raw") or "")
+    return lab[:50].title() if lab.isascii() else lab[:50]
+
+
+def _count_lang(rows: List[Dict[str, Any]]) -> Dict[str, int]:
+    c = {"hi": 0, "en": 0, "both": 0, "unk": 0}
+    for r in rows:
+        c[r["_lang"]] = c.get(r["_lang"], 0) + 1
+    return c
+
+
+def _count_kind(rows: List[Dict[str, Any]]) -> Dict[str, int]:
+    c: Dict[str, int] = {}
+    for r in rows:
+        c[r["_kind"]] = c.get(r["_kind"], 0) + 1
+    return c
+
+
+def _pairs(btns: List[Dict[str, Any]], width: int = 2) -> List[List[Dict[str, Any]]]:
+    return [btns[i:i + width] for i in range(0, len(btns), width)]
+
+
+def s2_screen(spec: Dict[str, Any], rows: List[Dict[str, Any]], page: int = 1) -> Any:
+    """The next screen for a search: ask 🌐 language → ask 📂 type → list. Returns (text, markup)."""
+    lab = esc(s2_label(spec))
+    lang, kind = spec.get("lang"), spec.get("kind")
+    if lang is None:
+        if kind and kind != "all" and s2_filter(rows, None, kind):
+            rows = s2_filter(rows, None, kind)            # the type they typed ("practice", "notes") is already chosen
+        c = _count_lang(rows)
+        langs_present = [k for k in ("hi", "en", "both") if c[k]]
+        if len(rows) > S2_ASK_MIN and (len(langs_present) >= 2 or (langs_present and c["unk"])):
+            btns = []
+            for k in ("hi", "en", "both", "unk"):
+                n = c[k] + (c["both"] if k in ("hi", "en") else 0)
+                if c[k]:
+                    btns.append({"text": f"{LANG_BTN[k]} ({n})", "callback_data": f"s2:l:{k}"})
+            kb = _pairs(btns) + [[{"text": f"📚 Sab dikhao ({len(rows)})", "callback_data": "s2:l:all"}]]
+            return (f"🔎 <b>{lab}</b> — {len(rows)} file mili ✅\n\n🌐 <b>Kis bhasha me chahiye?</b>\n"
+                    f"<i>Button dabao — usi bhasha ki files dikhaunga</i>", {"inline_keyboard": kb})
+        spec["lang"] = lang = "all"
+    rows_l = s2_filter(rows, lang, None)
+    if kind is None:
+        c = _count_kind(rows_l)
+        present = [k for k, _, _ in KINDS if c.get(k)]
+        if len(rows_l) > S2_ASK_MIN + 2 and len(present) >= 2:
+            btns = [{"text": f"{KIND_LABEL[k]} ({c[k]})", "callback_data": f"s2:k:{k}"} for k in present]
+            kb = _pairs(btns) + [[{"text": f"📚 Sab dikhao ({len(rows_l)})", "callback_data": "s2:k:all"}]]
+            lg = f" · {LANG_LABEL[lang]}" if lang in LANG_LABEL else ""
+            return (f"🔎 <b>{lab}</b>{esc(lg)} — {len(rows_l)} file\n\n📂 <b>Kya chahiye?</b>\n"
+                    f"<i>Book, Notes, Test… jo chahiye wo chuno</i>", {"inline_keyboard": kb})
+        spec["kind"] = kind = "all"
+    final = s2_filter(rows_l, None, kind)
+    total = len(final)
+    pages = max(1, (total + S2_PAGE - 1) // S2_PAGE)
+    page = max(1, min(page, pages))
+    chunk = final[(page - 1) * S2_PAGE: page * S2_PAGE]
+    bits = [b for b in (LANG_LABEL.get(lang) if lang in LANG_LABEL else "",
+                        KIND_LABEL.get(kind) if kind in KIND_LABEL else "") if b]
+    head = f"🔎 <b>{lab}</b>" + (f" · {esc(' · '.join(bits))}" if bits else "") + f" — <b>{total} file mili</b>"
+    if pages > 1:
+        head += f" (page {page}/{pages})"
+    names = [normalize(base_title(r.get("title"))) for r in chunk]
+    kb = []
+    for r, nm in zip(chunk, names):
+        bt = button_title(r, 40 if names.count(nm) > 1 else 46)
+        if names.count(nm) > 1 and r.get("file_size"):
+            bt += f" · {human_size(r.get('file_size'))}"      # same name twice on a page: the size tells them apart
+        kb.append([{"text": "📄 " + bt, "callback_data": f"book:{r['id']}"}])
+    nav = []
+    if page > 1:
+        nav.append({"text": "⬅️ Pichhe", "callback_data": f"s2:p:{page - 1}"})
+    if page < pages:
+        nav.append({"text": f"➡️ Aur dikhao ({total - page * S2_PAGE})", "callback_data": f"s2:p:{page + 1}"})
+    if nav:
+        kb.append(nav)
+    kb.append([{"text": "🔁 Bhasha / Type badlo", "callback_data": "s2:f"}])
+    return head + "\n\nJo chahiye us par tap karo 👇", {"inline_keyboard": kb}
+
+
+def s2_close_options(spec: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Nothing matched every word: files matching all but the least specific word, or a close spelling of the
+    title words — shown ONLY under a clear 'pura match nahi mila' line."""
+    req = spec.get("req") or []
+    out: List[Dict[str, Any]] = []
+    if len(req) > 1:
+        # drop one group at a time, keep the longest (most specific) words
+        order = sorted(range(len(req)), key=lambda i: len(req[i][0]))
+        for i in order[:2]:
+            sub = dict(spec, req=[g for j, g in enumerate(req) if j != i], opt=[])
+            out = s2_search(sub)
+            if out:
+                break
+    if not out:
+        try:
+            fz = fuzzy_rows([g[0] for g in req]) if req else []
+        except Exception:
+            fz = []
+        out = [dict(r, _lang=row_lang(r), _kind=row_kind(r)) for r in fz]
+    return out[:6]
+
+
+def s2_not_found(chat_id: int, user: Dict[str, Any], spec: Dict[str, Any], understood: str = "",
+                 rows_any: Optional[List[Dict[str, Any]]] = None) -> None:
+    lab = s2_label(spec) or "ye"
+    close = s2_close_options(spec)
+    uid = user.get("id")
+    try:
+        if not (uid and is_subadmin(uid)):
+            who = user_label({"first_name": user.get("first_name"), "last_name": user.get("last_name"),
+                              "username": user.get("username")}) if (user.get("first_name") or user.get("username")) else f"user {uid}"
+            audit_log(f"🔎 Missing request: {lab} ({who}) · {ist_now()} IST" + (f"\n🤖 {understood}" if understood else ""))
+    except Exception:
+        log_error("missing log")
+    text = f"😕 <b>\"{esc(lab)}\" ki file abhi bot me nahi hai.</b>"
+    if not (uid and is_subadmin(uid)):
+        text += " Admin ko bata diya ✅"
+    kb: List[Any] = []
+    if close:
+        text += "\n\n🤏 <b>Pura match nahi mila — ye milti-julti hain:</b>"
+        kb += [[{"text": "📄 " + button_title(r), "callback_data": f"book:{r['id']}"}] for r in close]
+    else:
+        text += "\n\nDusra naam ya sahi spelling try karo (jaise: <i>lucent</i>, <i>polity notes hindi</i>)."
+    kb.append([{"text": "📚 Files dekho (Type / Bhasha / Subject)", "callback_data": "bw:k:-:-:-:1"}])
+    send_text(chat_id, text, {"inline_keyboard": kb}, "HTML")
+
+
+def s2_rows(spec: Dict[str, Any]) -> List[Dict[str, Any]]:
+    rows = s2_search(spec)
+    if not rows and spec.get("fz"):
+        try:
+            rows = [dict(r, _lang=row_lang(r), _kind=row_kind(r)) for r in fuzzy_rows([g[0] for g in spec["req"]])]
+        except Exception:
+            rows = []
+    return rows
+
+
+def s2_answer(chat_id: int, user: Dict[str, Any], text: str, ctx: Dict[str, Any], d: Optional[Dict[str, Any]] = None,
+              u: Optional[Dict[str, Any]] = None, understood: str = "", not_found: bool = True) -> bool:
+    """Search + the next screen. False = nothing searchable in the message (or nothing found and not_found=False)."""
+    spec = s2_spec(text, d, u)
+    if not spec["req"]:
+        return False
+    return s2_run(chat_id, user, spec, ctx, understood=understood, not_found=not_found, raw=text)
+
+
+def s2_run(chat_id: int, user: Dict[str, Any], spec: Dict[str, Any], ctx: Dict[str, Any], note: str = "",
+           understood: str = "", not_found: bool = True, raw: str = "") -> bool:
+    rows = s2_search(spec)
+    if not rows:
+        # spelling: every typed word close to a word of a file name ("itihaas" → Itihas, "lusent" → Lucent)
+        try:
+            fz = fuzzy_rows([g[0] for g in spec["req"]])
+        except Exception:
+            fz = []
+        if fz:
+            spec["fz"] = True
+            rows = [dict(r, _lang=row_lang(r), _kind=row_kind(r)) for r in fz]
+            note += "🔤 Spelling ke hisaab se milte-julte naam:\n"
+    _known_w = lambda w: _s2_generic(w) or w in ALIASES or w in S2_BRANDS
+    unknown_typed = any(not _known_w(g[0]) for g in spec.get("req") or [])
+    if not rows and unknown_typed and spec.get("ai_req") and spec["ai_req"] != spec["req"]:
+        # the typed words are not in any file name, but the AI understood a subject / book ("mughalo ka itihaas")
+        typed = [g[0] for g in spec["req"] if not _known_w(g[0])]
+        near = lambda a: any(difflib.SequenceMatcher(None, a, t).ratio() >= 0.75 for t in typed)
+        ai_ok = [g for g in spec["ai_req"] if any(near(a) for a in g)]
+        known = [g for g in spec["req"] if g[0] not in typed]
+        sp_ai = dict(spec, req=known + [g for g in ai_ok if g not in known], opt=[], fz=False) if ai_ok else None
+    else:
+        sp_ai = None
+    if not rows and not sp_ai and unknown_typed and spec.get("ai_book"):
+        known = [g for g in spec["req"] if _known_w(g[0])]
+        sp_ai = dict(spec, req=known + spec["ai_book"], opt=[], fz=False)
+    if not rows and sp_ai:
+        rows = s2_search(sp_ai)
+        if rows:
+            spec.update(sp_ai)
+            note += f"🤖 Samjha: {' '.join(g[0] for g in spec['req'])}\n"
+    note_user(None, searches=1)
+    if not rows:
+        if not not_found:
+            return False
+        s2_not_found(chat_id, user, spec, understood)
+        return True
+    # asked-for language / type that has no file: say it, show what there is
+    if spec["lang"] and not s2_filter(rows, spec["lang"], None):
+        c = _count_lang(rows)
+        have = ", ".join(f"{LANG_LABEL[k]} ({c[k]})" for k in ("hi", "en", "both", "unk") if c[k])
+        note += f"ℹ️ {LANG_LABEL.get(spec['lang'], spec['lang'])} me nahi mili — ye bhashayen hain: {have}\n"
+        spec["lang"] = None
+    if spec["kind"] and not s2_filter(s2_filter(rows, spec["lang"], None) if spec["lang"] else rows, None, spec["kind"]):
+        note += f"ℹ️ {KIND_LABEL.get(spec['kind'], spec['kind'])} nahi mili — baaki type dikha raha hu\n"
+        spec["kind"] = spec["kind_q"] = None
+    txt, kb = s2_screen(spec, rows, 1)
+    ctx.update({"s2": spec, "q": [g[0] for g in spec["req"]], "lang": None, "types": [], "raw": (raw or spec.get("raw") or "")[:120],
+                "shown": [], "ask": None, "pending": None, "s2p": 1})
+    save_ctx(user.get("id"), ctx)
+    send_text(chat_id, (esc(note) + "\n" if note else "") + txt, kb, "HTML")
+    _FX.found = True                       # ✨ ⚡ reaction on the user's search message: files were found
+    return True
+
+
+def s2_callback(query: Dict[str, Any], data: str, chat_id: int, user_id: Optional[int]) -> None:
+    ctx = load_ctx(user_id)
+    spec = ctx.get("s2")
+    if not spec or not spec.get("req"):
+        show(chat_id, "⌛ Ye search purani ho gayi. Book ka naam dobara likho 🔍", None, query)
+        return
+    _, kind_, val = (data.split(":", 2) + ["", ""])[:3]
+    page = 1
+    if kind_ == "l":
+        spec["lang"] = val if val in ("hi", "en", "both", "unk", "all") else "all"
+        spec["kind"] = spec.get("kind_q")
+    elif kind_ == "k":
+        spec["kind"] = val if val in KIND_LABEL or val == "all" else "all"
+    elif kind_ == "p":
+        page = int(val) if val.isdigit() else 1
+    elif kind_ == "f":
+        spec["lang"], spec["kind"] = None, None
+    rows = s2_rows(spec)
+    if not rows:
+        show(chat_id, "😕 Ab is search me koi file nahi bachi. Naam dobara likho 🔍", None, query)
+        return
+    if kind_ == "f":
+        spec["lang"], spec["kind"] = None, None
+    txt, kb = s2_screen(spec, rows, page)
+    ctx["s2"], ctx["s2p"] = spec, page
+    save_ctx(user_id, ctx)
+    show(chat_id, txt, kb, query, "HTML")
+
+
+def s2_more(chat_id: int, user_id: Optional[int], ctx: Dict[str, Any]) -> bool:
+    """Typed "aur dikhao" after a search: the next page of the SAME list (never other words)."""
+    spec = ctx.get("s2")
+    if not spec or not spec.get("req"):
+        return False
+    if spec.get("lang") is None or spec.get("kind") is None:
+        spec["lang"] = spec.get("lang") or "all"
+        spec["kind"] = spec.get("kind") or "all"
+    rows = s2_rows(spec)
+    page = int(ctx.get("s2p") or 1) + 1
+    final = s2_filter(s2_filter(rows, spec["lang"], None), None, spec["kind"])
+    if (page - 1) * S2_PAGE >= len(final):
+        send_text(chat_id, ALL_SHOWN_MSG, {"inline_keyboard": [[{"text": "🔁 Bhasha / Type badlo", "callback_data": "s2:f"}]]}, "HTML")
+        return True
+    txt, kb = s2_screen(spec, rows, page)
+    ctx["s2"], ctx["s2p"] = spec, page
+    save_ctx(user_id, ctx)
+    send_text(chat_id, txt, kb, "HTML")
+    return True
+
+
+# ---- 📚 browse: type → language → subject → list (or subject first from 🗂️ Categories); counts on every button
+
+def _bw_query(kind: str, lang: str, subj: str) -> str:
+    q = f"&{S2_STATUSES}"
+    if kind not in ("-", "*"):
+        q += f"&keywords=ilike.*kind_{kind}*"
+    if lang not in ("-", "*"):
+        q += f"&language=eq.{lang}"
+    if subj not in ("-", "*"):
+        q += f"&keywords=ilike.*subj_{subj}*"
+    return q
+
+
+def bw_cb(order: str, kind: str = "-", lang: str = "-", subj: str = "-", page: int = 1) -> str:
+    return ":".join(["bw", order, kind, lang, subj, str(page)])
+
+
+def browse_view(order: str, kind: str, lang: str, subj: str, page: int = 1) -> Any:
+    """order 'k' = type → bhasha → subject; 's' = subject → type → bhasha."""
+    seq = ["kind", "lang", "subj"] if order == "k" else ["subj", "kind", "lang"]
+    cur = {"kind": kind, "lang": lang, "subj": subj}
+    nxt = next((f for f in seq if cur[f] == "-"), None)
+
+    def cb(**kw: str) -> str:
+        c = dict(cur, **kw)
+        return bw_cb(order, c['kind'], c['lang'], c['subj'], 1)
+    crumbs = [x for x in (KIND_LABEL.get(kind), LANG_LABEL.get(lang), SUBJ_LABEL.get(subj)) if x]
+    head = "📚 <b>Files</b>" + (" · " + esc(" · ".join(crumbs)) if crumbs else "")
+    if nxt:
+        opts = {"kind": [(k, KIND_LABEL[k]) for k, _, _ in KINDS],
+                "lang": [(k, LANG_BTN[k]) for k in ("hi", "en", "both", "unk")],
+                "subj": [(k, SUBJ_LABEL[k]) for k, _, _ in SUBJ]}[nxt]
+        counts = par(*[(lambda v: (lambda: count_rows("books", _bw_query(**dict(cur, **{nxt: v})))))(v) for v, _ in opts])
+        btns = [{"text": f"{lab} ({n})", "callback_data": cb(**{nxt: v})}
+                for (v, lab), n in zip(opts, counts) if isinstance(n, int) and n > 0]
+        total = count_rows("books", _bw_query(kind, lang, subj))
+        ask = {"kind": "📂 <b>Kaun sa type?</b>", "lang": "🌐 <b>Kis bhasha me?</b>", "subj": "📚 <b>Kaun sa subject?</b>"}[nxt]
+        kb = _pairs(btns) + [[{"text": f"📚 Sab dikhao ({total})", "callback_data": cb(**{nxt: '*'})}]]
+        if crumbs:
+            kb.append([{"text": "🔙 Shuru se", "callback_data": bw_cb(order)}])
+        if not total:
+            return f"{head}\n\nIs chunav me abhi koi file nahi.", {"inline_keyboard": [[{"text": "🔙 Shuru se", "callback_data": bw_cb(order)}]]}
+        return f"{head} — {total} file\n\n{ask}", {"inline_keyboard": kb}
+    q = _bw_query(kind, lang, subj)
+    total = count_rows("books", q)
+    per = 10
+    pages = max(1, (total + per - 1) // per)
+    page = max(1, min(page, pages))
+    rows = supabase("books", "GET", query=f"?select=id,title,language,keywords{q}&order=title.asc&limit={per}&offset={(page - 1) * per}")
+    if not rows:
+        return head + "\n\nIs chunav me abhi koi file nahi.", {"inline_keyboard": [[{"text": "🔙 Shuru se", "callback_data": bw_cb(order)}]]}
+    kb = [[{"text": "📄 " + button_title(r), "callback_data": f"book:{r['id']}"}] for r in rows]
+    nav = []
+    if page > 1:
+        nav.append({"text": "⬅️", "callback_data": bw_cb(order, kind, lang, subj, page - 1)})
+    if page < pages:
+        nav.append({"text": "➡️", "callback_data": bw_cb(order, kind, lang, subj, page + 1)})
+    if nav:
+        kb.append(nav)
+    kb.append([{"text": "🔙 Shuru se", "callback_data": bw_cb(order)}])
+    return f"{head} — {total} file (page {page}/{pages})\n\nJo chahiye us par tap karo 👇", {"inline_keyboard": kb}
+
+
+def browse_callback(query: Dict[str, Any], data: str, chat_id: int) -> None:
+    p = data.split(":")
+    if len(p) != 6:
+        show(chat_id, STALE_USER, None, query)
+        return
+    _, order, kind, lang, subj, page = p
+    ok = (order in ("k", "s") and (kind in KIND_LABEL or kind in ("-", "*")) and (lang in LANG_LABEL or lang in ("-", "*"))
+          and (subj in SUBJ_LABEL or subj in ("-", "*")) and page.isdigit())
+    if not ok:
+        show(chat_id, STALE_USER, None, query)
+        return
+    text, kb = browse_view(order, kind, lang, subj, int(page))
+    show(chat_id, text, kb, query, "HTML")
+
+
+S2_EXTRA_ALIASES = [
+    {"lucent", "ल्यूसेंट", "lusent"}, {"ncert", "एनसीईआरटी"}, {"polity", "rajniti", "राजनीति", "samvidhan", "constitution",
+    "संविधान", "राजव्यवस्था", "politics"}, {"economy", "economics", "eco", "arthshastra", "अर्थशास्त्र", "अर्थव्यवस्था"},
+    {"affairs", "अफेयर्स", "समसामयिकी"}, {"current", "करंट", "करेंट", "समसामयिकी"}, {"gk", "gs", "सामान्य ज्ञान", "general knowledge",
+    "general studies", "static gk", "सामान्य अध्ययन", "जीके"}, {"physics", "भौतिकी", "भौतिक विज्ञान"},
+    {"chemistry", "रसायन", "रसायन विज्ञान"}, {"biology", "जीव विज्ञान", "जीवविज्ञान"},
+]
+for _g in S2_EXTRA_ALIASES:
+    for _w in _g:
+        ALIASES[_w] = set(ALIASES.get(_w, set())) | _g
 
 
 if __name__ == "__main__":
