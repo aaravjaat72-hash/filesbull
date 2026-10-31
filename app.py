@@ -15752,6 +15752,50 @@ def webdiag() -> Any:
     _REQ_T0[0] = time.monotonic()
     op = request.args.get("op", "") or str(body.get("op") or "")
     out: Dict[str, Any] = {"ok": True, "op": op}
+    if op == "catalog":    # 🗂️ catalog read for the tagging pass (Oct 31): rows by id range, text cut short; no people
+        try:
+            after = int(request.args.get("after", "0") or 0)
+            lim = max(1, min(int(request.args.get("lim", "500") or 500), 1000))
+        except ValueError:
+            return jsonify({"ok": False, "error": "bad after/lim"}), 400
+        cols = "id,title,file_name,caption,keywords,language,status,file_size,mime_type,source_chat_title,created_at"
+        if request.args.get("text") == "1":
+            cols += ",content_text"
+        if has_category_col():
+            cols += ",category"
+        rows = supabase("books", "GET", query=f"?select={cols}&id=gt.{after}&order=id.asc&limit={lim}")
+        for r in rows:
+            if "content_text" in r:
+                r["content_text"] = str(r.get("content_text") or "")[:int(request.args.get("tl", "900") or 900)]
+            r["caption"] = str(r.get("caption") or "")[:500]
+        out.update({"rows": rows, "n": len(rows), "last": rows[-1]["id"] if rows else None, "category_col": has_category_col()})
+        return jsonify(out)
+    if op == "meta" and request.method == "POST":   # 🗂️ tagging pass: set title/language/keywords(/category) on given ids
+        items = body.get("rows") or []
+        dry = bool(body.get("dry"))
+        allowed = {"title", "language", "keywords"} | ({"category"} if has_category_col() else set())
+        clean = []
+        for it in items[:400]:
+            try:
+                bid = int(it.get("id"))
+            except Exception:
+                continue
+            patch = {k: v for k, v in it.items() if k in allowed and (v is None or isinstance(v, str))}
+            if patch.get("title") is not None and not str(patch["title"]).strip():
+                patch.pop("title")
+            if patch:
+                clean.append((bid, patch))
+        if dry:
+            out.update({"would": len(clean), "sample": [{"id": b, **p} for b, p in clean[:3]]})
+            return jsonify(out)
+
+        def _one(bid: int, patch: Dict[str, Any]) -> Any:
+            return lambda: supabase("books", "PATCH", payload=patch, query=f"?id=eq.{bid}")
+        res = par(*[_one(b, p) for b, p in clean]) if clean else []
+        bad = [clean[i][0] for i, r in enumerate(res) if isinstance(r, Exception) or not r]
+        books_changed()
+        out.update({"done": len(clean) - len(bad), "failed": bad[:50]})
+        return jsonify(out)
     if op == "book":       # a file by name: where it is now (no ids of people)
         q = re.sub(r"[^\w .-]", "", request.args.get("q", ""))[:60].strip()
         rows = supabase("books", "GET", query=f"?select=id,title,file_name,file_size,status,backup_chat_id,source_chat_title"
