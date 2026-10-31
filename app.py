@@ -15761,6 +15761,8 @@ def webdiag() -> Any:
         cols = "id,title,file_name,caption,keywords,language,status,file_size,mime_type,source_chat_title,created_at"
         if request.args.get("text") == "1":
             cols += ",content_text"
+        if request.args.get("fid") == "1":
+            cols += ",telegram_file_id"
         if has_category_col():
             cols += ",category"
         rows = supabase("books", "GET", query=f"?select={cols}&id=gt.{after}&order=id.asc&limit={lim}")
