@@ -88,6 +88,7 @@ CONFIG_VARS: List[tuple] = [
     ("OPENROUTER_API_KEY_2", "optional", "", True, "OpenRouter backup key"),
     ("NVIDIA_API_KEY", "optional", "", True, "AI — build.nvidia.com → Get API Key (also NVIDIA_API_KEY_2)"),
     ("NVIDIA_API_KEY_2", "optional", "", True, "NVIDIA backup key"),
+    ("BRAVE_API_KEY", "optional", "", True, "🔭 TG Finder web search — api.search.brave.com → API keys (free plan)"),
     ("OPENAI_API_KEY", "optional", "", True, "AI (paid) — platform.openai.com/api-keys"),
     ("OPENAI_MODEL", "optional", "gpt-5-mini", False, "OpenAI model"),
     ("AI_DAILY_PER_USER", "optional", "12", False, "AI chat calls per user per day"),
@@ -15807,6 +15808,15 @@ def webdiag() -> Any:
         out.update({"tgf": dict(st, res=st["res"][:40]), "screen": list(tgf_screen(st, 1)), "build": BUILD_ID
                     if "BUILD_ID" in globals() else None, "elapsed": round(req_elapsed(), 1)})
         return jsonify(out)
+    if op == "tgfidx":     # merge verified channels into the finder's index (POST rows [{u,t,d,n,k,ts}])
+        rows_i = [r for r in (body.get("rows") or []) if isinstance(r, dict) and r.get("u")]
+        rows_i = [dict(u=str(r["u"])[:32], t=str(r.get("t") or "")[:120], d=str(r.get("d") or "")[:300],
+                       n=r.get("n") if isinstance(r.get("n"), int) else None, k="g" if r.get("k") == "g" else "c",
+                       ts=int(r.get("ts") or time.time())) for r in rows_i
+                  if not TGF_PIRACY.search(f"{r.get('t', '')} {r.get('d', '')} {r.get('u', '')}")]
+        if rows_i:
+            tgf_index_save(rows_i)
+        return jsonify(dict(out, merged=len(rows_i), size=len(tgf_index())))
     if op == "tgfv":       # verify one name on its public t.me page
         return jsonify(dict(out, v=tgf_verify(request.args.get("u", ""))))
     if op == "s2":         # v25 asking search, dry: what the user would see for a text (+ the old search for comparison)
@@ -17587,6 +17597,7 @@ for _g in S2_EXTRA_ALIASES:
 from concurrent.futures import ThreadPoolExecutor  # noqa: E402
 
 TGF_PAGE = 8
+TGF_IDX_MAX = 4000
 TGF_BUDGET = 22.0
 TGF_MINS = [0, 10_000, 100_000, 1_000_000]
 TGF_MIN_LABEL = {0: "Sab", 10_000: "10K+", 100_000: "100K+", 1_000_000: "1M+"}
@@ -17691,8 +17702,8 @@ def tgf_index_save(found: List[Dict[str, Any]]) -> None:
     idx = tgf_index()
     for r in found:
         idx[r["u"].lower()] = [r["u"], r["t"], r["d"][:160], r["n"], r["k"], r["ts"]]
-    if len(idx) > 1500:
-        idx = dict(sorted(idx.items(), key=lambda kv: -(kv[1][3] or 0))[:1500])
+    if len(idx) > TGF_IDX_MAX:
+        idx = dict(sorted(idx.items(), key=lambda kv: -(kv[1][3] or 0))[:TGF_IDX_MAX])
     set_setting("tgf_idx", json.dumps(idx, ensure_ascii=False))
 
 
@@ -17737,6 +17748,29 @@ def tgf_ask(text: str) -> Dict[str, Any]:
             out["min"] = int(d["min_members"])
         if out["type"] == "a" and d.get("type") in ("channel", "group"):
             out["type"] = d["type"][0]
+    return out
+
+
+def tgf_web(words: List[str], topic: str) -> List[str]:
+    """Optional web search for t.me links: only when the owner has put a Brave Search API key (free tier: 2,000
+    searches a month at api.search.brave.com) into Vercel → Settings → Environment Variables as BRAVE_API_KEY."""
+    key = os.environ.get("BRAVE_API_KEY", "").strip()
+    if not key:
+        return []
+    q = "site:t.me " + " ".join((words or [])[:5] or [topic])
+    try:
+        req = urllib.request.Request("https://api.search.brave.com/res/v1/web/search?" +
+                                     urllib.parse.urlencode({"q": q, "count": 20}),
+                                     headers={"Accept": "application/json", "X-Subscription-Token": key})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read(400_000).decode("utf-8", "replace"))
+    except Exception:
+        return []
+    out: List[str] = []
+    for it in ((data.get("web") or {}).get("results") or []):
+        m = re.match(r"https?://t\.me/(?:s/)?([A-Za-z][A-Za-z0-9_]{4,31})", str(it.get("url") or ""))
+        if m and m.group(1).lower() not in [x.lower() for x in out]:
+            out.append(m.group(1))
     return out
 
 
@@ -17788,7 +17822,7 @@ def tgf_run(text: str, budget: float = TGF_BUDGET) -> Dict[str, Any]:
                 own.append(c["username"])
     except Exception:
         pass
-    for u in q["usernames"] + own[:20] + tgf_guesses(words):
+    for u in q["usernames"] + tgf_web(typed or words, q["topic"]) + own[:20] + tgf_guesses(words):
         if u and u.lower() not in [c.lower() for c in cands]:
             cands.append(u)
     found: Dict[str, Dict[str, Any]] = {}
@@ -17819,6 +17853,15 @@ def tgf_run(text: str, budget: float = TGF_BUDGET) -> Dict[str, Any]:
             snips[u.lower()] = p["snip"]
             more += p["links"]
         verify_many(more)
+    stale = [r["u"] for r in sorted(found.values(), key=lambda r: -(r["n"] or 0))
+             if rel_ok(r) and time.time() - (r.get("ts") or 0) > 7 * 86400][:16]
+    if stale and left() > 4:                       # index hits older than a week: fresh counts for what is shown first
+        with ThreadPoolExecutor(max_workers=16) as ex:
+            for u, r in zip(stale, ex.map(tgf_verify, stale)):
+                if r:
+                    found[r["u"].lower()] = r
+                else:
+                    found.pop(u.lower(), None)
     allv = list(found.values())
     rel = [r for r in allv if rel_ok(r)]
     bad = [r for r in rel if TGF_PIRACY.search(f"{r['t']} {r['d']} {r['u']}")]
@@ -17863,6 +17906,12 @@ def tgf_filter(st: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 def tgf_screen(st: Dict[str, Any], page: int = 1) -> Any:
     rows = tgf_filter(st)
+    near_note = ""
+    if not rows and st.get("res"):
+        t = st.get("type") or "a"
+        rows = [r for r in st["res"] if t == "a" or r.get("k") == t] or list(st["res"])
+        near_note = (f"ℹ️ {TGF_MIN_LABEL.get(int(st.get('min') or 0), '')} wale nahi mile — "
+                     f"sabse bade jo mile wo ye hain:")
     pages = max(1, (len(rows) + TGF_PAGE - 1) // TGF_PAGE)
     page = max(1, min(page, pages))
     chunk = rows[(page - 1) * TGF_PAGE: page * TGF_PAGE]
@@ -17870,7 +17919,7 @@ def tgf_screen(st: Dict[str, Any], page: int = 1) -> Any:
     head = (f"🔭 <b>TG Finder</b> · “{esc(st.get('q') or '')}”\n"
             f"<i>{len(rows)} mile · {TGF_MIN_LABEL.get(m, _tgf_n(m) + '+')} · {TGF_TYPE_LABEL.get(st.get('type') or 'a')}"
             f"{' · page ' + str(page) + '/' + str(pages) if pages > 1 else ''}</i>")
-    lines = [head, ""]
+    lines = [head, ""] + ([near_note, ""] if near_note else [])
     if not rows:
         lines.append("😕 Is filter me koi public channel / group nahi mila. Filter badlo ya dusre shabd likho.")
     for i, r in enumerate(chunk, (page - 1) * TGF_PAGE + 1):
