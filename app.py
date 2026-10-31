@@ -1922,7 +1922,8 @@ def admin_menu(user_id: Optional[int] = None) -> Dict[str, Any]:
         [{"text": "🔍 Admin: " + ("search cmd" if search_cmd_only(True) else "auto"), "callback_data": "ad:som"},
          {"text": "👥 Users: " + ("search cmd" if search_cmd_only(False) else "auto"), "callback_data": "ad:sum"}],
     ] + ([[{"text": agent_label(), "callback_data": "ad:agent"}],
-          [{"text": "✨ Animations: " + ("ON" if fx_on() else "OFF"), "callback_data": "ad:fx"}]]
+          [{"text": "✨ Animations: " + ("ON" if fx_on() else "OFF"), "callback_data": "ad:fx"}],
+          [{"text": "🔭 TG Finder", "callback_data": "ad:tgf"}]]
          if (user_id is None or is_owner(user_id)) else []) + [
         [{"text": "🔍 Search Menu", "callback_data": "ad:usermenu"}],
     ]}
@@ -2501,6 +2502,12 @@ def handle_admin_callback(query: Dict[str, Any], data: str, chat_id: int, user_i
               "admin_add_source": "ad:addsrc", "admin_report": "ad:report"}
     data = legacy.get(data, data)
     cmd = data[3:]
+    if cmd == "tgf" or cmd == "tgfx" or cmd.startswith("tgf:"):
+        if not is_owner(user_id):
+            show(chat_id, "⛔ 🔭 TG Finder sirf owner ke liye hai.", {"inline_keyboard": [BACK_ROW]}, query)
+            return
+        tgf_callback(query, cmd, chat_id, user_id)
+        return
     # the settings most admin screens read, fetched in ONE round trip (was one DB call each)
     if cmd in ("smode", "usermenu", "backup", "log", "logtest", "ainame", "cmdq") or cmd.startswith("cmdq:"):
         prefetch_settings([f"admsearch:{user_id}", f"pending:{user_id}", "log_chat_id", "backup_chat_id", "ai_naming",
@@ -5493,6 +5500,12 @@ def handle_private_message(message: Dict[str, Any]) -> None:
         if not command and hd_pending(user_id):
             hd_submit(message, user)
             return
+    if command in ("/admin", "/start", "/cancel") and is_subadmin(user_id):
+        try:
+            if (get_pending(user_id) or {}).get("a") == "tgf":
+                clear_pending(user_id)              # 🔭 TG Finder mode ends on /admin, /start, /cancel
+        except Exception:
+            pass
     if command and command not in USER_COMMANDS and not is_subadmin(user_id):
         send_text(chat_id, f"⛔ Ye command sirf admin ke liye hai.\nAapka Telegram ID: {user_id}")
         return
@@ -5520,6 +5533,11 @@ def handle_private_message(message: Dict[str, Any]) -> None:
         pending = get_pending(user_id)
         if pending and action is None and pending.get("a") in ("fxsticker", "fxdp") and fx_admin_input(message, user_id, pending):
             return
+        if pending and action is None and pending.get("a") == "tgf":
+            if is_owner(user_id):
+                tgf_chat(message, user_id)          # 🔭 TG Finder mode: his chat is a finder query
+                return
+            clear_pending(user_id)
         if pending and action is None and pending.get("a") in ("hdreply", "bcast"):
             if pending.get("a") == "hdreply":
                 hd_admin_reply(message, user_id, pending.get("x"))
@@ -5979,7 +5997,7 @@ CALLBACK_PATTERNS = [
     r"ad:files(:\d+)?", r"ad:fl:[0-9a-f]{4,16}:\d+", r"ad:f:\d+(:\d+)?(:[0-9a-f]{0,16})?", r"ad:fs:\d+",
     r"ad:fixn:\d+", r"ad:cmdq:[0-9a-f]{4,16}", r"ad:op:[nyspca]:[0-9a-f]{4,16}(:\d+)?",
     r"ad:rn:\d+", r"ad:mkreq:-?\d+", r"ad:keyadd:[a-z]+", r"ad:rtl:[a-z]", r"ad:rtord:[a-z]*", r"ad:rtos:[a-z]*",
-    r"ad:rtm:[a-z]", r"ad:rtms:[a-z]:(a|\d+)",
+    r"ad:rtm:[a-z]", r"ad:rtms:[a-z]:(a|\d+)", r"ad:tgf", r"ad:tgfx", r"ad:tgf:[mtp]:[a-z0-9]{1,4}",
     r"ad:(y:)?(rmreq:-?\d+|rmsrc:-?\d+|rmadm:\d+|keyrm:[0-9a-f]{4,32}|fdel:\d+|backupoff|logoff|ublogout|ubdelin|ubdelal|ubdx:[a-z]+:-?\d+)",
     r"ad:(ub|ublogin|ubrun|ubpause|ubbf|ubbfp|ubrv|ubsetin|ubsetal)", r"ad:ubbfs:-?\d+", r"ad:ubrv:\d+", r"ad:ubrf:\d+",
     r"ad:ubst:[a-z]+", r"ad:ubdl:[a-z]+",
@@ -15781,6 +15799,16 @@ def webdiag() -> Any:
     _REQ_T0[0] = time.monotonic()
     op = request.args.get("op", "") or str(body.get("op") or "")
     out: Dict[str, Any] = {"ok": True, "op": op}
+    if op == "tgf":        # 🔭 TG Finder dry run (no index write when save=0): what the owner would get for a chat
+        txt_t = request.args.get("q", "")[:300]
+        st = tgf_run(txt_t, float(request.args.get("budget", TGF_BUDGET) or TGF_BUDGET))
+        if request.args.get("min"):
+            st["min"] = int(request.args.get("min") or 0)
+        out.update({"tgf": dict(st, res=st["res"][:40]), "screen": list(tgf_screen(st, 1)), "build": BUILD_ID
+                    if "BUILD_ID" in globals() else None, "elapsed": round(req_elapsed(), 1)})
+        return jsonify(out)
+    if op == "tgfv":       # verify one name on its public t.me page
+        return jsonify(dict(out, v=tgf_verify(request.args.get("u", ""))))
     if op == "s2":         # v25 asking search, dry: what the user would see for a text (+ the old search for comparison)
         txt_s = request.args.get("q", "")[:200]
         u_s = understand(txt_s)
@@ -16729,7 +16757,17 @@ def lang_from_text(txt: Any, ocr: bool = False) -> Optional[str]:
             return "hi"
         if en_ok and lat_words > dev_words:
             return "en"
-        return "hi" if hi_ok else ("en" if en_ok else None)
+        if hi_ok or en_ok:
+            return "hi" if hi_ok else "en"
+        dc = len(re.findall(r"[\u0900-\u097F]", s))
+        lc = len(re.findall(r"[A-Za-z]", s))
+        if dc >= 200 and lc >= 200:
+            return "both"
+        if lc >= 600 and dc < 20:
+            return "en"
+        if dc >= 200 and lc < dc * 0.3:
+            return "hi"
+        return None
     d = len(re.findall(r"[\u0900-\u097F]", s))
     l_ = len(re.findall(r"[A-Za-z]", s))
     if d + l_ < 80:
@@ -16738,14 +16776,23 @@ def lang_from_text(txt: Any, ocr: bool = False) -> Optional[str]:
     e = len(_ENGW.findall(s))
     if k >= 6 and k > e:
         return "hi"
+    if len(_CHANAKYA.findall(s)) >= 6 and len(_CHANAKYA.findall(s)) > e:      # Chanakya / DevLys font ("keâ", "efJe")
+        return "hi"
     ratio = d / (d + l_)
     if ratio >= 0.6:
         return "hi"
     if ratio <= 0.12:
-        return "en" if e >= 3 else None
+        return "en" if (e >= 3 or (d == 0 and l_ >= 600)) else None
     if d >= 150 and l_ >= 150 and e >= 5:
         return "both"
-    return "hi" if ratio > 0.4 else None
+    if ratio > 0.4:
+        return "hi"
+    if d >= 40 and l_ >= 40:
+        return "both"                   # a Hindi line beside an English one ("Which of … ? निम्नलिखित में से …")
+    return None
+
+
+_CHANAKYA = re.compile(r"keâ|efJe|Ùee|ceW|meW|Deewj|nesles|DeeÙe|hej|Øe")
 
 
 def row_lang(row: Dict[str, Any]) -> str:
@@ -17523,6 +17570,420 @@ for _g in S2_EXTRA_ALIASES:
     for _w in _g:
         ALIASES[_w] = set(ALIASES.get(_w, set())) | _g
 
+
+
+# ================================================================ 🔭 TG Finder (Aarav 5:19 PM IST Oct 31 2026)
+# "public groups find kre jaise 1m users vale … bot ke ander bot" — OWNER-ONLY mode under ⚙️ Admin Panel → 🔭 TG Finder.
+# The owner chats ("SSC GD notes wale bade channel", "1M+ study groups") → PUBLIC Telegram channels / groups on that topic,
+# sorted by size. Bot API + public t.me pages only (never a user session). Discovery, in order:
+#   1. the AI (the live AI router — NVIDIA first when its key is there) turns the chat into search words + the public
+#      @usernames it knows for that topic, 2. rule-based guesses from the words (sscgd, ssc_gd_notes …), 3. the finder's
+#   own growing index of every channel it has verified, 4. snowball: the newest posts (t.me/s/<name>) of the best hits
+#   mention / link more channels. EVERY candidate is verified on its public t.me/<name> page (title, description,
+#   subscribers / members); nothing unverified is shown. Free web search engines refuse servers (captcha / 403,
+#   checked Oct 31), so they are not used. Channels advertising piracy (leaked / "paid course free", movies, mod apk)
+#   or adult / betting content are dropped and counted.
+
+from concurrent.futures import ThreadPoolExecutor  # noqa: E402
+
+TGF_PAGE = 8
+TGF_BUDGET = 22.0
+TGF_MINS = [0, 10_000, 100_000, 1_000_000]
+TGF_MIN_LABEL = {0: "Sab", 10_000: "10K+", 100_000: "100K+", 1_000_000: "1M+"}
+TGF_TYPE_LABEL = {"a": "Dono", "c": "📢 Channel", "g": "👥 Group"}
+TGF_PIRACY = re.compile(
+    r"paid\s*(?:courses?|batch(?:es)?|notes?|pdfs?|material|lectures?|videos?)\s*(?:free|for\s*free|muft|फ्री)|"
+    r"free\s*paid|all\s*paid\s*(?:courses?|batch(?:es)?)|paid\s*batch(?:es)?\s*(?:free|available)|\bleak(?:ed|s)?\b|"
+    r"\bcrack(?:ed|s)?\b|mod\s*apk|premium\s*(?:apk|free|unlocked)|\bhd\s*movies?|movies?\s*(?:download|hd|link)|"
+    r"new\s*movies?|web\s*series|netflix|prime\s*video|hotstar|\bott\b|torrent|pira(?:cy|ted|te)|"
+    r"\b18\s*\+|\badult\b|\bxxx\b|\bbetting\b|\bsatta\b|\bcasino\b|\bteen\s*patti\b", re.I)
+TGF_STOP = {"wale", "wala", "wali", "vale", "vala", "channel", "channels", "group", "groups", "telegram", "tg", "find",
+            "dhundo", "dhoondo", "dhundh", "batao", "chahiye", "chaiye", "do", "de", "dedo", "kr", "kro", "karo", "ke", "ki",
+            "ka", "me", "mein", "or", "aur", "jaise", "type", "public", "bade", "bada", "badi", "big", "large", "top",
+            "best", "popular", "users", "user", "members", "member", "subscribers", "subscriber", "wale", "k", "m",
+            "lakh", "million", "plus", "kaun", "kon", "se", "sabse", "jyada", "zyada", "list", "the", "for", "of",
+            "and", "a", "an", "with", "on", "in", "to", "hai", "hain", "mujhe", "muje", "bhi", "koi", "kuch", "acche",
+            "ache", "achhe", "naye", "new", "free", "1m", "10k", "100k", "1k"}
+TGF_SYS = (
+    "You help an admin find PUBLIC Telegram channels and groups. He writes in Hindi, Hinglish or English. "
+    "Reply with ONLY a JSON object: {\"topic\": short English topic, "
+    "\"words\": 3-8 lowercase words (English and Hinglish spellings) that appear in such channels' names or "
+    "descriptions, \"usernames\": up to 30 public Telegram usernames (without @) of real, popular channels or groups "
+    "on this topic that you are fairly sure exist, \"min_members\": a number when he asks for a size (\"1M wale\" -> "
+    "1000000, \"1 lakh+\" -> 100000) else null, \"type\": \"channel\" | \"group\" | \"any\"}. "
+    "Never include channels that share pirated / leaked paid courses, movies, cracked apps, adult or betting content.")
+TGF_SUM_SYS = (
+    "For each Telegram channel below write ONE short Hinglish line (max 12 words) saying what a member gets there "
+    "(e.g. \"SSC GD ke daily mock test aur GK quiz\"), using only its title, description and post snippet. "
+    "Reply with ONLY JSON: {\"s\": {\"<username>\": \"<line>\"}}.")
+
+
+def tgf_get(url: str, timeout: float = 6.0) -> str:
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read(600_000).decode("utf-8", "replace")
+
+
+def _tgf_num(s: str) -> Optional[int]:
+    s = (s or "").strip().lower().replace(",", "").replace("\u00a0", " ")
+    if s == "no" or s.startswith("no "):
+        return 0
+    m = re.match(r"([\d ]+(?:\.\d+)?)\s*([km])?\b", s)
+    if not m:
+        return None
+    try:
+        n = float(m.group(1).replace(" ", ""))
+    except ValueError:
+        return None
+    return int(n * {"k": 1_000, "m": 1_000_000}.get(m.group(2) or "", 1))
+
+
+def tgf_verify(u: str) -> Optional[Dict[str, Any]]:
+    """The public t.me/<name> page: a channel shows "N subscribers", a group "N members, M online". Users, bots
+    and missing names show neither → None."""
+    u = (u or "").strip().lstrip("@")
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,31}", u):
+        return None
+    try:
+        h = tgf_get(f"https://t.me/{u}", 6)
+    except Exception:
+        return None
+    g = lambda p: html.unescape((re.search(p, h, re.S) or [None, ""])[1] or "")
+    extra = re.sub(r"<[^>]+>", " ", g(r'<div class="tgme_page_extra">\s*(.*?)\s*</div>'))
+    if not re.search(r"subscriber|member", extra, re.I):
+        return None
+    title = g(r'<meta property="og:title" content="([^"]*)"')
+    desc = g(r'<meta property="og:description" content="([^"]*)"')
+    kind = "c" if re.search(r"subscriber", extra, re.I) else "g"
+    members = _tgf_num(extra.split(",")[0].replace("subscribers", "").replace("subscriber", "")
+                       .replace("members", "").replace("member", ""))
+    return {"u": u, "t": title[:120], "d": re.sub(r"\s+", " ", desc)[:300], "n": members, "k": kind, "ts": int(time.time())}
+
+
+def tgf_posts(u: str) -> Dict[str, Any]:
+    """Newest public posts (t.me/s/<name>): other channels they link / mention + a text snippet."""
+    try:
+        h = tgf_get(f"https://t.me/s/{u}", 6)
+    except Exception:
+        return {"links": [], "snip": ""}
+    links = re.findall(r"t\.me/(?!s/|joinchat|\+|c/|share|addstickers|addemoji|iv\?|proxy)([A-Za-z][A-Za-z0-9_]{4,31})", h)
+    txt = re.sub(r"<[^>]+>", " ", " ".join(re.findall(r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', h, re.S)[-6:]))
+    ments = re.findall(r"(?<![\w/])@([A-Za-z][A-Za-z0-9_]{4,31})", txt)
+    seen, out = set(), []
+    for x in links + ments:
+        lx = x.lower()
+        if lx != u.lower() and lx not in seen and not lx.endswith("bot"):
+            seen.add(lx)
+            out.append(x)
+    return {"links": out[:40], "snip": re.sub(r"\s+", " ", html.unescape(txt))[-400:]}
+
+
+def tgf_index() -> Dict[str, Any]:
+    try:
+        return json.loads(get_setting("tgf_idx") or "{}")
+    except Exception:
+        return {}
+
+
+def tgf_index_save(found: List[Dict[str, Any]]) -> None:
+    idx = tgf_index()
+    for r in found:
+        idx[r["u"].lower()] = [r["u"], r["t"], r["d"][:160], r["n"], r["k"], r["ts"]]
+    if len(idx) > 1500:
+        idx = dict(sorted(idx.items(), key=lambda kv: -(kv[1][3] or 0))[:1500])
+    set_setting("tgf_idx", json.dumps(idx, ensure_ascii=False))
+
+
+def tgf_words(text: str) -> List[str]:
+    out: List[str] = []
+    for w in tokenize(text):
+        if w in TGF_STOP or (w.isdigit() and len(w) < 3) or len(w) < 2:
+            continue
+        if w not in out:
+            out.append(w)
+    return out[:8]
+
+
+def tgf_ask(text: str) -> Dict[str, Any]:
+    """Chat → {words, usernames, min, type}. AI first (NVIDIA when its key is there), rules always."""
+    low = (text or "").lower()
+    minm = None
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(m|million|k|lakh|lac|l)\b", low)
+    if m:
+        n = float(m.group(1))
+        minm = int(n * {"m": 1e6, "million": 1e6, "k": 1e3, "lakh": 1e5, "lac": 1e5, "l": 1e5}[m.group(2)])
+    typ = "g" if re.search(r"\bgroups?\b|ग्रुप", low) and not re.search(r"\bchannels?\b|चैनल", low) else (
+        "c" if re.search(r"\bchannels?\b|चैनल", low) and not re.search(r"\bgroups?\b", low) else "a")
+    words = tgf_words(text)
+    out = {"words": list(words), "usernames": [], "min": minm, "type": typ, "ai": None, "topic": " ".join(words)}
+    try:
+        only = "nvidia" if provider_keys("nvidia") else None
+        raw = ai_complete(TGF_SYS, text[:400], max_tokens=700, cap=8.0, want_json=True, only=only) or (
+            ai_complete(TGF_SYS, text[:400], max_tokens=700, cap=5.0, want_json=True) if only else None)
+        d = json.loads(raw) if raw else None
+    except Exception:
+        d = None
+    if isinstance(d, dict):
+        out["ai"] = (_AI_LAST.get("p") if isinstance(_AI_LAST, dict) else None) or "ai"
+        for w in d.get("words") or []:
+            for t in tokenize(str(w)):
+                if t not in out["words"] and t not in TGF_STOP and len(t) >= 2:
+                    out["words"].append(t)
+        out["usernames"] = [str(x).strip().lstrip("@").split("/")[-1] for x in (d.get("usernames") or [])][:30]
+        out["topic"] = str(d.get("topic") or out["topic"])[:60]
+        if out["min"] is None and isinstance(d.get("min_members"), (int, float)) and d["min_members"] > 0:
+            out["min"] = int(d["min_members"])
+        if out["type"] == "a" and d.get("type") in ("channel", "group"):
+            out["type"] = d["type"][0]
+    return out
+
+
+def tgf_guesses(words: List[str]) -> List[str]:
+    w = [x for x in words if re.fullmatch(r"[a-z0-9]+", x)][:4]
+    out: List[str] = []
+    bases = []
+    if len(w) >= 2:
+        bases += [w[0] + w[1], w[0] + "_" + w[1]]
+    if len(w) >= 3:
+        bases += [w[0] + w[1] + w[2], "_".join(w[:3])]
+    bases += [x for x in w if len(x) >= 5]
+    for b in bases:
+        for suf in ("", "_official", "official", "_notes", "notes", "pdf", "_pdf", "exam", "_exam", "2026", "_2026", "hindi",
+                    "group", "_group", "_channel", "channel", "_quiz", "quiz"):
+            x = b + suf
+            if 5 <= len(x) <= 32 and x not in out:
+                out.append(x)
+    return out[:45]
+
+
+def _tgf_hits(r: Dict[str, Any], words: List[str]) -> int:
+    """Whole words in the title / description; inside the @name too (names are glued: sscgdexam)."""
+    toks = set(re.findall(r"[a-z0-9]+|[\u0900-\u097F]+", normalize(f"{r.get('t', '')} {r.get('d', '')} {r.get('u', '').replace('_', ' ')}")))
+    uname = (r.get("u") or "").lower()
+    return sum(1 for w in words if w and (w in toks or (len(w) >= 2 and w in uname)))
+
+
+def tgf_relevant(r: Dict[str, Any], typed: List[str], extra: List[str]) -> bool:
+    ht = _tgf_hits(r, typed)
+    if not typed:
+        return _tgf_hits(r, extra) >= 1
+    return ht >= min(2, len(typed)) or (ht >= 1 and _tgf_hits(r, [w for w in extra if w not in typed]) >= 1)
+
+
+def tgf_run(text: str, budget: float = TGF_BUDGET) -> Dict[str, Any]:
+    t0 = time.monotonic()
+    left = lambda: budget - (time.monotonic() - t0)
+    q = tgf_ask(text)
+    words = q["words"]
+    typed = tgf_words(text)
+    rel_ok = lambda r: tgf_relevant(r, typed, words)
+    idx = tgf_index()
+    cands: List[str] = []
+    own: List[str] = []
+    try:                                           # the bot's own public source / join channels on the topic
+        for c in supabase("channels", "GET", query="?select=username,title&username=not.is.null&limit=1000") or []:
+            if c.get("username") and _tgf_hits({"u": c["username"], "t": c.get("title") or "", "d": ""}, typed):
+                own.append(c["username"])
+    except Exception:
+        pass
+    for u in q["usernames"] + own[:20] + tgf_guesses(words):
+        if u and u.lower() not in [c.lower() for c in cands]:
+            cands.append(u)
+    found: Dict[str, Dict[str, Any]] = {}
+    for key, v in idx.items():                     # 3. the finder's own index
+        r = {"u": v[0], "t": v[1], "d": v[2], "n": v[3], "k": v[4], "ts": v[5]}
+        if rel_ok(r):
+            found[key] = r
+    checked = set(found)
+
+    def verify_many(us: List[str]) -> None:
+        todo = [u for u in us if u.lower() not in checked][:60]
+        checked.update(u.lower() for u in todo)
+        if not todo or left() < 3:
+            return
+        with ThreadPoolExecutor(max_workers=16) as ex:
+            for r in ex.map(tgf_verify, todo):
+                if r:
+                    found[r["u"].lower()] = r
+    verify_many(cands)                                                       # 1 + 2
+    rel = sorted([r for r in found.values() if rel_ok(r)], key=lambda r: -(r["n"] or 0))
+    snips: Dict[str, str] = {}
+    if left() > 6 and rel:                                                   # 4. snowball from the best hits
+        seeds = [r["u"] for r in rel[:6]]
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            posts = list(ex.map(tgf_posts, seeds))
+        more: List[str] = []
+        for u, p in zip(seeds, posts):
+            snips[u.lower()] = p["snip"]
+            more += p["links"]
+        verify_many(more)
+    allv = list(found.values())
+    rel = [r for r in allv if rel_ok(r)]
+    bad = [r for r in rel if TGF_PIRACY.search(f"{r['t']} {r['d']} {r['u']}")]
+    rel = sorted([r for r in rel if r not in bad], key=lambda r: (-(r["n"] or 0), r["u"].lower()))
+    try:
+        tgf_index_save([r for r in allv if not TGF_PIRACY.search(f"{r['t']} {r['d']} {r['u']}")])
+    except Exception:
+        log_error("tgf index")
+    # one AI line per top hit: "yaha kya milega"
+    sums: Dict[str, str] = {}
+    if rel and left() > 5:
+        try:
+            items = [{"u": r["u"], "title": r["t"], "desc": r["d"][:200], "posts": snips.get(r["u"].lower(), "")[:200]}
+                     for r in rel[:12]]
+            raw = ai_complete(TGF_SUM_SYS, json.dumps(items, ensure_ascii=False), max_tokens=700,
+                              cap=min(8.0, left() - 1), want_json=True)
+            d = json.loads(raw) if raw else {}
+            for k, v in (d.get("s") or {}).items():
+                sums[str(k).lstrip("@").lower()] = str(v)[:90]
+        except Exception:
+            pass
+    for r in rel:
+        r["s"] = sums.get(r["u"].lower()) or ""
+    return {"q": text[:120], "topic": q["topic"], "words": words, "min": q["min"] or 0, "type": q["type"], "ai": q["ai"],
+            "res": rel[:120], "hidden": len(bad), "checked": len(checked), "secs": round(time.monotonic() - t0, 1)}
+
+
+def _tgf_n(n: Optional[int]) -> str:
+    if n is None:
+        return "members: pata nahi"
+    if n >= 1_000_000:
+        return f"{n / 1e6:.1f}M".replace(".0M", "M")
+    if n >= 1_000:
+        return f"{n / 1e3:.1f}K".replace(".0K", "K")
+    return str(n)
+
+
+def tgf_filter(st: Dict[str, Any]) -> List[Dict[str, Any]]:
+    m, t = int(st.get("min") or 0), st.get("type") or "a"
+    return [r for r in st.get("res") or [] if (r.get("n") or 0) >= m and (t == "a" or r.get("k") == t)]
+
+
+def tgf_screen(st: Dict[str, Any], page: int = 1) -> Any:
+    rows = tgf_filter(st)
+    pages = max(1, (len(rows) + TGF_PAGE - 1) // TGF_PAGE)
+    page = max(1, min(page, pages))
+    chunk = rows[(page - 1) * TGF_PAGE: page * TGF_PAGE]
+    m = int(st.get("min") or 0)
+    head = (f"🔭 <b>TG Finder</b> · “{esc(st.get('q') or '')}”\n"
+            f"<i>{len(rows)} mile · {TGF_MIN_LABEL.get(m, _tgf_n(m) + '+')} · {TGF_TYPE_LABEL.get(st.get('type') or 'a')}"
+            f"{' · page ' + str(page) + '/' + str(pages) if pages > 1 else ''}</i>")
+    lines = [head, ""]
+    if not rows:
+        lines.append("😕 Is filter me koi public channel / group nahi mila. Filter badlo ya dusre shabd likho.")
+    for i, r in enumerate(chunk, (page - 1) * TGF_PAGE + 1):
+        icon = "📢" if r.get("k") == "c" else "👥"
+        unit = "subscribers" if r.get("k") == "c" else "members"
+        n = r.get("n")
+        lines.append(f"{i}. {icon} <b>{esc(r.get('t') or r['u'])}</b> — {_tgf_n(n)}{'' if n is None else ' ' + unit}")
+        lines.append(f"   🔗 t.me/{esc(r['u'])}")
+        about = r.get("s") or (r.get("d") or "")[:90]
+        if about:
+            lines.append(f"   💬 {esc(about)}")
+    if st.get("hidden"):
+        lines.append(f"\n🚫 {st['hidden']} channel piracy / adult / betting jaise lage — hata diye.")
+    if st.get("ai") is None:
+        lines.append("\n<i>AI se baat nahi hui — sirf shabdon se dhoondha.</i>")
+    kb = [[{"text": ("✅ " if m == x else "") + TGF_MIN_LABEL[x], "callback_data": f"ad:tgf:m:{i}"} for i, x in enumerate(TGF_MINS)],
+          [{"text": ("✅ " if (st.get("type") or "a") == k else "") + v, "callback_data": f"ad:tgf:t:{k}"}
+           for k, v in TGF_TYPE_LABEL.items()]]
+    nav = []
+    if page > 1:
+        nav.append({"text": "⬅️", "callback_data": f"ad:tgf:p:{page - 1}"})
+    if page < pages:
+        nav.append({"text": f"➡️ More ({len(rows) - page * TGF_PAGE})", "callback_data": f"ad:tgf:p:{page + 1}"})
+    if nav:
+        kb.append(nav)
+    kb.append([{"text": "❌ Finder band", "callback_data": "ad:tgfx"}, {"text": "🔙 Admin Panel", "callback_data": "ad:panel"}])
+    return "\n".join(lines), {"inline_keyboard": kb}
+
+
+TGF_INTRO = ("🔭 <b>TG Finder</b> — bot ke andar bot\n\n"
+             "Bas likho kaun se public channel / group chahiye, jaise:\n"
+             "• <i>SSC GD notes wale bade channel</i>\n• <i>1M+ wale study groups</i>\n• <i>cricket news channel</i>\n\n"
+             "Main public Telegram channels / groups dhoondh ke size ke hisaab se list dunga (subscribers / members ke "
+             "saath). Piracy / adult / betting wale hata deta hu.\n\n<i>Finder ON hai — band karne ke liye ❌ dabao.</i>")
+
+
+def tgf_state(user_id: int) -> Dict[str, Any]:
+    try:
+        return json.loads(get_setting(f"tgf_last:{user_id}") or "{}")
+    except Exception:
+        return {}
+
+
+def tgf_open(chat_id: int, user_id: int, query: Optional[Dict[str, Any]] = None) -> None:
+    set_pending(user_id, "tgf")
+    show(chat_id, TGF_INTRO, {"inline_keyboard": [[{"text": "❌ Finder band", "callback_data": "ad:tgfx"},
+                                                   {"text": "🔙 Admin Panel", "callback_data": "ad:panel"}]]}, query, "HTML")
+
+
+def tgf_chat(message: Dict[str, Any], user_id: int) -> None:
+    chat_id = message["chat"]["id"]
+    text = (message.get("text") or "").strip()
+    if re.fullmatch(r"(?i)\s*(band|bnd|exit|stop|bas|close|khatam)\s*(karo|kro|kr|do)?\s*", text or ""):
+        clear_pending(user_id)
+        send_text(chat_id, "🔭 Finder band. ⚙️ /admin se wapas khol sakte ho.")
+        return
+    set_pending(user_id, "tgf")                     # stays on while he chats (15 min after the last message)
+    if not text:
+        send_text(chat_id, "🔭 Likh ke batao kaun se channel / group chahiye.")
+        return
+    msg = send_text(chat_id, f"🔭 “{esc(text[:80])}” — public channels dhoondh raha hu… (10-20 sec)", None, "HTML")
+    mid = ((msg or {}).get("result") or {}).get("message_id")
+    try:
+        st = tgf_run(text)
+    except Exception:
+        log_error("tgf_run")
+        st = None
+    if not st:
+        send_text(chat_id, "❌ Abhi dhoondh nahi paya — thodi der baad dobara likho.")
+        return
+    try:
+        set_setting(f"tgf_last:{user_id}", json.dumps(st, ensure_ascii=False))
+    except Exception:
+        log_error("tgf save")
+    txt, kb = tgf_screen(st, 1)
+    if mid:
+        try:
+            telegram("editMessageText", {"chat_id": chat_id, "message_id": mid, "text": txt, "parse_mode": "HTML",
+                                         "reply_markup": kb, "disable_web_page_preview": True})
+            return
+        except Exception:
+            pass
+    send_text(chat_id, txt, kb, "HTML")
+
+
+def tgf_callback(query: Dict[str, Any], cmd: str, chat_id: int, user_id: int) -> None:
+    if cmd == "tgfx":
+        clear_pending(user_id)
+        show(chat_id, "🔭 Finder band.", {"inline_keyboard": [BACK_ROW]}, query)
+        return
+    if cmd == "tgf":
+        tgf_open(chat_id, user_id, query)
+        return
+    st = tgf_state(user_id)
+    if not st.get("res") and not st.get("q"):
+        tgf_open(chat_id, user_id, query)
+        return
+    _, k, v = (cmd.split(":") + ["", ""])[:3]
+    page = 1
+    if k == "m" and v.isdigit() and int(v) < len(TGF_MINS):
+        st["min"] = TGF_MINS[int(v)]
+    elif k == "t" and v in TGF_TYPE_LABEL:
+        st["type"] = v
+    elif k == "p" and v.isdigit():
+        page = int(v)
+    if k in ("m", "t"):
+        try:
+            set_setting(f"tgf_last:{user_id}", json.dumps(st, ensure_ascii=False))
+        except Exception:
+            log_error("tgf save")
+    set_pending(user_id, "tgf")
+    txt, kb = tgf_screen(st, page)
+    show(chat_id, txt, kb, query, "HTML")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
