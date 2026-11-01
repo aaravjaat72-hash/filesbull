@@ -4788,6 +4788,7 @@ def index_review(record: Dict[str, Any], from_chat: Any, message_id: Any, where:
             log_error("catmap")
     if retry:
         queue_name_retry(book_id)          # the AI is retried when it is back; success → Inbox → settles into Backup
+    langq_add(book_id, record)              # 🏷️ language still unknown → auto-reader (keepalive / OCR Action)
     try:
         count_named_by(how)
     except Exception:
@@ -4844,6 +4845,7 @@ def index_file(record: Dict[str, Any], from_chat: Any, message_id: Any, where: s
             log_error("catmap")
     if record.pop("_retry", None):
         queue_name_retry(book_id)
+    langq_add(book_id, record)          # 🏷️ language still unknown → auto-reader (keepalive / OCR Action), never in this reply
     if how != "kept":
         try:
             count_named_by(how)
@@ -8004,7 +8006,7 @@ def health() -> Any:
     _REQ.clear()
     try:
         # the settings the keepalive work below reads, in one round trip
-        prefetch_settings(["webhook_fp", "commands_fp", "ainame_queue", "logfill_state", BIG_QUEUE_KEY, ROUTER_KEY, "ai_keys",
+        prefetch_settings(["webhook_fp", "commands_fp", "ainame_queue", "langq", "langq_kick", "logfill_state", BIG_QUEUE_KEY, ROUTER_KEY, "ai_keys",
                            "webq", "webbigq", "upl:bucket", "upl:sweep", "upl:pw", "webbig_kick", "gh:botvar", "diag_sha"])
     except Exception:
         pass
@@ -8022,6 +8024,14 @@ def health() -> Any:
     except Exception as exc:
         log_error("name_queue")
         names = {"error": type(exc).__name__}
+    try:
+        if req_elapsed() < 5.0:
+            langs = process_lang_queue(budget=max(1.0, min(4.0, 8.0 - req_elapsed())))   # 🏷️ auto-reader
+        else:
+            langs = {"skipped": "time"}
+    except Exception as exc:
+        log_error("lang_queue")
+        langs = {"error": type(exc).__name__}
     try:
         flush_logs()        # ✏️ renames done by the retry go to the log too
     except Exception:
@@ -8061,6 +8071,10 @@ def health() -> Any:
     status["webhook_registered"] = registered
     status["self_heal"] = heal
     status["ai_name_retry"] = names
+    try:
+        status["auto_reader"] = dict(langq_status(), last=langs)
+    except Exception:
+        status["auto_reader"] = {"last": langs}
     try:
         status["animations"] = dict({"mode": "on" if fx_on() else "off"}, **FX_STATS)
     except Exception:
@@ -12272,6 +12286,7 @@ def ub_catalog(record: Dict[str, Any], where: str) -> str:
             save_categories({int(book_id): slug})
         except Exception:
             log_error("catmap")
+    langq_add(book_id, record)          # 🏷️ language still unknown → auto-reader (keepalive / OCR Action)
     if how not in ("kept",):
         try:
             count_named_by(how)
@@ -16998,6 +17013,260 @@ def tag_record(record: Dict[str, Any], text: str = "") -> None:
             record["title"] = tagged_title(record["title"], lang)[:500]
     except Exception:
         log_error("tag_record")
+
+
+
+# ---- 🏷️ AUTO-READER for new files (Aarav, Nov 1 2026 7:25 AM IST: "isme new files ke liye ek auto reader lga dena")
+# Every new file already gets tag_record() at save time (name/caption → page-1 text layer when small and time allows).
+# A file whose language is still unknown goes to bot_settings "langq" and is read later, never inside a user's reply:
+#   1. keepalive (GET /, every 5–10 min): files ≤ 8 MB → download, text layer of up to 8 pages (no OCR on Vercel);
+#   2. still unknown / scanned / 8–20 MB → the GitHub Action langread.yml (OCR with tesseract hin+eng, 2 pages) asks for
+#      work at POST /api/langread-job (GitHub OIDC of this repo's workflow on main), reports text to /api/langread-done
+#      signed with a one-batch HMAC key; the bot itself decides the language from that text (lang_from_text).
+# Found → name gets [हिंदी] / [English] / [हिंदी + English], keywords lang_/kind_/subj_ updated. Not found after the OCR
+# try (or > 20 MB, which bots can't download) → stays [भाषा अज्ञात]. Nothing is deleted; file ids never change.
+LANGQ_KEY = "langq"
+LANGQ_MAX = 800
+LANGQ_TRIES = 2
+LANGQ_STALE_SEC = 30 * 60
+LANGQ_INLINE_MAX = 8 * 1024 * 1024
+LANG_WORKFLOW = "langread.yml"
+OIDC_AUD_LANG = "filesbull-langread"
+_LANGQ_MIME = re.compile(r"pdf|word|officedocument|text/|image/(?:jpe?g|png|webp)", re.I)
+
+
+def langq_load() -> List[Dict[str, Any]]:
+    try:
+        q = json.loads(get_setting(LANGQ_KEY) or "[]")
+        return q if isinstance(q, list) else []
+    except Exception:
+        return []
+
+
+def langq_save(q: List[Dict[str, Any]]) -> None:
+    set_setting(LANGQ_KEY, json.dumps(q[-LANGQ_MAX:], separators=(",", ":")))
+
+
+def langq_add(book_id: Any, record: Dict[str, Any]) -> bool:
+    """Queue a just-saved file whose language is still unknown (≤ 20 MB, a readable type). Never raises."""
+    try:
+        if not book_id or str(record.get("language") or "unk") != "unk" or not record.get("telegram_file_id"):
+            return False
+        size = int(record.get("file_size") or 0)
+        name = str(record.get("file_name") or "")
+        if size > TG_FILE_LIMIT or not (_LANGQ_MIME.search(str(record.get("mime_type") or "")) or
+                                         re.search(r"\.(?:pdf|docx?|pptx|txt|jpe?g|png)$", name, re.I)):
+            return False
+        q = langq_load()
+        if any(int(x.get("id") or 0) == int(book_id) for x in q):
+            return False
+        q.append({"id": int(book_id), "st": "text" if size <= LANGQ_INLINE_MAX else "ocr", "n": 0, "t": int(time.time())})
+        langq_save(q)
+        return True
+    except Exception:
+        log_error("langq_add")
+        return False
+
+
+def lang_apply(row: Dict[str, Any], lang: str, text: str = "", how: str = "auto") -> bool:
+    """Write a found language into the file's name + tags (DB only; the file and its ids stay as they are)."""
+    if lang not in ("hi", "en", "both"):
+        return False
+    title = tagged_title(row.get("title") or "", lang)[:500]
+    kind = kind_of(row.get("title"), row.get("file_name"), row.get("caption"), None, row.get("file_size"))
+    subj = subj_of(row.get("title"), row.get("file_name"), row.get("caption"), text or str(row.get("content_text") or ""))
+    patch = {"title": title, "language": lang, "keywords": with_facets(row.get("keywords"), lang, kind, subj)}
+    supabase("books", "PATCH", patch, f"?id=eq.{int(row['id'])}")
+    books_changed()
+    try:
+        rename_log([[int(row["id"]), row.get("title"), title]], f"🏷️ Auto-reader ({how}): bhasha mili")
+    except Exception:
+        pass
+    return True
+
+
+def _langq_rows(ids: List[int]) -> Dict[int, Dict[str, Any]]:
+    if not ids:
+        return {}
+    cols = "id,title,file_name,caption,keywords,language,telegram_file_id,file_size,mime_type,content_text,status"
+    return {int(r["id"]): r for r in supabase("books", "GET", query=f"?id=in.({','.join(str(int(i)) for i in ids)})&select={cols}")}
+
+
+def process_lang_queue(budget: float = 4.0, max_items: int = 2) -> Dict[str, Any]:
+    """Keepalive step: text-layer read of queued small files; the rest is left for the OCR Action (dispatched here)."""
+    stats: Dict[str, Any] = {"found": 0, "to_ocr": 0, "left": 0}
+    q = langq_load()
+    if not q:
+        return stats
+    t0 = time.monotonic()
+    now = time.time()
+    changed = False
+    for x in q:                       # an OCR batch that never reported → back in line (counts as a try)
+        if x.get("st") == "run" and now - float(x.get("ct") or 0) > LANGQ_STALE_SEC:
+            x["st"], x["n"], changed = "ocr", int(x.get("n") or 0) + 1, True
+    drop = {int(x["id"]) for x in q if int(x.get("n") or 0) >= LANGQ_TRIES}
+    todo = [x for x in q if x.get("st") == "text" and int(x["id"]) not in drop][:max_items]
+    rows = _langq_rows([int(x["id"]) for x in todo]) if todo else {}
+    for x in todo:
+        if time.monotonic() - t0 > budget:
+            break
+        changed = True
+        row = rows.get(int(x["id"]))
+        if not row or row_lang(row) != "unk":
+            drop.add(int(x["id"]))
+            continue
+        lang, body = None, ""
+        try:
+            data = download_file(row.get("telegram_file_id"), row.get("file_size"))
+            if data:
+                parts = []
+                for p in iter_pages(data, str(row.get("file_name") or ""), str(row.get("mime_type") or ""), 8):
+                    parts.append(str(p))
+                    if time.monotonic() - t0 > budget:
+                        break
+                body = "\n".join(parts)
+                lang = lang_from_text(body)
+        except Exception:
+            lang = None
+        if lang and lang_apply(row, lang, body, "text"):
+            stats["found"] += 1
+            drop.add(int(x["id"]))
+        else:
+            x["st"] = "ocr"
+            stats["to_ocr"] += 1
+    if drop:
+        q = [x for x in q if int(x["id"]) not in drop]
+        changed = True
+    if changed:
+        langq_save(q)
+    stats["left"] = len(q)
+    if any(x.get("st") == "ocr" for x in q):
+        stats["dispatch"] = langread_dispatch()
+    return stats
+
+
+def langread_dispatch() -> str:
+    """Start the OCR Action now (at most every 10 min). 'dispatched' | 'recent' | 'no_token' | 'error: …'."""
+    if not GH_DISPATCH_TOKEN:
+        return "no_token"
+    try:
+        last = float(get_setting("langq_kick") or 0)
+    except Exception:
+        last = 0.0
+    if time.time() - last < 600:
+        return "recent"
+    set_setting("langq_kick", str(int(time.time())))
+    if _DIAG["dry"]:
+        _DIAG["sent"].append({"ms": 0, "m": "langread_dispatch"})
+        return "dispatched"
+    url = f"https://api.github.com/repos/{GH_REPO}/actions/workflows/{LANG_WORKFLOW}/dispatches"
+    body = json.dumps({"ref": GH_BRANCH, "inputs": {"bot_url": PUBLIC_HOME.rstrip("/")}}).encode()
+    req = urllib.request.Request(url, data=body, method="POST", headers={
+        "Authorization": f"Bearer {GH_DISPATCH_TOKEN}", "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "filesbull-bot", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            return "dispatched" if resp.status in (200, 204) else f"error: HTTP {resp.status}"
+    except urllib.error.HTTPError as exc:
+        return _scrub(f"error: HTTP {exc.code}")[:120]
+    except Exception as exc:
+        return _scrub(f"error: {type(exc).__name__}")[:120]
+
+
+def lang_batch_key(batch: str) -> str:
+    master = os.environ.get("BIGFILE_SECRET", "").strip() or hashlib.sha256(f"filesbull-bigfile:{BOT_TOKEN}".encode()).hexdigest()
+    return hmac.new(master.encode(), f"langbatch:{batch}".encode(), hashlib.sha256).hexdigest()
+
+
+def langq_status() -> Dict[str, Any]:
+    cnt: Dict[str, int] = {}
+    for x in langq_load():
+        cnt[x.get("st", "?")] = cnt.get(x.get("st", "?"), 0) + 1
+    return {"queue": cnt, "ocr_trigger": "instant" if GH_DISPATCH_TOKEN else "schedule_30min"}
+
+
+@app.post("/api/langread-job")
+def langread_job_api() -> Any:
+    """The OCR Action asks for work. Auth: GitHub OIDC token of this repo's langread workflow on main."""
+    body = request.get_json(silent=True) or {}
+    try:
+        verify_oidc(str(body.get("oidc") or ""), LANG_WORKFLOW, OIDC_AUD_LANG)
+    except InputError as exc:
+        return jsonify({"ok": False, "error": "unauthorized", "why": str(exc)}), 401
+    except Exception as exc:
+        return jsonify({"ok": False, "error": "unauthorized", "why": type(exc).__name__}), 401
+    q = langq_load()
+    now = time.time()
+    for x in q:
+        if x.get("st") == "run" and now - float(x.get("ct") or 0) > LANGQ_STALE_SEC:
+            x["st"], x["n"] = "ocr", int(x.get("n") or 0) + 1
+    q = [x for x in q if int(x.get("n") or 0) < LANGQ_TRIES]
+    pick = [x for x in q if x.get("st") in ("ocr", "text")][:int(body.get("max") or 25)]
+    rows = _langq_rows([int(x["id"]) for x in pick])
+    batch = hashlib.sha1(os.urandom(12)).hexdigest()[:12]
+    items = []
+    for x in pick:
+        r = rows.get(int(x["id"]))
+        if not r or row_lang(r) != "unk":
+            x["st"] = "gone"
+            continue
+        x["st"], x["ct"], x["b"] = "run", int(now), batch
+        items.append({"id": int(r["id"]), "file_id": r.get("telegram_file_id"), "size": int(r.get("file_size") or 0),
+                      "mime": r.get("mime_type") or "", "file_name": r.get("file_name") or ""})
+    q = [x for x in q if x.get("st") != "gone"]
+    langq_save(q)
+    out: Dict[str, Any] = {"ok": True, "items": items}
+    if items:
+        out["batch"], out["k"] = batch, lang_batch_key(batch)
+        if not (body.get("has") or {}).get("bot_token") and BOT_TOKEN:
+            out["creds"] = {"bot_token": BOT_TOKEN}
+    flush_request()
+    return jsonify(out)
+
+
+@app.post("/api/langread-done")
+def langread_done_api() -> Any:
+    """The OCR Action reports text per file. Auth: X-Filesbull-Signature = HMAC-SHA256(batch key, raw body)."""
+    raw = request.get_data() or b""
+    try:
+        body = json.loads(raw.decode("utf-8") or "{}")
+    except Exception:
+        body = {}
+    batch = str(body.get("batch") or "")
+    sig = request.headers.get("X-Filesbull-Signature", "")
+    if not batch or not sig or not BOT_TOKEN or not hmac.compare_digest(sig, hmac.new(lang_batch_key(batch).encode(), raw, hashlib.sha256).hexdigest()):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    _REQ.clear()
+    q = langq_load()
+    mine = {int(x["id"]): x for x in q if x.get("b") == batch and x.get("st") == "run"}
+    got = {int(it.get("id") or 0): it for it in (body.get("items") or []) if int(it.get("id") or 0) in mine}
+    rows = _langq_rows(list(got))
+    res = {"found": 0, "unknown": 0}
+    done = set()
+    for bid, it in got.items():
+        row = rows.get(bid)
+        txt = str(it.get("txt") or "")[:6000]
+        lang = None
+        if row and row_lang(row) == "unk" and txt:
+            lang = lang_from_text(txt, ocr=it.get("how") == "ocr") or (lang_from_text(txt) if it.get("how") == "ocr" else None)
+        try:
+            if lang and row and lang_apply(row, lang, txt, it.get("how") or "ocr"):
+                res["found"] += 1
+                done.add(bid)
+                continue
+        except Exception:
+            log_error("langread apply")
+            continue
+        x = mine[bid]
+        if it.get("err") and int(x.get("n") or 0) + 1 < LANGQ_TRIES:
+            x["st"], x["n"] = "ocr", int(x.get("n") or 0) + 1      # download hiccup → one more try
+        else:
+            done.add(bid)                                           # read, still unknown → stays [भाषा अज्ञात]
+            res["unknown"] += 1
+    langq_save([x for x in q if int(x["id"]) not in done])
+    flush_logs()
+    flush_request()
+    return jsonify({"ok": True, **res})
 
 
 # ---- 🔎 the search: only the file's own name counts, every typed key word must match

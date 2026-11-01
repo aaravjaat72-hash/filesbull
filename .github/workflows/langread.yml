@@ -1,0 +1,41 @@
+name: langread
+# 🏷️ Auto-reader for NEW files (Aarav, Nov 1 2026): files whose language the bot could not tell from the name, the caption
+# or the PDF's text layer are read here with OCR (tesseract Hindi + English, 2 pages) — Vercel can't run OCR.
+# Started by the bot (workflow_dispatch) when such files are waiting; the 30-minute schedule picks up anything left.
+# The bot's token comes from the bot after GitHub's OIDC token proves this run is this workflow on main (or from the
+# Actions secret BOT_TOKEN). Only text goes back to the bot; nothing is uploaded, renamed or deleted. See tools/lang_runner.py.
+on:
+  workflow_dispatch:
+    inputs:
+      bot_url:
+        description: "bot address (the bot fills it; else the repo variable BOT_URL is used)"
+        required: false
+        default: ""
+  schedule:
+    - cron: "17,47 * * * *"
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: langread
+  cancel-in-progress: false
+
+jobs:
+  read:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: tools
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Read new files (language)
+        env:
+          BOT_URL_INPUT: ${{ github.event.inputs.bot_url }}
+          BOT_URL: ${{ vars.BOT_URL }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+        run: python tools/lang_runner.py
