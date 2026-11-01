@@ -16953,9 +16953,11 @@ def base_title(title: Any) -> str:
 
 
 def tagged_title(title: Any, lang: str) -> str:
-    """'Lucent GK [हिंदी]'. An unknown language adds nothing to the name (buttons show ❔ in front)."""
+    """'Lucent GK [हिंदी]' / '[English]' / '[हिंदी + English]' / '[भाषा अज्ञात]' (Aarav, Oct 31: every name shows its language)."""
     b = base_title(title)[:480]
-    return (b + " " + LANG_TAGS[lang]).strip() if lang in ("hi", "en", "both") else (b or str(title or ""))
+    if not b:
+        return str(title or "")
+    return (b + " " + LANG_TAGS.get(lang if lang in LANG_TAGS else "unk", "")).strip()
 
 
 def display_title(row: Dict[str, Any]) -> str:
