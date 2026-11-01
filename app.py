@@ -15886,6 +15886,16 @@ def webdiag() -> Any:
             r["caption"] = str(r.get("caption") or "")[:500]
         out.update({"rows": rows, "n": len(rows), "last": rows[-1]["id"] if rows else None, "category_col": has_category_col()})
         return jsonify(out)
+    if op == "langq":      # 🏷️ auto-reader: queue state; POST ids → put those (unknown-language, ≤ 20 MB) files in line
+        if request.method == "POST":
+            ids = [int(i) for i in (body.get("ids") or [])[:50] if str(i).isdigit()]
+            rows = _langq_rows(ids)
+            out["added"] = [i for i in ids if i in rows and row_lang(rows[i]) == "unk" and langq_add(i, rows[i])]
+        if request.args.get("run") == "1" or body.get("run"):
+            out["run"] = process_lang_queue(budget=4.0)
+        out.update(langq_status())
+        out["items"] = langq_load()[:60]
+        return jsonify(out)
     if op == "meta" and request.method == "POST":   # 🗂️ tagging pass: set title/language/keywords(/category) on given ids
         items = body.get("rows") or []
         dry = bool(body.get("dry"))
