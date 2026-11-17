@@ -29,6 +29,11 @@ class SearchTests(unittest.TestCase):
         with patch.object(bot, "s2_fetch", return_value=[row(1, telegram_file_unique_id="same"), row(2, telegram_file_unique_id="same")]):
             self.assertEqual(len(bot.s2_search(spec)), 1)
 
+    def test_passive_deployment_never_changes_webhook(self):
+        with patch.dict(bot.os.environ, {"WEBHOOK_AUTO_SETUP": "0"}), patch.object(bot, "telegram") as tg:
+            self.assertEqual(bot.ensure_webhook(force=True)["action"], "disabled")
+            tg.assert_not_called()
+
     def test_legacy_mixed_language(self):
         self.assertEqual(bot.row_lang(dict(language="mixed")), "both")
 
