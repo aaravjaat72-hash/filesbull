@@ -416,5 +416,13 @@ def install(namespace):
         template = globals()[name]
         namespace[name] = FunctionType(template.__code__, namespace, name,
                                        template.__defaults__, template.__closure__)
+    original_ensure = namespace["ensure_webhook"]
+    def controlled_webhook(force=False):
+        # New deployments stay passive until explicitly activated. This also
+        # stops an older deployment on the same repository stealing updates.
+        if namespace["os"].environ.get("WEBHOOK_AUTO_SETUP", "0").lower() not in {"1", "true", "on"}:
+            return {"action": "disabled", "commands": "unchanged", "before": {}}
+        return original_ensure(force=force)
+    namespace["ensure_webhook"] = controlled_webhook
     namespace["app"].view_functions["health"] = namespace["health"]
     namespace["app"].view_functions["webhook"] = namespace["webhook"]
