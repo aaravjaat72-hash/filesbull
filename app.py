@@ -18315,5 +18315,7 @@ def tgf_callback(query: Dict[str, Any], cmd: str, chat_id: int, user_id: int) ->
     txt, kb = tgf_screen(st, page)
     show(chat_id, txt, kb, query, "HTML")
 
+from search_fixes import install as _install_search_fixes
+_install_search_fixes(globals())
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
