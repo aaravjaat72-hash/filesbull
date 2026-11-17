@@ -1,0 +1,22 @@
+name: Search regression tests
+on:
+  push:
+    branches: [main]
+    paths: [app.py, search_fixes.py, test_search.py, requirements.txt, .github/workflows/search-tests.yml]
+  pull_request:
+    paths: [app.py, search_fixes.py, test_search.py, requirements.txt, .github/workflows/search-tests.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r requirements.txt
+      - run: python -m compileall -q app.py search_fixes.py tools
+      - run: python -m unittest -v test_search
